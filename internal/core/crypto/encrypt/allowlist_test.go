@@ -82,10 +82,7 @@ func isStdlibOrInternal(pkg string) bool {
 	// Stdlib packages don't contain a dot in their first path element.
 	// Third-party packages (including byreis module) do.
 	parts := strings.SplitN(pkg, "/", 2)
-	if strings.Contains(parts[0], ".") {
-		return false
-	}
-	return true
+	return !strings.Contains(parts[0], ".")
 }
 
 // checkAllowlist checks a list of deps against the allowlist rules and returns
@@ -258,7 +255,7 @@ func TestAllowlist_NegativeTest_ForbiddenImportFails(t *testing.T) {
 		t.Fatalf("write temp package: %v", err)
 	}
 
-	cmd := exec.Command("go", "list", "-deps", "example.com/inject-test/injecttest")
+	cmd := exec.CommandContext(t.Context(), "go", "list", "-deps", "example.com/inject-test/injecttest")
 	cmd.Dir = tmp
 	out, err := cmd.Output()
 	if err != nil {
@@ -296,7 +293,7 @@ func TestAllowlist_NegativeTest_ForbiddenImportFails(t *testing.T) {
 // a failure rather than a green no-op.
 func goListDeps(t *testing.T, pkg string) []string {
 	t.Helper()
-	cmd := exec.Command("go", "list", "-deps", pkg)
+	cmd := exec.CommandContext(t.Context(), "go", "list", "-deps", pkg)
 	out, err := cmd.Output()
 	if err != nil {
 		t.Fatalf("ALLOWLIST GATE FAIL: go list -deps %s failed: %v (output: %s)\n"+

@@ -32,18 +32,26 @@ func New() *Provider {
 // Compile-time assertion that Provider implements GitProvider.
 var _ coregit.GitProvider = (*Provider)(nil)
 
+// OpenSubmissionPR creates a contributor submission PR on GitHub.
+// Stub: real implementation pending.
 func (p *Provider) OpenSubmissionPR(_ context.Context, _ coregit.OpenPRInput) (coregit.PullRequest, error) {
 	panic("not implemented") // stub: real implementation pending
 }
 
+// GetSubmission fetches an open submission PR from GitHub.
+// Stub: real implementation pending.
 func (p *Provider) GetSubmission(_ context.Context, _ coregit.PRRef) (coregit.Submission, error) {
 	panic("not implemented") // stub: real implementation pending
 }
 
+// MergeSubmission merges a reviewed submission PR on GitHub.
+// Stub: real implementation pending.
 func (p *Provider) MergeSubmission(_ context.Context, _ coregit.MergeInput) (coregit.MergeResult, error) {
 	panic("not implemented") // stub: real implementation pending
 }
 
+// CommentPR posts a review comment on a GitHub PR.
+// Stub: real implementation pending.
 func (p *Provider) CommentPR(_ context.Context, _ coregit.PRRef, _ string) error {
 	panic("not implemented") // stub: real implementation pending
 }

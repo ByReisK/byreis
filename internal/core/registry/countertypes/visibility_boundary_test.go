@@ -140,7 +140,7 @@ func checkNoExportedCtor(t *testing.T) {
 	// function signature containing "CounterAuthority" as a return type.
 	// We exclude the type declaration and method signatures (Valid, LastAccepted,
 	// Pending are receivers, not free functions).
-	cmd := exec.Command("go", "doc", "-all", pkg)
+	cmd := exec.CommandContext(t.Context(), "go", "doc", "-all", pkg)
 	out, err := cmd.Output()
 	if err != nil {
 		t.Fatalf("go doc failed for %s: %v\n"+
@@ -205,6 +205,14 @@ func TestCapmintIsNotImportableOutsideRegistryAdapter(t *testing.T) {
 			"Cannot run compile-fail assertion — treat as a failure.", err)
 	}
 
+	// Read the main module's go and toolchain directives so the generated temp
+	// go.mod declares the same language version. Without this, when the main
+	// module declares "go 1.26 / toolchain go1.26.3" the subprocess `go build`
+	// resolves the replace target to a module requiring go >= 1.26, which
+	// pre-empts the "use of internal package" rejection with a
+	// "requires go >= 1.26" error — obscuring the security assertion.
+	goLine, toolchainLine := readMainModuleGoDirectives(t, modRoot)
+
 	// Write a tiny Go package in a temp directory that is OUTSIDE the module
 	// (so go build won't interfere with the module cache) but references capmint
 	// by its full import path. We simulate a non-adapter package attempting import.
@@ -212,14 +220,17 @@ func TestCapmintIsNotImportableOutsideRegistryAdapter(t *testing.T) {
 
 	// The fake module references capmint via the actual module path.
 	// We set up a replace directive in go.mod to point at the local module root.
-	goModContent := `module github.com/byreis-test/capmint-forgery-attempt
+	// The go/toolchain directives mirror the main module so toolchain resolution
+	// in the subprocess does not raise a version-mismatch error before the
+	// internal-package visibility check fires.
+	goModContent := "module github.com/byreis-test/capmint-forgery-attempt\n\n" +
+		goLine + "\n"
+	if toolchainLine != "" {
+		goModContent += toolchainLine + "\n"
+	}
+	goModContent += "\nrequire github.com/ByReisK/byreis v0.0.0\n\n" +
+		"replace github.com/ByReisK/byreis => " + modRoot + "\n"
 
-go 1.22
-
-require github.com/ByReisK/byreis v0.0.0
-
-replace github.com/ByReisK/byreis => ` + modRoot + `
-`
 	mainGoContent := `package main
 
 // This file simulates a non-adapter package (e.g. internal/core/crypto/verify)
@@ -243,7 +254,9 @@ func main() {}
 	}
 
 	// Run `go build .` in the temp dir; it should FAIL with "use of internal package".
-	cmd := exec.Command("go", "build", ".")
+	// Inherit the test process environment (which includes the active GOTOOLCHAIN
+	// resolution) so the subprocess uses the same toolchain as the test itself.
+	cmd := exec.CommandContext(t.Context(), "go", "build", ".")
 	cmd.Dir = tmpDir
 	buildOut, buildErr := cmd.CombinedOutput()
 
@@ -271,6 +284,36 @@ func main() {}
 		t.Logf("capmint import from non-adapter package rejected by Go toolchain.\n"+
 			"Error (expected): %s", strings.TrimSpace(buildOutStr))
 	}
+}
+
+// readMainModuleGoDirectives reads the "go" and "toolchain" directives from
+// the main module's go.mod. It returns the full directive lines (e.g.
+// "go 1.26" and "toolchain go1.26.3") so the caller can embed them verbatim
+// in a generated temp go.mod. The toolchain line is returned as "" when the
+// go.mod carries no toolchain directive (older modules). Neither value is
+// empty for the go line; a missing go directive causes a fatal test error.
+func readMainModuleGoDirectives(t *testing.T, modRoot string) (goLine, toolchainLine string) {
+	t.Helper()
+
+	data, err := os.ReadFile(filepath.Join(modRoot, "go.mod"))
+	if err != nil {
+		t.Fatalf("cannot read main module go.mod: %v", err)
+	}
+
+	for _, line := range strings.Split(string(data), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "go ") && goLine == "" {
+			goLine = trimmed
+		}
+		if strings.HasPrefix(trimmed, "toolchain ") && toolchainLine == "" {
+			toolchainLine = trimmed
+		}
+	}
+
+	if goLine == "" {
+		t.Fatal("main module go.mod has no 'go' directive — cannot generate a compatible temp go.mod")
+	}
+	return goLine, toolchainLine
 }
 
 // findModuleRoot walks up from the test file location to find the go.mod.

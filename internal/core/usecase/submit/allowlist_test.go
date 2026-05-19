@@ -226,7 +226,7 @@ func TestAllowlist_Submit_NegativeTest_ForbiddenImportFails(t *testing.T) {
 // that cannot run must fail rather than pass as a no-op.
 func goListDepsSubmit(t *testing.T, pkg string) []string {
 	t.Helper()
-	cmd := exec.Command("go", "list", "-deps", pkg)
+	cmd := exec.CommandContext(t.Context(), "go", "list", "-deps", pkg)
 	out, err := cmd.Output()
 	if err != nil {
 		t.Fatalf("ALLOWLIST GATE FAIL: go list -deps %s failed: %v (output: %s)\n"+

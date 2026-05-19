@@ -11,6 +11,7 @@ import (
 // EventKind classifies an auditable event.
 type EventKind string
 
+// EventKind values enumerate all auditable event types.
 const (
 	EventKindModePromotion   EventKind = "mode.promotion"
 	EventKindSubmit          EventKind = "submit"

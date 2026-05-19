@@ -11,6 +11,7 @@ import "context"
 // Level is the log severity.
 type Level int
 
+// Level values enumerate log severity from least to most severe.
 const (
 	LevelDebug Level = iota
 	LevelInfo

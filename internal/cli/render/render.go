@@ -17,6 +17,7 @@ import (
 // can branch on the failure kind.
 type ExitCode int
 
+// Exit code constants map error categories to process exit codes.
 const (
 	ExitOK               ExitCode = 0
 	ExitGeneralError     ExitCode = 1
@@ -59,10 +60,10 @@ func (r *Renderer) PrintVersion(version string) {
 		_ = enc.Encode(map[string]string{"version": version})
 		return
 	}
-	fmt.Fprintf(r.Out, "byreis version %s\n", version)
+	_, _ = fmt.Fprintf(r.Out, "byreis version %s\n", version)
 }
 
 // PrintError prints an error with an actionable hint to stderr.
 func (r *Renderer) PrintError(msg string) {
-	fmt.Fprintf(r.Err, "error: %s\n", msg)
+	_, _ = fmt.Fprintf(r.Err, "error: %s\n", msg)
 }

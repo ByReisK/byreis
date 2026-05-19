@@ -44,14 +44,21 @@ func New() *Client {
 // Compile-time assertion.
 var _ registry.RegistryClient = (*Client)(nil)
 
+// FetchAdminSet returns the admin recipient and signer set for a project.
+// Stub: real implementation pending.
 func (c *Client) FetchAdminSet(_ context.Context, _ string) (registry.AdminSet, error) {
 	panic("not implemented") // stub: real implementation pending
 }
 
+// VerifyRegistryFreshness enforces anti-rollback for the registry HEAD.
+// Stub: real implementation pending.
 func (c *Client) VerifyRegistryFreshness(_ context.Context, _ string) error {
 	panic("not implemented") // stub: real implementation pending
 }
 
+// CounterAuthority returns the per-(project,file) anti-replay view.
+// Stub: real implementation calls capmint.Mint after reading the
+// signature-verified counter store. Pending — see capmint package doc.
 func (c *Client) CounterAuthority(_ context.Context, _, _ string) (countertypes.CounterAuthority, error) {
 	// Real implementation: read the signature-verified counter store and the
 	// anti-rollback cache, then call capmint.Mint(lastAccepted, pending).
@@ -67,10 +74,14 @@ func (c *Client) CounterAuthority(_ context.Context, _, _ string) (countertypes.
 	return capmint.Mint(0, nil), nil // stub: capmint.Mint panics; line replaced with the real read
 }
 
+// RecordPendingBump records the write-ahead merge intent in the registry.
+// Stub: real implementation pending.
 func (c *Client) RecordPendingBump(_ context.Context, _ registry.PendingBumpInput) error {
 	panic("not implemented") // stub: real implementation pending
 }
 
+// CommitBump finalizes a counter bump after the secrets-repo merge has landed.
+// Stub: real implementation pending.
 func (c *Client) CommitBump(_ context.Context, _ registry.CommitBumpInput) error {
 	panic("not implemented") // stub: real implementation pending
 }
