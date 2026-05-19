@@ -13,7 +13,7 @@ LDFLAGS      := -X $(MODULE)/pkg/byreis.Version=$(VERSION)
 GOLANGCI     := golangci-lint
 GO_TEST_FLAGS := -race -timeout=120s
 
-.PHONY: build test test-testhook test-shipgate lint install clean check-allowlist
+.PHONY: build test test-testhook test-shipgate lint install clean check-allowlist check-publish-boundary ci-parity
 
 ## build: compile the byreis binary to ./bin/byreis
 build:
@@ -42,12 +42,81 @@ install:
 	go install -ldflags "$(LDFLAGS)" $(CMD_PKG)
 
 ## check-allowlist: run the closed-world import allowlist gate (Go test is authoritative)
-## Targets: internal/core/crypto/encrypt and internal/core/usecase/submit (the Submit compilation unit).
+## The tests pin GOOS=linux GOARCH=amd64 on all inner go list -deps calls so the
+## evaluated transitive-dep set is identical on every dev host and in CI (linux/amd64).
+## The allowlist is the platform-union satisfying linux+windows+darwin.
 ## A non-zero exit is a hard failure; a gate that cannot run fails, never passes.
 check-allowlist:
 	go test -v -race -run TestAllowlist \
 		./internal/core/crypto/encrypt/ \
 		./internal/core/usecase/submit/
+
+## check-publish-boundary: bidirectional publish-boundary audit.
+## FAILS if any go list ./... source dir is git-ignored (build-required source excluded from repo).
+## FAILS if any intended-private artifact (PLAN*, design/, CLAUDE.md, .claude/, scripts/,
+## spike/, *.key, *.age, /identity/, .byreis.local.yaml) is NOT ignored.
+## A gate that cannot run (missing go/git) exits non-zero.
+check-publish-boundary:
+	@echo "--- check-publish-boundary: bidirectional audit ---"
+	@FAILED=0; \
+	for d in $$(go list -f '{{.Dir}}' ./... | sed "s|$$(pwd)/||"); do \
+		if git check-ignore -q "$$d" 2>/dev/null; then \
+			echo "FAIL: build-required source dir is git-ignored: $$d"; \
+			FAILED=1; \
+		fi; \
+	done; \
+	if [ $$FAILED -eq 0 ]; then \
+		echo "PASS: no build-required source dirs are git-ignored"; \
+	fi; \
+	for p in PLAN.md PLAN.v1.md design/ CLAUDE.md .claude/ scripts/ spike/ somekey.key somekey.age identity/ .byreis.local.yaml; do \
+		if ! git check-ignore -q "$$p" 2>/dev/null; then \
+			echo "FAIL: intended-private artifact is NOT git-ignored: $$p"; \
+			FAILED=1; \
+		fi; \
+	done; \
+	if [ $$FAILED -eq 0 ]; then \
+		echo "PASS: all intended-private artifacts are git-ignored"; \
+	fi; \
+	exit $$FAILED
+
+## ci-parity: clean COMMITTED-HEAD worktree (refuses on dirty tree); GOOS=linux GOARCH=amd64 build-parity + native -race test + GOOS-pinned allowlist + shipgate; true cross-arch test execution is the post-push CI job.
+## A gate that cannot run exits non-zero.
+##
+## Why git worktree into a sibling dir (not mktemp): Go ignores go.mod found under the
+## system temp root on macOS (/var/folders/.../T/...), causing "pattern ./...: directory
+## prefix . does not contain main module". The worktree lands in a sibling of the repo
+## root (outside $TMPDIR, outside the repo itself) where Go respects go.mod normally.
+## The sibling path (.byreis-ci-parity.<pid>) is never inside the repo so it cannot trip
+## check-publish-boundary or be accidentally committed.
+##
+## Cross-arch note: a macOS host cannot execute linux/amd64 test binaries (exec format
+## error). The split is intentional: GOOS=linux GOARCH=amd64 go build ./... catches
+## compile-parity (the class of break that linux CI would catch first); go test -race ./...
+## runs on the native host arch for real execution; the allowlist and shipgate tests use
+## GOOS=linux GOARCH=amd64 on their inner go list -deps calls (already pinned in the test
+## source) so they are platform-deterministic regardless of host arch.
+ci-parity:
+	@echo "--- ci-parity: clean-worktree CI-platform-matched verification ---"
+	@if [ -n "$$(git status --porcelain)" ]; then \
+	  echo "ci-parity: REFUSING — working tree is dirty. Stage+commit the exact to-be-pushed tree as one clean commit, THEN run ci-parity (it verifies the committed HEAD that git push will send)."; \
+	  exit 1; \
+	fi
+	@WT="$$(cd .. && pwd)/.byreis-ci-parity.$$$$" && \
+	trap 'git worktree remove --force "$$WT" 2>/dev/null || rm -rf "$$WT"' EXIT INT TERM && \
+	echo "Creating detached worktree at $$WT ..." && \
+	git worktree add --detach "$$WT" HEAD && \
+	cd "$$WT" && \
+	echo "--- go build ./... (GOOS=linux GOARCH=amd64) ---" && \
+	GOOS=linux GOARCH=amd64 go build ./... && \
+	echo "--- go test -race -timeout=120s ./... (native host arch) ---" && \
+	go test -race -timeout=120s ./... && \
+	echo "--- allowlist gate (GOOS-pinned inside tests) ---" && \
+	go test -v -race -run TestAllowlist \
+		./internal/core/crypto/encrypt/ \
+		./internal/core/usecase/submit/ && \
+	echo "--- ship-gate suite ---" && \
+	go test -race -tags shipgate -run TestAsymmetryShipGate ./internal/core/usecase/ && \
+	echo "--- ci-parity: ALL CHECKS PASSED ---"
 
 ## clean: remove build artifacts
 clean:

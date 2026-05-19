@@ -94,7 +94,7 @@ jobs:
           go-version: "1.26.x"
           cache: true
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6
+        uses: golangci/golangci-lint-action@v7
         with:
           version: v2.12.2
 
@@ -112,10 +112,16 @@ jobs:
         # bash script was retired deliberately: two gates that can disagree are
         # themselves a defect. A non-zero exit is a hard failure, and a gate that
         # cannot run must fail loudly rather than exit 0 silently.
+        # GOOS=linux GOARCH=amd64 is pinned so the transitive-dep set evaluated
+        # here is identical on every dev host and in CI. The allowlist is the
+        # platform-union satisfying linux+windows+darwin.
         # Targets:
         #   - internal/core/crypto/encrypt  (contributor encrypt allowlist)
         #   - internal/core/usecase/submit  (the Submit compilation unit only,
         #                                    not the whole usecase package)
+        env:
+          GOOS: linux
+          GOARCH: amd64
         run: |
           go test -v -race -run TestAllowlist \
             ./internal/core/crypto/encrypt/ \

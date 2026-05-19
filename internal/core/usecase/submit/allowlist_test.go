@@ -30,10 +30,10 @@ package submit_test
 // Wired by: make check-allowlist / CI allowlist job.
 
 import (
+	"os"
+	"os/exec"
 	"strings"
 	"testing"
-
-	"os/exec"
 )
 
 const module = "github.com/ByReisK/byreis"
@@ -110,11 +110,17 @@ var allowedThirdPartyPkgsSubmit = map[string]bool{
 	"golang.org/x/crypto/scrypt":            true,
 	"golang.org/x/crypto/internal/alias":    true,
 	"golang.org/x/crypto/internal/poly1305": true,
-	// golang.org/x/sys/cpu was previously listed defensively but is NOT in the
-	// real transitive set of filippo.io/age (verified via `go list -deps`);
-	// keeping it would dilute the "minimal necessary" claim. It is deliberately
-	// omitted — if a future age release pulls it in, the subset test fails and
-	// the addition goes through explicit review per ADR-0005.
+	// AMENDMENT (reviewed amendment): golang.org/x/sys/cpu is pulled transitively
+	// by golang.org/x/crypto chacha20/chacha20poly1305 for CPU-feature detection
+	// on linux/amd64 and windows/amd64 (absent on darwin/arm64). It is a
+	// CPU-feature-flag package carrying no identity, ed25519, private-key, or
+	// counter material. The darwin-only verification that previously supported
+	// omitting it was incomplete; this entry brings the allowlist to the
+	// platform-union required for deterministic CI evaluation under a pinned
+	// GOOS=linux GOARCH=amd64. crypto/ed25519, internal/core/registry,
+	// internal/core/crypto/identity, internal/core/crypto/decrypt, and
+	// internal/core/registry/countertypes remain forbidden and unchanged.
+	"golang.org/x/sys/cpu": true,
 }
 
 // isStdlibOrInternal returns true if the package is a standard library package.
@@ -283,12 +289,17 @@ func TestAllowlist_Submit_NegativeTest_ForbiddenImportFails(t *testing.T) {
 	}
 }
 
-// goListDepsSubmit runs `go list -deps <pkg>` and returns the transitive dep list.
+// goListDepsSubmit runs `go list -deps <pkg>` pinned to GOOS=linux GOARCH=amd64
+// and returns the transitive dep list. Pinning the evaluation platform makes
+// the gate produce the same dep set on every dev host as in CI (ubuntu-latest,
+// linux/amd64). The allowlist is the platform-union satisfying all supported
+// platforms, so a linux/amd64 evaluation is the correct authoritative superset.
 // If go list fails, the test fails loudly and never skips silently: a gate
 // that cannot run must fail rather than pass as a no-op.
 func goListDepsSubmit(t *testing.T, pkg string) []string {
 	t.Helper()
 	cmd := exec.CommandContext(t.Context(), "go", "list", "-deps", pkg)
+	cmd.Env = append(os.Environ(), "GOOS=linux", "GOARCH=amd64")
 	out, err := cmd.Output()
 	if err != nil {
 		t.Fatalf("ALLOWLIST GATE FAIL: go list -deps %s failed: %v (output: %s)\n"+

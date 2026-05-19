@@ -38,11 +38,17 @@ go.work.sum
 # vendor/
 
 # --- byreis runtime artifacts (never commit secrets/keys) ---
+# Key material is matched by EXTENSION (covers any path/depth) — these are the
+# real exposure surface; byreis loads the admin key from keychain/env/key-file,
+# never from a tracked in-repo identity dir.
 *.key
 *.key.pub
 *.age
-identity/
 .byreis.local.yaml
+# Belt-and-braces: an accidental repo-ROOT runtime identity dir a dev/user
+# might create locally. ROOT-ANCHORED (leading slash) so it CANNOT match the
+# source package internal/core/crypto/identity/ (or any nested identity/ dir).
+/identity/
 # Throwaway crypto-spike PROOF CODE only. Durable gate artifacts
 # (FINDINGS.md, REQUIREMENTS.md) live in design/ and ARE committed.
 # design/ (DESIGN.md, ADRs, reqs) and docs/ (public docs) are tracked.
