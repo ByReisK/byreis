@@ -15,46 +15,34 @@
 //
 // # Wiring
 //
-// Until the real implementation lands, Mint panics. The registry adapter calls
-// Mint; once the adapter is fully wired, Mint must call
-// countertypes.newCounterAuthority.
-//
-// Open design question: countertypes.newCounterAuthority is unexported, so
-// capmint cannot call it directly today. Bridging it requires one of:
-//
-//	a. countertypes exports a restricted-by-name constructor (e.g. New or Mint)
-//	   and the visibility test adds a source-scan assertion that the constructor
-//	   is not called from verify/mode/usecase (defense-in-depth alongside the
-//	   capmint internal/ rule).
-//	b. countertypes exposes newCounterAuthority via a package-level var set by an
-//	   explicit non-init() registration call driven by the adapter's wiring
-//	   code — a one-shot set-once guarded by sync.Once, never a global mutable
-//	   open to any caller (this option needs careful review).
-//	c. Another reviewed mechanism.
-//
-// Until then, Mint panics and the type-shape constraint is operative.
+// Mint delegates to countertypes.MintFromAdapter, passing an untyped nil as the
+// witness argument. The witness type (*countertypes.adapterWitness) is
+// unexported in countertypes and therefore cannot be named from this package.
+// Passing the untyped nil is correct and Go-safe: MintFromAdapter accepts a nil
+// witness in production and does not panic on it. The load-bearing guarantee is
+// the Go internal/ import rule on this package plus the AST surface classifier
+// in countertypes; the witness parameter is defense-in-depth for
+// accident-prevention and classifier purposes only.
 //
 // Security note: this package is security-relevant. The visibility boundary and
-// any chosen bridging mechanism require crypto and threat-model sign-off before
-// release; it is not self-certified.
+// the bridge mechanism require crypto and threat-model sign-off before release;
+// it is not self-certified.
 package capmint
 
 import "github.com/ByReisK/byreis/internal/core/registry/countertypes"
 
 // Mint constructs a Valid()==true CounterAuthority for the registry adapter.
 //
-// This function is the sole module-reachable constructor for CounterAuthority
-// values with Valid()==true. It is importable only from packages rooted at
-// internal/adapter/registry (Go internal/ rule — see package-level doc).
-//
-// The panic body is replaced with the real construction once the bridge to
-// countertypes.newCounterAuthority is in place (see the open design question in
-// the package doc). All registry adapter code that needs a CounterAuthority
-// must call this function, never construct one directly.
+// It is the sole module-reachable constructor for Valid()==true CounterAuthority
+// values and is importable only from packages rooted at internal/adapter/registry
+// (Go internal/ rule — see package-level doc). All registry adapter code that
+// needs a CounterAuthority must call this function. The adapter must ensure all
+// preconditions (SourceVerified fetch provenance, anti-rollback cache check,
+// fail-closed ancestry check) are satisfied before calling Mint.
 func Mint(lastAccepted uint64, pending *countertypes.PendingBump) countertypes.CounterAuthority {
-	// Real body, once the bridge is in place:
-	//   return countertypes.newCounterAuthority(lastAccepted, pending)
-	// This path is currently unreachable in practice (the registry adapter stub
-	// also panics before calling Mint), so panicking here is safe for the gate.
-	panic("not implemented: wire to countertypes.newCounterAuthority via the approved bridge")
+	// capmint cannot name *countertypes.adapterWitness (unexported type), so the
+	// only witness value it can pass is the untyped nil — Go converts this to
+	// (*countertypes.adapterWitness)(nil). MintFromAdapter accepts a nil witness
+	// in production (no panic here; the nil-panic guard is test-only).
+	return countertypes.MintFromAdapter(nil, lastAccepted, pending)
 }

@@ -36,8 +36,13 @@ type Decryptor interface {
 	Decrypt(ctx context.Context, art artifact.Signed, id identity.Identity) (map[string]string, error)
 
 	// RoundTripAll verifies that every value in the artifact can be decrypted
-	// by every provided identity (post-merge integrity check). Returns
-	// ErrDecrypt for any (identity, value) pair that fails.
+	// by every identity actually provided in ids. It proves the live envelope
+	// is decryptable under exactly those identities — typically the executing
+	// admin's own identity — and makes no claim about other current admins.
+	// The guarantee that the file-of-record is wrapped to every current
+	// verified recipient is established separately by the recipient-set check
+	// in VerifyOfRecord, not by this function. Returns ErrDecrypt for any
+	// (identity, value) pair that fails.
 	RoundTripAll(ctx context.Context, art artifact.Signed, ids []identity.Identity) error
 }
 
@@ -82,8 +87,11 @@ func (d *decryptor) RoundTripAll(
 	if len(ids) == 0 {
 		return fmt.Errorf("%w: no identities provided for round-trip", ErrDecrypt)
 	}
-	// Every value MUST decrypt under EVERY recipient identity (post-merge
-	// integrity: confirms the live file is readable by all current admins).
+	// Every value MUST decrypt under every identity actually provided here
+	// (post-merge integrity: confirms the live file is decryptable under the
+	// supplied identities — the executing admin's own identity at the merge
+	// call site). Coverage of all current verified recipients is proven by
+	// VerifyOfRecord's recipient-set check, not by this loop.
 	for _, id := range ids {
 		if id == nil || id.AgeIdentity() == nil {
 			return fmt.Errorf("%w: nil identity in round-trip set", ErrDecrypt)

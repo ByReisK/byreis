@@ -27,14 +27,18 @@ import (
 	"github.com/ByReisK/byreis/internal/core/crypto/artifact"
 	"github.com/ByReisK/byreis/internal/core/crypto/manifest"
 	"github.com/ByReisK/byreis/internal/core/crypto/sign"
+	coreregistry "github.com/ByReisK/byreis/internal/core/registry"
 	"github.com/ByReisK/byreis/internal/core/registry/countertypes"
 	"github.com/ByReisK/byreis/internal/core/registry/rectypes"
 )
 
-// Sentinel errors owned by this package. ErrReplay and ErrCounterReconcile are
-// owned by internal/core/registry/countertypes and are referenced from there
-// directly; this package does not define alias vars for them, to avoid two
-// packages owning the same sentinel.
+// Sentinel errors owned by this package or re-exported from their canonical
+// owner. ErrReplay and ErrCounterReconcile are owned by
+// internal/core/registry/countertypes and are referenced from there directly;
+// this package does not define alias vars for them, to avoid two packages owning
+// the same sentinel. ErrNoTrustedSigner is owned by internal/core/registry and
+// re-exported here as a direct reference so callers that import verify can still
+// check the sentinel via errors.Is.
 var (
 	// ErrFormatVersion: format_version does not match ^byreis\.native\.v[0-9]+$
 	// or contains a separator byte.
@@ -62,13 +66,12 @@ var (
 		"file-of-record is unsigned: it was never merged via `byreis merge`; " +
 			"a contributor submission must be reviewed and merged before live use")
 
-	// ErrNoTrustedSigner: no trusted manifest signer key is available, or all
-	// keys are invalid. This is a hard error and never a downgrade to unsigned.
-	// This package is the semantic owner; the registry boundary returns this
-	// same sentinel by reference rather than defining its own alias.
-	ErrNoTrustedSigner = errors.New(
-		"no trusted manifest signer key available — " +
-			"run `byreis doctor` to check your trust anchor, or `byreis auth login`")
+	// ErrNoTrustedSigner is re-exported from its canonical owner
+	// (internal/core/registry) so callers that import verify can check this
+	// sentinel via errors.Is. Because this is a direct pointer assignment rather
+	// than a newly allocated error, errors.Is(err, verify.ErrNoTrustedSigner) and
+	// errors.Is(err, coreregistry.ErrNoTrustedSigner) are equivalent.
+	ErrNoTrustedSigner = coreregistry.ErrNoTrustedSigner
 
 	// ErrSignatureInvalid: Ed25519 signature verification failed.
 	ErrSignatureInvalid = errors.New("manifest signature verification failed")

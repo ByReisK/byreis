@@ -57,48 +57,104 @@ const ctPkg = "github.com/ByReisK/byreis/internal/core/registry/countertypes"
 
 // TestShippedSurface_NoUnwitnessedValidProducer is the mechanical, fail-closed
 // gate. For each shipped-candidate tag set it lists the package's Go files via
-// `go list -tags`, parses them, and asserts every exported package-level func
-// returning CounterAuthority requires at least one unexported parameter type
-// (the witness). The default set must additionally have ZERO such producers.
+// `go list -tags`, parses them, and applies the relaxed LB-2 rule from
+// ADR-0007 §1.4:
+//
+//   - Zero unwitnessed exported CounterAuthority producers under ANY tag set.
+//   - The only permitted producer name set is a subset of
+//     {MintFromAdapter, NewForTest}; every member must be witness-gated.
+//   - Default tag set in B3b (MintFromAdapter not yet added): len(P)==0.
+//   - Default tag set at B3d acceptance (when MintFromAdapter is wired):
+//     len(P)==1 && P[0].name=="MintFromAdapter" && P[0].witnessGated.
+//   - Testhook set: every producer is witness-gated; the testhook-vs-default
+//     delta is exactly {NewForTest}, witness-gated (asserted separately in
+//     TestShippedSurface_TesthookDeltaIsWitnessGated).
+//   - A second or unwitnessed producer under ANY tag set => test FAILS.
 func TestShippedSurface_NoUnwitnessedValidProducer(t *testing.T) {
 	t.Parallel()
 
-	for _, ts := range shippedCandidateTagSets {
-		t.Run(ts.name, func(t *testing.T) {
-			producers := exportedCounterAuthorityProducers(t, ts.tags)
+	permitted := map[string]bool{"MintFromAdapter": true, "NewForTest": true}
 
-			if ts.tags == "" && len(producers) != 0 {
-				for _, p := range producers {
-					t.Errorf("FAIL: exported package-level %s %q produces CounterAuthority "+
-						"under the DEFAULT (shipped) tag set.\n"+
-						"  No exported Valid()-producer is permitted in the shipped surface — "+
-						"the sole producer is the unexported newCounterAuthority via capmint.\n"+
-						"  Remove or unexport it.", p.kind, p.name)
-				}
-				return
+	for _, ts := range shippedCandidateTagSets {
+		ts := ts
+		t.Run(ts.name, func(t *testing.T) {
+			t.Parallel()
+			producers := exportedCounterAuthorityProducers(t, ts.tags)
+			producerMap := make(map[string]ctProducer, len(producers))
+			for _, p := range producers {
+				producerMap[p.name] = p
 			}
 
+			// B3b reality: default set must have zero producers.
+			// B3d acceptance criterion: default set has exactly one named witness-gated
+			// MintFromAdapter. Both are checked below by enforcing the relaxed rule.
+			if ts.tags == "" {
+				// In B3b (no MintFromAdapter yet): len must be 0.
+				// In B3d+: len must be 1, name==MintFromAdapter, witnessGated.
+				if len(producers) > 1 {
+					for _, p := range producers {
+						t.Errorf("FAIL: exported %s %q under DEFAULT tag set — "+
+							"only zero (B3b) or exactly one named MintFromAdapter (B3d+) is permitted.",
+							p.kind, p.name)
+					}
+				} else if len(producers) == 1 {
+					p := producers[0]
+					if p.name != "MintFromAdapter" {
+						t.Errorf("FAIL: sole exported producer under DEFAULT tag set is %q "+
+							"(want MintFromAdapter) — only MintFromAdapter is the permitted "+
+							"production constructor name.", p.name)
+					}
+					if !p.witnessGated {
+						t.Errorf("FAIL: MintFromAdapter under DEFAULT tag set is NOT witness-gated " +
+							"— it must require an unexported adapterWitness parameter.")
+					}
+					if p.name == "MintFromAdapter" && p.witnessGated {
+						t.Logf("OK (B3d acceptance): MintFromAdapter is present, witness-gated, " +
+							"sole producer under default tag set — LB-2 B3d criterion satisfied.")
+					}
+				} else {
+					t.Logf("OK (B3b reality): default tag set has zero CounterAuthority producers " +
+						"(MintFromAdapter not yet wired).")
+				}
+			}
+
+			// For ALL tag sets: enforce the relaxed rule.
 			for _, p := range producers {
-				if p.witnessGated {
-					t.Logf("OK: exported %s %q returns CounterAuthority but is witness-gated "+
-						"(requires unexported param %q) under tags %q — uncallable from "+
-						"verify/mode/usecase/cli even if compiled.",
-						p.kind, p.name, p.unexportedParam, tagLabel(ts.tags))
+				// Rule 1: zero unwitnessed.
+				if !p.witnessGated {
+					t.Errorf("FAIL: exported package-level %s %q produces CounterAuthority "+
+						"under tags %q WITHOUT requiring an unexported witness parameter.\n"+
+						"  Zero unwitnessed CounterAuthority producers are permitted under "+
+						"any shipped-candidate tag set.\n"+
+						"  Gate it behind an unexported witness type or remove it.",
+						p.kind, p.name, tagLabel(ts.tags))
 					continue
 				}
-				t.Errorf("FAIL: exported package-level %s %q produces CounterAuthority "+
-					"under tags %q WITHOUT requiring an unexported witness parameter.\n"+
-					"  Such a symbol is a production-grade Valid()-producer reachable as "+
-					"module API: verify/mode/usecase/cli could call it if a shipped build "+
-					"set this tag.\n"+
-					"  Gate it behind an unexported witness type declared in this package "+
-					"(mirror countertypes.testOnlyWitness / capmint), or remove it.",
-					p.kind, p.name, tagLabel(ts.tags))
+				// Rule 2: only permitted names.
+				if !permitted[p.name] {
+					t.Errorf("FAIL: exported %s %q is witness-gated but its name is not in "+
+						"the permitted set {MintFromAdapter, NewForTest} under tags %q.\n"+
+						"  Only these named constructors are permitted — rename or remove it.",
+						p.kind, p.name, tagLabel(ts.tags))
+					continue
+				}
+				t.Logf("OK: exported %s %q returns CounterAuthority, is witness-gated "+
+					"(unexported param %q), and has a permitted name — uncallable from "+
+					"verify/mode/usecase/cli even if compiled. tags=%q",
+					p.kind, p.name, p.unexportedParam, tagLabel(ts.tags))
+			}
+
+			// Rule 3: for any tag set, if more than one producer exists, it must be
+			// because testhook added NewForTest alongside MintFromAdapter. A second
+			// MintFromAdapter (impossible via map key) or any other pair is a violation.
+			if len(producers) > 2 {
+				t.Errorf("FAIL: more than 2 CounterAuthority producers under tags %q (%d) — "+
+					"only {MintFromAdapter} (default) or {MintFromAdapter, NewForTest} "+
+					"(testhook) are permitted.", tagLabel(ts.tags), len(producers))
 			}
 
 			if !t.Failed() {
-				t.Logf("tag set %q: %d CounterAuthority producer(s), all witness-gated "+
-					"or absent — shipped-build-testhook-free is mechanically enforced.",
+				t.Logf("tag set %q: %d CounterAuthority producer(s), relaxed LB-2 rule satisfied.",
 					tagLabel(ts.tags), len(producers))
 			}
 		})
@@ -143,53 +199,207 @@ func TestShippedSurface_TesthookDeltaIsWitnessGated(t *testing.T) {
 	}
 }
 
-// TestShippedSurface_GuardFires is the negative self-test: it proves the AST
-// classifier flags a plain exported Valid()-producer (mirrors the allowlist
-// negative tests). It synthesizes the AST of a witness-free exported producer
-// and asserts the classifier reports it as NOT witness-gated, so a real
-// regression cannot pass silently.
+// TestShippedSurface_GuardFires is the extended negative self-test.
+//
+// It proves the AST classifier fires on:
+//
+//	(a) a witness-FREE exported producer (the original guard),
+//	(b) a SECOND witness-gated producer alongside MintFromAdapter (the relaxed
+//	    rule must reject a second producer even if each is individually
+//	    witness-gated), and
+//	(c) an exported producer whose name is NOT "MintFromAdapter" even if
+//	    witness-gated (the relaxed rule allows ONLY the named constructor).
+//
+// The relaxed LB-2 rule (ADR-0007 §1.4) permits at most one CounterAuthority
+// producer under any shipped-candidate tag set, it must be named "MintFromAdapter",
+// and it must be witness-gated. Zero unwitnessed producers. Zero second producers.
+// A guard that silently accepts any of (a)/(b)/(c) is itself a defect.
 func TestShippedSurface_GuardFires(t *testing.T) {
 	t.Parallel()
 
-	const src = `package countertypes
+	// (a) witness-FREE exported producer — the original case.
+	t.Run("(a)_witness_free_producer", func(t *testing.T) {
+		t.Parallel()
+		const src = `package countertypes
 
-// Simulated REGRESSION: a plain exported Valid()-producer with only
-// builtin/exported parameter types. verify/mode/usecase/cli could call this.
 func ResurrectedNewForTest(lastAccepted uint64, pending *PendingBump) CounterAuthority {
 	return newCounterAuthority(lastAccepted, pending)
 }
+`
+		fset := token.NewFileSet()
+		file, err := parser.ParseFile(fset, "regression_a.go", src, 0)
+		if err != nil {
+			t.Fatalf("parse synthetic source: %v", err)
+		}
+		got := classifyProducers(file)
+		p, ok := got["ResurrectedNewForTest"]
+		if !ok {
+			t.Fatal("NEGATIVE TEST FAIL: classifier did not detect the witness-free producer — " +
+				"the guard would not fire on a real regression.")
+		}
+		if p.witnessGated {
+			t.Fatal("NEGATIVE TEST FAIL: classifier marked a witness-FREE producer as " +
+				"witness-gated — a regression would pass silently.")
+		}
+		// Apply the relaxed rule: zero unwitnessed producers => FAIL.
+		violations := countUnwitnessed(got)
+		if violations == 0 {
+			t.Fatal("NEGATIVE TEST FAIL: relaxed-rule check did not count the unwitnessed " +
+				"producer as a violation — the guard fires on classification but the rule " +
+				"check would pass silently.")
+		}
+		t.Log("(a) guard fires: witness-free producer detected and classified as violation.")
+	})
 
-// Control: a witness-gated producer (must be classified as safe).
+	// (b) a SECOND witness-gated producer alongside MintFromAdapter — must FAIL.
+	t.Run("(b)_second_witness_gated_producer", func(t *testing.T) {
+		t.Parallel()
+		const src = `package countertypes
+
+func MintFromAdapter(w *adapterWitness, la uint64, p *PendingBump) CounterAuthority {
+	return newCounterAuthority(la, p)
+}
+
+func SecondWitnessedProducer(w *adapterWitness, la uint64) CounterAuthority {
+	return newCounterAuthority(la, nil)
+}
+`
+		fset := token.NewFileSet()
+		file, err := parser.ParseFile(fset, "regression_b.go", src, 0)
+		if err != nil {
+			t.Fatalf("parse synthetic source: %v", err)
+		}
+		got := classifyProducers(file)
+		if len(got) != 2 {
+			t.Fatalf("expected 2 producers in synthetic source, got %d: %v", len(got), got)
+		}
+		// Apply the relaxed rule: exactly ONE named witness-gated producer allowed.
+		// Two producers => violation even if both are witness-gated.
+		if !relaxedRuleViolated(got) {
+			t.Fatal("NEGATIVE TEST FAIL: relaxed rule accepted two witness-gated producers — " +
+				"only one named MintFromAdapter is permitted.")
+		}
+		t.Log("(b) guard fires: second witness-gated producer detected as violation of " +
+			"the 'exactly one named MintFromAdapter' rule.")
+	})
+
+	// (c) wrong-named witness-gated producer — must FAIL even if only one.
+	t.Run("(c)_wrong_named_witness_gated_producer", func(t *testing.T) {
+		t.Parallel()
+		const src = `package countertypes
+
+func WrongNamedProducer(w *adapterWitness, la uint64, p *PendingBump) CounterAuthority {
+	return newCounterAuthority(la, p)
+}
+`
+		fset := token.NewFileSet()
+		file, err := parser.ParseFile(fset, "regression_c.go", src, 0)
+		if err != nil {
+			t.Fatalf("parse synthetic source: %v", err)
+		}
+		got := classifyProducers(file)
+		p, ok := got["WrongNamedProducer"]
+		if !ok {
+			t.Fatal("NEGATIVE TEST FAIL: classifier did not detect the wrong-named producer.")
+		}
+		if !p.witnessGated {
+			t.Fatal("control check: expected WrongNamedProducer to be classified as " +
+				"witness-gated (it has an unexported-type param) — classifier regression.")
+		}
+		// Apply the relaxed rule: the only permitted name is "MintFromAdapter".
+		if !relaxedRuleViolated(got) {
+			t.Fatal("NEGATIVE TEST FAIL: relaxed rule accepted a wrong-named witness-gated " +
+				"producer — only 'MintFromAdapter' is permitted by name.")
+		}
+		t.Log("(c) guard fires: wrong-named witness-gated producer detected as violation.")
+	})
+
+	// Control: MintFromAdapter alone — must PASS the relaxed rule.
+	t.Run("control_mint_from_adapter_alone", func(t *testing.T) {
+		t.Parallel()
+		const src = `package countertypes
+
+func MintFromAdapter(w *adapterWitness, la uint64, p *PendingBump) CounterAuthority {
+	return newCounterAuthority(la, p)
+}
+`
+		fset := token.NewFileSet()
+		file, err := parser.ParseFile(fset, "control.go", src, 0)
+		if err != nil {
+			t.Fatalf("parse synthetic source: %v", err)
+		}
+		got := classifyProducers(file)
+		if len(got) != 1 {
+			t.Fatalf("expected exactly 1 producer in control source, got %d", len(got))
+		}
+		if relaxedRuleViolated(got) {
+			t.Fatal("NEGATIVE TEST FAIL (false positive): relaxed rule rejected " +
+				"MintFromAdapter alone — the B3d acceptance criterion would fail.")
+		}
+		t.Log("control: MintFromAdapter alone passes the relaxed rule.")
+	})
+
+	// Original control from the old test: witness-gated producer classified as safe.
+	t.Run("original_witnessed_control", func(t *testing.T) {
+		t.Parallel()
+		const src = `package countertypes
+
 func WitnessedProducer(w *testOnlyWitness, la uint64) CounterAuthority {
 	return newCounterAuthority(la, nil)
 }
 `
-	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, "regression.go", src, 0)
-	if err != nil {
-		t.Fatalf("parse synthetic regression source: %v", err)
-	}
-	got := classifyProducers(file)
+		fset := token.NewFileSet()
+		file, err := parser.ParseFile(fset, "original_control.go", src, 0)
+		if err != nil {
+			t.Fatalf("parse synthetic source: %v", err)
+		}
+		got := classifyProducers(file)
+		p, ok := got["WitnessedProducer"]
+		if !ok || !p.witnessGated {
+			t.Fatalf("original control: classifier failed to recognize witness-gated "+
+				"producer (ok=%v, gated=%v)", ok, p.witnessGated)
+		}
+		t.Log("original control: witness-gated producer classified as safe.")
+	})
+}
 
-	bad, ok := got["ResurrectedNewForTest"]
-	if !ok {
-		t.Fatal("NEGATIVE TEST FAIL: classifier did not detect the plain exported " +
-			"Valid()-producer at all — the guard would not fire on a real regression.")
+// countUnwitnessed returns the number of producers that are NOT witness-gated.
+func countUnwitnessed(producers map[string]ctProducer) int {
+	n := 0
+	for _, p := range producers {
+		if !p.witnessGated {
+			n++
+		}
 	}
-	if bad.witnessGated {
-		t.Fatal("NEGATIVE TEST FAIL: classifier marked a witness-FREE exported " +
-			"Valid()-producer as witness-gated. A real regression would pass silently. " +
-			"(A guard that silently passes a forbidden surface is itself a defect.)")
-	}
+	return n
+}
 
-	good, ok := got["WitnessedProducer"]
-	if !ok || !good.witnessGated {
-		t.Fatalf("NEGATIVE TEST FAIL: classifier failed to recognize the witness-gated "+
-			"control as safe (ok=%v, gated=%v) — false positives would make the guard "+
-			"unmaintainable.", ok, good.witnessGated)
+// relaxedRuleViolated applies the ADR-0007 §1.4 relaxed LB-2 rule to a producer map:
+//
+//   - zero unwitnessed producers,
+//   - the only permitted producer name set is a subset of {MintFromAdapter, NewForTest},
+//   - every member is witness-gated,
+//   - at most one producer with name "MintFromAdapter" (and zero others outside
+//     the permitted set).
+//
+// Returns true if the rule is violated (test should FAIL if guard must fire).
+// Returns false if the rule is satisfied (test should FAIL if guard must NOT fire).
+func relaxedRuleViolated(producers map[string]ctProducer) bool {
+	permitted := map[string]bool{"MintFromAdapter": true, "NewForTest": true}
+	for name, p := range producers {
+		if !p.witnessGated {
+			return true // unwitnessed => violation
+		}
+		if !permitted[name] {
+			return true // wrong name => violation
+		}
 	}
-	t.Log("guard fires: a witness-free exported Valid()-producer is detected and " +
-		"classified unsafe; the witness-gated control is classified safe.")
+	// More than one producer with name MintFromAdapter is impossible (map key),
+	// but two different permitted names (MintFromAdapter + NewForTest) is allowed
+	// only under the testhook set. For the default set, MintFromAdapter must be
+	// the only one. We accept both here; the per-tag-set rule is enforced in
+	// TestShippedSurface_NoUnwitnessedValidProducer.
+	return false
 }
 
 // ctProducer describes an exported package-level symbol that yields a

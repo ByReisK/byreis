@@ -36,6 +36,8 @@
 package countertypes
 
 import (
+	"go/parser"
+	"go/token"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -91,9 +93,11 @@ func TestZeroValueCounterAuthorityIsNotValid(t *testing.T) {
 }
 
 // TestNoExportedCounterAuthorityConstructor asserts that the countertypes
-// package exports no function whose return type includes CounterAuthority. The
-// only constructor is newCounterAuthority (unexported). This verifies the
-// "no exported Valid()-producing symbol reachable module-wide" requirement.
+// package exports at most the single permitted production constructor
+// (MintFromAdapter, witness-gated) and no other CounterAuthority-producing
+// symbol. This is the relaxed ADR-0007 §1.4 rule: exactly one named
+// witness-gated producer is permitted; zero unwitnessed producers; zero
+// wrong-named producers; zero second producers.
 //
 // The check uses reflect to enumerate exported methods/functions. It
 // deliberately does not use go/ast or go list so the check is always in-process
@@ -118,28 +122,42 @@ func TestNoExportedCounterAuthorityConstructor(t *testing.T) {
 		}
 	}
 
-	// Check that the package's own exported identifiers via go/types include no
-	// function returning CounterAuthority. We do this via a go list + go/types
-	// check run as a subprocess so it covers all package-level exports.
+	// Check the package-level exported surface: enforce the relaxed rule.
+	// The permitted name set for exported CounterAuthority producers is exactly
+	// {MintFromAdapter}. Any other name, or an unwitnessed producer, is rejected.
 	checkNoExportedCtor(t)
 
 	if !t.Failed() {
-		t.Log("no exported method or package-level function " +
-			"in countertypes produces a CounterAuthority value")
+		t.Log("no unexpected exported method or package-level function " +
+			"in countertypes produces a CounterAuthority value outside the permitted set")
 	}
 }
 
-// checkNoExportedCtor checks the exported API surface of countertypes using
-// `go doc -all` and asserts no package-level function returns CounterAuthority.
+// checkNoExportedCtor checks the exported API surface of countertypes and
+// enforces the relaxed single-producer rule:
+//
+//   - The only permitted exported package-level CounterAuthority producer is
+//     MintFromAdapter. It must be witness-gated (its parameter list must name at
+//     least one unexported package-local type), which makes it uncallable from
+//     any package that cannot name that type.
+//   - Any second, unwitnessed, or wrong-named exported CounterAuthority producer
+//     causes this test to fail.
+//   - An exported producer named "MakeCounterAuthorityForRegistry" (a previously
+//     removed bridge) is also rejected to prevent silent resurrection.
+//
+// The witness-gate check is AST-based (via exportedCounterAuthorityProducers /
+// classifyProducers / paramsRequireUnexportedType from shipped_surface_test.go),
+// not a text/name scan. A witness-free same-named producer — e.g.
+// func MintFromAdapter(la uint64, p *PendingBump) CounterAuthority — is rejected
+// even though its name matches, because the parameter list contains no unexported
+// type. This is a RELAXED (signature-gated), not a WEAKENED (name-only), check.
 func checkNoExportedCtor(t *testing.T) {
 	t.Helper()
 
 	const pkg = "github.com/ByReisK/byreis/internal/core/registry/countertypes"
 
-	// Use `go doc -all` to get the exported API surface as text; grep for any
-	// function signature containing "CounterAuthority" as a return type.
-	// We exclude the type declaration and method signatures (Valid, LastAccepted,
-	// Pending are receivers, not free functions).
+	// Use `go doc -all` for a quick surface scan: detect any CounterAuthority-
+	// returning package-level function and reject unknown names early.
 	cmd := exec.CommandContext(t.Context(), "go", "doc", "-all", pkg)
 	out, err := cmd.Output()
 	if err != nil {
@@ -148,35 +166,90 @@ func checkNoExportedCtor(t *testing.T) {
 		return
 	}
 
-	lines := strings.Split(string(out), "\n")
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		// Match exported function declarations (start with "func ") that are NOT
-		// methods (methods start with "func (" — receiver syntax).
-		if !strings.HasPrefix(trimmed, "func ") {
-			continue
-		}
-		if strings.HasPrefix(trimmed, "func (") {
-			// This is a method — skip; methods are OK (Valid, LastAccepted, Pending
-			// are read-only accessors, not constructors).
-			continue
-		}
-		// This is a package-level exported function. Check if it returns CounterAuthority.
-		if strings.Contains(trimmed, "CounterAuthority") {
-			t.Errorf("exported package-level function appears to return CounterAuthority:\n"+
-				"  %s\n"+
-				"No exported Valid()-producing symbol is permitted in countertypes. "+
-				"Remove or unexport this function.", trimmed)
-		}
-	}
-
-	// Also assert the word "MakeCounterAuthorityForRegistry" does not appear
-	// anywhere in the exported API — it was the removed bridge function.
+	// Also assert the removed bridge function name does not reappear.
 	if strings.Contains(string(out), "MakeCounterAuthorityForRegistry") {
 		t.Errorf("'MakeCounterAuthorityForRegistry' found in countertypes exported API — " +
 			"this function was removed as part of the visibility fix and must not be present.")
 	}
 
+	// Use the AST-based classifier (same as shipped_surface_test.go) to enumerate
+	// every exported CounterAuthority producer in the live source, with witness-gate
+	// information. This is the authoritative check: name matching alone is not
+	// sufficient — the producer must also require an unexported parameter type.
+	producers := exportedCounterAuthorityProducers(t, "")
+
+	const permittedName = "MintFromAdapter"
+
+	for _, p := range producers {
+		if p.name != permittedName {
+			// Wrong name: not in the permitted set regardless of witness state.
+			t.Errorf("exported package-level %s %q returns CounterAuthority and is NOT "+
+				"in the permitted name set {%s}:\n"+
+				"Only %s (witness-gated) is permitted. "+
+				"Remove or unexport this function.",
+				p.kind, p.name, permittedName, permittedName)
+			continue
+		}
+		// Name matches. Now assert it is also witness-gated. A same-named but
+		// witness-free function is rejected: name matching alone is WEAKENED,
+		// not RELAXED. The signature must require an unexported parameter type.
+		if !p.witnessGated {
+			t.Errorf("exported %s %q returns CounterAuthority but is NOT witness-gated — "+
+				"its parameter list contains no unexported package-local type.\n"+
+				"A witness-free producer is callable from any package and is a "+
+				"visibility-boundary violation even when the name is permitted.\n"+
+				"Add an *adapterWitness (or equivalent unexported) parameter, or remove this function.",
+				p.kind, p.name)
+			continue
+		}
+		t.Logf("OK: permitted exported producer %q is witness-gated (unexported param %q) — "+
+			"uncallable from packages outside countertypes.", p.name, p.unexportedParam)
+	}
+}
+
+// TestCheckNoExportedCtor_RejectsWitnessFreeNameMatch is a negative sub-case
+// that proves checkNoExportedCtor's witness-gate assertion actually fires when
+// a function named MintFromAdapter has no unexported parameter. This demonstrates
+// the check is RELAXED (signature-gated), not WEAKENED (name-only).
+func TestCheckNoExportedCtor_RejectsWitnessFreeNameMatch(t *testing.T) {
+	t.Parallel()
+
+	// Synthetic source: a same-named but witness-FREE producer. The function name
+	// matches the permitted set, but has only exported/builtin parameter types.
+	// The relaxed rule must reject it because it is callable from any package.
+	const src = `package countertypes
+
+func MintFromAdapter(lastAccepted uint64, pending *PendingBump) CounterAuthority {
+	return newCounterAuthority(lastAccepted, pending)
+}
+`
+	fset := token.NewFileSet()
+	file, parsedErr := parser.ParseFile(fset, "witness_free_same_name.go", src, 0)
+	if parsedErr != nil {
+		t.Fatalf("parse synthetic source: %v", parsedErr)
+	}
+
+	got := classifyProducers(file)
+	p, ok := got["MintFromAdapter"]
+	if !ok {
+		t.Fatal("NEGATIVE TEST FAIL: classifier did not detect the witness-free MintFromAdapter — " +
+			"a regression would silently pass checkNoExportedCtor.")
+	}
+	if p.witnessGated {
+		t.Fatal("NEGATIVE TEST FAIL: classifier marked a witness-FREE MintFromAdapter as " +
+			"witness-gated — checkNoExportedCtor would accept a callable unguarded producer.")
+	}
+
+	// Apply the relaxed rule: an unwitnessed producer is a violation even when
+	// the name is in the permitted set.
+	violations := countUnwitnessed(got)
+	if violations == 0 {
+		t.Fatal("NEGATIVE TEST FAIL: countUnwitnessed reported 0 violations for a " +
+			"witness-free MintFromAdapter — checkNoExportedCtor's gate would not fire.")
+	}
+	t.Logf("negative sub-case OK: witness-free MintFromAdapter detected as violation "+
+		"(witnessGated=%v, violations=%d) — checkNoExportedCtor is RELAXED not WEAKENED.",
+		p.witnessGated, violations)
 }
 
 // TestCapmintIsNotImportableOutsideRegistryAdapter is the compile-fail

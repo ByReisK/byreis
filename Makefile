@@ -13,7 +13,7 @@ LDFLAGS      := -X $(MODULE)/pkg/byreis.Version=$(VERSION)
 GOLANGCI     := golangci-lint
 GO_TEST_FLAGS := -race -timeout=120s
 
-.PHONY: build test lint install clean check-allowlist
+.PHONY: build test test-testhook test-shipgate lint install clean check-allowlist
 
 ## build: compile the byreis binary to ./bin/byreis
 build:
@@ -23,6 +23,11 @@ build:
 ## test: run all tests with the race detector
 test:
 	go test $(GO_TEST_FLAGS) ./...
+
+## test-testhook: run all tests with the testhook build tag (counter-decision negatives)
+## This is the ONLY place the testhook tag is compiled; never compiled into shipped binaries.
+test-testhook:
+	go test $(GO_TEST_FLAGS) -tags testhook ./...
 
 ## test-shipgate: run the non-skippable asymmetric-access ship-gate suite
 test-shipgate:

@@ -62,6 +62,13 @@ type AdminSet struct {
 	Stale       bool
 	StaleReason string
 
+	// ConfiguredFiles maps logical_file_name → registry-configured repo-relative
+	// path for this project. It is filled ONLY from a SourceVerified registry
+	// fetch and is consumed by the merge use-case's write-path cross-check. An
+	// unverified/stale AdminSet must carry an empty or nil ConfiguredFiles so
+	// the merge cross-check cannot proceed on an unverified path.
+	ConfiguredFiles map[string]string
+
 	FetchedAt  time.Time
 	HeadCommit string
 }
@@ -71,10 +78,11 @@ type AdminSet struct {
 // Each sentinel has exactly one owning package to avoid two packages owning the
 // same error. ErrReplay and ErrCounterReconcile are owned by
 // internal/core/registry/countertypes and are referenced from there directly
-// (no alias vars). ErrNoTrustedSigner is owned by internal/core/crypto/verify;
-// the registry boundary returns that package's sentinel by import, not a local
-// alias. This package does not import crypto/verify, which keeps the dependency
-// direction clean and avoids an import cycle.
+// (no alias vars). ErrNoTrustedSigner is owned by this package; the registry
+// boundary adapter and the verify package both reference it from here directly
+// rather than defining alias vars. This keeps the dependency direction clean:
+// verify imports core/registry (for the sentinel) but core/registry never
+// imports verify, so there is no import cycle.
 var (
 	// ErrUnsignedRegistry: the registry HEAD commit could not be
 	// signature-verified. A hard error for admin promotion; a contributor
@@ -99,6 +107,18 @@ var (
 	ErrCacheTampered = errors.New(
 		"registry cache integrity check failed (counter regressed) — possible tamper; " +
 			"delete the cache and re-fetch: rm -rf ~/.cache/byreis/registry")
+
+	// ErrNoTrustedSigner: no trusted manifest signer key is available, or all
+	// keys are invalid. This package is the semantic owner; the adapter boundary
+	// and the verify package both reference this sentinel directly rather than
+	// defining alias vars, so the sentinel has exactly one owner.
+	//
+	// Returned at the registry boundary when a parsed SignerKey has wrong length
+	// (not 32 bytes): a bad key at parse time surfaces this error before it
+	// can cause a confusing ErrSignatureInvalid later at verify time.
+	ErrNoTrustedSigner = errors.New(
+		"no trusted manifest signer key available — " +
+			"run `byreis doctor` to check your trust anchor, or `byreis auth login`")
 )
 
 // PendingBumpInput carries the write-ahead intent recorded before a
@@ -136,11 +156,9 @@ type RegistryClient interface {
 	// never silently grants admin from an expired cache.
 	//
 	// Every Ed25519 key parsed into SignerKeys is length-validated to exactly
-	// 32 bytes at this boundary. A wrong-length entry → ErrNoTrustedSigner here
-	// (rather than a confusing ErrSignatureInvalid raised later at verify time).
-	// ErrNoTrustedSigner is the canonical sentinel from
-	// internal/core/crypto/verify; callers import that package's sentinel
-	// directly — this interface returns it by reference.
+	// 32 bytes at this boundary. A wrong-length entry returns ErrNoTrustedSigner
+	// (this package's sentinel) rather than a confusing ErrSignatureInvalid
+	// raised later at verify time.
 	FetchAdminSet(ctx context.Context, projectID string) (AdminSet, error)
 
 	// VerifyRegistryFreshness enforces anti-rollback: the fetched HEAD must be a

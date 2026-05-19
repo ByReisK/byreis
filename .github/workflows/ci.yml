@@ -70,19 +70,19 @@ jobs:
           go-version: "1.26.x"
           cache: true
       - name: Run testhook-gated decision-table negatives with race detector
-        # T4: the §3.4 step-4 counter-decision negatives (ErrReplay vs
-        # ErrCounterReconcile vs OK, and the ADR-0006 H-1 lost-intent row) are
-        # gated behind -tags testhook because they need a Valid()
-        # CounterAuthority. Without this job they never executed in CI. This
-        # job is the ONLY place the testhook tag is compiled, and it compiles
-        # ONLY tests (go test), never a shipped/release binary. It is paired
-        # with the build job's clean-invocation assertion and the default-tag
-        # TestShippedSurface_* guard: the tag is exercised in TEST CI and
-        # provably excluded from BUILD/RELEASE CI.
-        run: |
-          go test -race -timeout=120s -tags testhook \
-            ./internal/core/crypto/verify/... \
-            ./internal/core/registry/countertypes/...
+        # This job is the ONLY place the testhook tag is compiled, and it
+        # compiles ONLY tests (go test), never a shipped/release binary. It is
+        # paired with the build job's clean-invocation assertion and the
+        # default-tag TestShippedSurface_* guard: the tag is exercised in TEST
+        # CI and provably excluded from BUILD/RELEASE CI.
+        #
+        # Scope:
+        #   - internal/core/crypto/verify: signed-commit verify negatives
+        #   - internal/core/registry/countertypes: counter-decision negatives
+        #     (ErrReplay vs ErrCounterReconcile vs OK, H-1 lost-intent row)
+        #   - internal/app, internal/cli: wiring-layer B3e tests
+        #   - All other packages with testhook-gated tests run here too.
+        run: go test -race -timeout=120s -tags testhook ./...
 
   lint:
     name: Lint (golangci-lint)

@@ -61,11 +61,24 @@ var allowedByreisPkgsSubmit = map[string]bool{
 	module + "/internal/core/crypto/manifest":   true,
 	module + "/internal/core/crypto/artifact":   true,
 	module + "/internal/core/registry/rectypes": true,
+	// AMENDMENT (B3c, explicit review): the Submit spine consumes the
+	// append-only audit port and the structured-log port. Both packages have a
+	// transitive set of EXACTLY themselves (stdlib-only; verified via
+	// `go list -deps`): zero third-party, and provably no crypto/ed25519,
+	// crypto/identity, crypto/decrypt, or internal/core/registry reachable.
+	// They are pure consumer-defined domain ports with no identity-bearing or
+	// counter-authority dependency, so admitting them cannot reintroduce
+	// decrypt/identity material on the contributor path. crypto/ed25519,
+	// internal/core/registry, and internal/core/registry/countertypes remain
+	// forbidden.
+	module + "/internal/core/audit":   true,
+	module + "/internal/core/logging": true,
 	// Note: module + "/internal/core/registry" is NOT here (it transitively
 	// reaches crypto/ed25519 via SignerKey/CounterStore).
 	// Note: module + "/internal/core/registry/countertypes" is NOT here
 	// (counter authority is for verify/admin, not the contributor submit path).
-	// The git/audit/config port packages are added here when they are wired.
+	// The git/config port packages are consumer-defined INSIDE this sub-package
+	// (submit.GitPort etc.) so internal/core/git is deliberately not pulled in.
 }
 
 // allowedThirdPartyPkgsSubmit enumerates the non-stdlib, non-byreis packages

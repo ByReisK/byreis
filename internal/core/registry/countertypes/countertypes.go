@@ -45,12 +45,17 @@
 //
 // # Wiring
 //
-// Until the real implementation lands, the registry adapter stub and
-// capmint.Mint both panic. The type-shape constraint (no exported constructor,
-// no settable trust-bearing field) is already operative. capmint.Mint will
-// call countertypes.newCounterAuthority through a bridge once that bridge is
-// reviewed (see the open design question in
-// internal/adapter/registry/internal/capmint/capmint.go).
+// Production CounterAuthority values are now minted via the exported
+// MintFromAdapter function defined in this package. MintFromAdapter requires an
+// unexported *adapterWitness parameter, making it uncallable by accident from
+// packages that cannot name that type. The only wired caller is
+// internal/adapter/registry/internal/capmint (the capability-mint package),
+// which is itself importable only by code rooted at internal/adapter/registry
+// (Go internal/ rule). The honest, load-bearing guarantee is the Go internal/
+// import restriction on capmint combined with the AST classifier in
+// shipped_surface_test.go — not the witness parameter alone. The witness is
+// defense-in-depth: it makes the constructor unnameable-by-construction from
+// core packages and AST-classifiable by the surface guard.
 //
 // Security note: the construction and trust model here is security-relevant and
 // is not self-certified. It requires crypto and threat-model sign-off before
@@ -80,16 +85,23 @@ var ErrCounterReconcile = errors.New(
 		"see reconciliation runbook: run `byreis admin counter reconcile` or contact an admin")
 
 // PendingBump is the write-ahead intent recorded before a secrets-repo merge.
-// TargetArtifactSHA is sha256 over the exact, untransformed signed
-// file-of-record bytes (zero normalization). It is the post-sign hash, not the
-// pre-sign hash.
+// TargetArtifactSHA is the canonical content SHA of the signed file-of-record
+// (the post-sign value), computed by the single shared content-SHA function —
+// it is NOT a hash of the raw, untransformed on-disk file buffer.
 type PendingBump struct {
 	// PendingCounter is last_accepted_counter + 1, recorded before merge.
 	PendingCounter uint64
 
-	// TargetArtifactSHA is sha256 (hex) over the exact untransformed signed
-	// file-of-record bytes, with zero normalization. It is compared against the
-	// content SHA of the committed file in the VerifyOfRecord decision table.
+	// TargetArtifactSHA is the canonical content SHA of the signed
+	// file-of-record: sha256 over the canonical domain stream of the manifest,
+	// a 0x1f separator, and the raw signature — i.e. the value the shared
+	// content-SHA function computes, NOT a hash of the raw, untransformed
+	// on-disk file bytes and not a re-implemented preimage. The recorder MUST
+	// obtain it by calling that same shared content-SHA function over the
+	// file-of-record it is about to commit, so the recorded value and the
+	// verify-time value come from the identical function. It is compared
+	// against the content SHA of the committed file in the VerifyOfRecord
+	// decision table.
 	TargetArtifactSHA string
 
 	// TargetPR is the PR reference for audit linkage.
@@ -172,4 +184,31 @@ func newCounterAuthority(lastAccepted uint64, pending *PendingBump) CounterAutho
 		pending:      pending,
 		valid:        true,
 	}
+}
+
+// adapterWitness is an unexported capability token. It has zero usable fields
+// and zero exported constructor. Because the type is unexported, no package
+// outside countertypes can name *adapterWitness in a declaration, so
+// MintFromAdapter is uncallable by any package that cannot name this type.
+// capmint passes an untyped nil (Go-converted to (*adapterWitness)(nil))
+// because it cannot name the type at all. There is no exported producer of
+// *adapterWitness under any build tag — that would be a laundering vector.
+// The honest guarantee rests on the Go internal/ import rule and the AST
+// surface classifier, not on this token alone.
+type adapterWitness struct{ _ [0]func() }
+
+// MintFromAdapter is the single exported production CounterAuthority producer.
+// It requires a *adapterWitness parameter, which is unexported and has no
+// exported constructor. This makes MintFromAdapter uncallable by construction
+// from any package that cannot name *adapterWitness. The only wired caller is
+// internal/adapter/registry/internal/capmint, which passes an untyped nil
+// because it cannot name the type. MintFromAdapter accepts a nil witness in
+// production — the nil-panic guard belongs to the test-only NewForTest, not
+// here. The load-bearing guarantee is the Go internal/ import rule on capmint
+// combined with the AST surface classifier in countertypes, plus capmint being
+// the only wired caller; the witness parameter is defense-in-depth for
+// accident-prevention and AST classification only.
+func MintFromAdapter(w *adapterWitness, lastAccepted uint64, pending *PendingBump) CounterAuthority {
+	_ = w // accepted for AST classification; not claimed load-bearing
+	return newCounterAuthority(lastAccepted, pending)
 }

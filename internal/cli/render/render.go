@@ -67,3 +67,10 @@ func (r *Renderer) PrintVersion(version string) {
 func (r *Renderer) PrintError(msg string) {
 	_, _ = fmt.Fprintf(r.Err, "error: %s\n", msg)
 }
+
+// EncodeJSON encodes v as JSON to w. Errors are silently discarded to keep
+// command RunE signatures clean; a write error to stdout is not actionable
+// from the command layer.
+func EncodeJSON(w io.Writer, v any) error {
+	return json.NewEncoder(w).Encode(v)
+}

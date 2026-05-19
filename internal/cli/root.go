@@ -11,9 +11,16 @@ import (
 )
 
 // NewRootCmd constructs the root cobra command with all subcommands wired.
-// All adapter construction and injection is done here (cmd/byreis/main.go calls
-// this). Zero business logic lives in this file.
+// All adapter construction and injection is done in cmd/byreis/main.go, which
+// passes a populated Deps into this function. Zero business logic lives here.
 func NewRootCmd() *cobra.Command {
+	return NewRootCmdWithDeps(&Deps{})
+}
+
+// NewRootCmdWithDeps constructs the root command with fully-injected use-case
+// deps. This overload is used by cmd/byreis/main.go (production) and by tests
+// that need to verify command behaviour with injected fakes.
+func NewRootCmdWithDeps(deps *Deps) *cobra.Command {
 	var jsonFlag bool
 
 	root := &cobra.Command{
@@ -30,8 +37,15 @@ hold only public keys.`,
 
 	root.PersistentFlags().BoolVar(&jsonFlag, "json", false, "emit machine-readable JSON output")
 
-	// version subcommand — the only command implemented so far.
 	root.AddCommand(newVersionCmd(&jsonFlag))
+	root.AddCommand(newInitCmd(deps, &jsonFlag))
+	root.AddCommand(newDoctorCmd(deps, &jsonFlag))
+	root.AddCommand(newSubmitCmd(deps, &jsonFlag))
+	root.AddCommand(newReviewCmd(deps, &jsonFlag))
+	root.AddCommand(newMergeCmd(deps, &jsonFlag))
+	root.AddCommand(newGetCmd(deps, &jsonFlag))
+	root.AddCommand(newDecryptCmd(deps, &jsonFlag))
+	root.AddCommand(newEditCmd(deps, &jsonFlag))
 
 	return root
 }
