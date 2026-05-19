@@ -1,3 +1,9 @@
+# --- Internal planning/design docs (NOT published; kept local only) ---
+# Public repo carries only contributor-facing README/roadmap + code.
+PLAN.md
+PLAN.v1.md
+design/
+
 # --- Claude Code / local AI tooling (intentionally not committed) ---
 CLAUDE.md
 .claude/

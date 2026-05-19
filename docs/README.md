@@ -12,8 +12,5 @@ Planned contents (per `PLAN.md` §1/§9, written during/after BUILD):
 - `threat-model.md` — public-facing security model & what byreis does/doesn't protect
 - `architecture.md` — high-level overview for evaluators
 
-> **Internal engineering artifacts do not live here.** The normative design
-> spec, ADRs, locked requirements, and the crypto-spike findings are in
-> [`../design/`](../design/) (`DESIGN.md`, `adr/`, `REQUIREMENTS.md`,
-> `FINDINGS.md`). Throwaway crypto-spike proof code is in `../spike/`
-> (git-ignored). Keep this `docs/` tree clean and publishable.
+This tree holds only user-facing documentation. Internal engineering and
+design notes are intentionally kept out of the public repository.
