@@ -1,0 +1,126 @@
+# golangci-lint configuration for byreis.
+# Enforces the Clean Architecture dependency rule: internal/core/** must not
+# import cobra/bubbletea/lipgloss/huh/go-git/go-keyring/net-http clients, so
+# the business core stays free of UI, SDK, and network concerns.
+
+version: "2"
+
+linters:
+  enable:
+    - depguard       # enforces the Clean Architecture import bans below
+    - govet          # standard correctness checks
+    - errcheck       # unchecked errors
+    - staticcheck    # advanced static analysis
+    - gosimple       # simplification suggestions
+    - ineffassign    # dead assignments
+    - unused         # unused code
+    - gofmt          # formatting
+    - goimports      # import grouping
+    - misspell       # spelling
+    - godot          # comment style
+    - noctx          # context-less HTTP requests
+    - gosec          # security issues (informational; non-blocking on skeleton)
+    - revive         # idiomatic Go
+    - exhaustive     # exhaustive switch checks
+
+linters-settings:
+  depguard:
+    rules:
+      # RULE 1: internal/core/** must not import UI packages (cobra, bubbletea, lipgloss, huh).
+      no-ui-in-core:
+        list-mode: lax  # deny the listed packages
+        files:
+          - "**/internal/core/**"
+        deny:
+          - pkg: "github.com/spf13/cobra"
+            desc: "internal/core must not import cobra (Clean Architecture: adapters depend inward, not outward). Move cobra usage to internal/cli."
+          - pkg: "github.com/charmbracelet/bubbletea"
+            desc: "internal/core must not import bubbletea (TUI framework). Use a port/interface in core; implement in internal/tui."
+          - pkg: "github.com/charmbracelet/lipgloss"
+            desc: "internal/core must not import lipgloss (UI styling). Move to internal/cli/render or internal/tui."
+          - pkg: "github.com/charmbracelet/huh"
+            desc: "internal/core must not import huh (UI forms). Move to internal/cli or internal/tui."
+
+      # RULE 2: internal/core/** must not import SDK/network packages.
+      no-sdk-in-core:
+        list-mode: lax
+        files:
+          - "**/internal/core/**"
+        deny:
+          - pkg: "github.com/go-git/go-git"
+            desc: "internal/core must not import go-git (network/SDK). Implement GitProvider in internal/adapter/git/github."
+          - pkg: "github.com/zalando/go-keyring"
+            desc: "internal/core must not import go-keyring (OS keychain SDK). Implement TokenStore in internal/adapter/keychain."
+          - pkg: "github.com/google/go-github"
+            desc: "internal/core must not import go-github SDK. Implement GitProvider in internal/adapter/git/github."
+          - pkg: "net/http"
+            desc: "internal/core must not import net/http for client use. Use injected ports. (HTTP handlers in adapters are allowed.)"
+
+      # RULE 3: internal/core/** must not import adapter implementations (prevent cycles).
+      no-adapter-in-core:
+        list-mode: lax
+        files:
+          - "**/internal/core/**"
+        deny:
+          - pkg: "github.com/ByReisK/byreis/internal/adapter"
+            desc: "internal/core must not import internal/adapter (dependency inversion violated). Define ports in core; implement in adapters."
+
+      # RULE 4: crypto/encrypt must not import identity or decrypt packages.
+      # The comprehensive closed-world import allowlist is enforced by the Go
+      # test (allowlist_test.go); these depguard rules are defense-in-depth.
+      no-identity-in-encrypt:
+        list-mode: lax
+        files:
+          - "**/internal/core/crypto/encrypt/**"
+        deny:
+          - pkg: "github.com/ByReisK/byreis/internal/core/crypto/identity"
+            desc: "crypto/encrypt must not import crypto/identity: the contributor path must never reach private-key material, or the asymmetric-access guarantee is defeated."
+          - pkg: "github.com/ByReisK/byreis/internal/core/crypto/decrypt"
+            desc: "crypto/encrypt must not import crypto/decrypt: it would give the contributor path a route to decrypt capability, defeating the asymmetric-access guarantee."
+          - pkg: "github.com/ByReisK/byreis/internal/core/registry"
+            desc: "crypto/encrypt must not import the parent registry package: it transitively reaches crypto/ed25519 via SignerKey/CounterStore. Use internal/core/registry/rectypes only."
+
+      # RULE 5: internal/adapter must not be imported by pkg/byreis or internal/cli
+      # (adapters are wired in cmd/byreis only).
+      adapter-wired-at-cmd:
+        list-mode: lax
+        files:
+          - "**/pkg/byreis/**"
+          - "**/internal/cli/**"
+        deny:
+          - pkg: "github.com/ByReisK/byreis/internal/adapter"
+            desc: "pkg/byreis and internal/cli must not import adapters directly. Adapters are wired in cmd/byreis/main.go via constructor injection."
+
+  govet:
+    enable-all: true
+    disable:
+      - fieldalignment  # useful but too noisy for early scaffold
+
+  revive:
+    rules:
+      - name: exported
+        disabled: false
+      - name: context-as-argument
+        disabled: false
+      - name: error-return
+        disabled: false
+
+  godot:
+    scope: declarations
+    period: true
+
+issues:
+  # Increase limits for new code during scaffolding.
+  max-issues-per-linter: 50
+  max-same-issues: 10
+  exclude-rules:
+    # panic("not implemented") stubs are allowed while the skeleton is filled in.
+    - text: "SA1012"
+      linters: [staticcheck]
+    # Allow unexported fields in domain structs.
+    - linters: [revive]
+      text: "exported function .* should have comment"
+    # adapter packages may import SDKs.
+    - path: "internal/adapter/.*"
+      linters: [depguard]
+      text: "net/http"

@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          cache: true
+      - name: Build
+        run: go build ./cmd/byreis
+
+  test:
+    name: Test (race)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          cache: true
+      - name: Run tests with race detector
+        run: go test -race -timeout=120s ./...
+
+  lint:
+    name: Lint (golangci-lint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          cache: true
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v2.1.6
+
+  allowlist:
+    name: Import Allowlist (closed-world gate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          cache: true
+      - name: Run allowlist test (positive + negative) — Go test is authoritative
+        # The Go test is the single authoritative import-allowlist gate. A prior
+        # bash script was retired deliberately: two gates that can disagree are
+        # themselves a defect. A non-zero exit is a hard failure, and a gate that
+        # cannot run must fail loudly rather than exit 0 silently.
+        # Targets:
+        #   - internal/core/crypto/encrypt  (contributor encrypt allowlist)
+        #   - internal/core/usecase/submit  (the Submit compilation unit only,
+        #                                    not the whole usecase package)
+        run: |
+          go test -v -race -run TestAllowlist \
+            ./internal/core/crypto/encrypt/ \
+            ./internal/core/usecase/submit/
+
+  shipgate:
+    name: Ship Gate (asymmetric-access guarantee)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          cache: true
+      - name: Run ship-gate suite (asymmetric-access guarantee)
+        # This job is non-skippable. A red result here blocks the release
+        # pipeline via the 'needs: [shipgate]' dependency in release.yml: there
+        # is no manual-override path. It currently runs the structured stub; the
+        # full behavioral suite is filled in later. Target is the parent usecase
+        # package where the suite lives — the Submit sub-package import allowlist
+        # is covered by the allowlist job above.
+        run: go test -v -race -tags shipgate -timeout=120s ./internal/core/usecase/

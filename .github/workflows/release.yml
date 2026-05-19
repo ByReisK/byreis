@@ -1,0 +1,60 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  # The shipgate job is reproduced here (not just referenced) so release cannot
+  # proceed without it. The 'needs: [shipgate]' below is the hard gating
+  # mechanism: there is no manual-override path. The full behavioral suite is
+  # filled in later; today the job runs the structured stub, but the gating
+  # wiring is real and non-bypassable.
+  shipgate:
+    name: Ship Gate (BLOCKS RELEASE)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          cache: true
+      - name: Run ship-gate suite (asymmetric-access guarantee)
+        # Non-skippable. A red result means the build does not ship, regardless
+        # of any other green results.
+        run: go test -v -race -tags shipgate -timeout=120s ./internal/core/usecase/
+
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    # The release job has needs: [shipgate] with no manual-override path. A red
+    # shipgate job prevents this job from running.
+    needs: [shipgate]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          cache: true
+      - name: Build release binary
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          LDFLAGS="-X github.com/ByReisK/byreis/pkg/byreis.Version=${VERSION}"
+          GOOS=linux  GOARCH=amd64 go build -ldflags "${LDFLAGS}" -o byreis-linux-amd64   ./cmd/byreis
+          GOOS=linux  GOARCH=arm64 go build -ldflags "${LDFLAGS}" -o byreis-linux-arm64   ./cmd/byreis
+          GOOS=darwin GOARCH=amd64 go build -ldflags "${LDFLAGS}" -o byreis-darwin-amd64  ./cmd/byreis
+          GOOS=darwin GOARCH=arm64 go build -ldflags "${LDFLAGS}" -o byreis-darwin-arm64  ./cmd/byreis
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            byreis-linux-amd64
+            byreis-linux-arm64
+            byreis-darwin-amd64
+            byreis-darwin-arm64
+          generate_release_notes: true

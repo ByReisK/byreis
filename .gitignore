@@ -1,0 +1,53 @@
+# --- Claude Code / local AI tooling (intentionally not committed) ---
+CLAUDE.md
+.claude/
+
+# --- Go ---
+# Binaries (root-anchored: the built `byreis` binary only — NOT the
+# cmd/byreis or pkg/byreis source directories)
+/byreis
+/bin/
+/dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Coverage / profiling
+coverage.txt
+coverage.out
+*.prof
+*.cpu
+*.mem
+
+# Go workspace / vendor (uncomment vendor/ if you don't vendor)
+go.work
+go.work.sum
+# vendor/
+
+# --- byreis runtime artifacts (never commit secrets/keys) ---
+*.key
+*.key.pub
+*.age
+identity/
+.byreis.local.yaml
+# Throwaway crypto-spike PROOF CODE only. Durable gate artifacts
+# (FINDINGS.md, REQUIREMENTS.md) live in design/ and ARE committed.
+# design/ (DESIGN.md, ADRs, reqs) and docs/ (public docs) are tracked.
+spike/
+
+# --- Editors / OS ---
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# --- Env / local config ---
+.env
+.env.*
+!.env.example
