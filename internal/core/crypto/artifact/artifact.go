@@ -24,7 +24,7 @@ type RecipientEntry struct {
 // ManifestSig is the Ed25519 signature block present in a Signed artifact.
 type ManifestSig struct {
 	Signer string `yaml:"signer"` // admin id
-	Sig    string `yaml:"sig"`    // base64-encoded Ed25519 signature
+	Sig    string `yaml:"sig"`    // hex-encoded Ed25519 signature
 }
 
 // Metadata is the byreis: block embedded in both Unsigned and Signed files.

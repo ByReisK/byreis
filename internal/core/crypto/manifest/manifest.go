@@ -6,7 +6,31 @@
 // decrypt package. Not imported by external adapters or CLI packages.
 package manifest
 
-import "errors"
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"regexp"
+	"sort"
+)
+
+// Separator bytes. RS delimits list elements / sub-fields of a record; US
+// delimits top-level fields. Both are control characters that cannot occur in
+// armored age ciphertext, hex digests, fingerprints, or printable-ASCII ids —
+// any signed field containing one is rejected before a byte is emitted, so an
+// attacker cannot shift the framing of subsequent signed fields.
+const (
+	sepRS = 0x1e // record separator
+	sepUS = 0x1f // unit separator
+)
+
+// formatVersionRE constrains the first signed field. A free-form first field
+// would be a separator-injection / framing-ambiguity surface, so the version
+// is a fixed enum, not an arbitrary string.
+var formatVersionRE = regexp.MustCompile(`^byreis\.native\.v[0-9]+$`)
 
 // Sentinel errors returned by this package.
 var (
@@ -57,19 +81,112 @@ type Manifest struct {
 	RecipientFingerprints []string
 }
 
-// Encode produces the canonical byte stream that Ed25519 signs. It is
-// deterministic: map iteration order is irrelevant because the encoder sorts
-// all variable-length fields internally.
-//
-// Returns ErrFormatVersion if FormatVersion is invalid or contains separator
-// bytes. Returns ErrSeparatorInjection if any key name, ProjectID, or
-// LogicalFileName contains a separator byte. Panics are never used.
-func Encode(m Manifest) ([]byte, error) {
-	panic("not implemented") // stub: real implementation pending
+// containsSeparator reports whether s holds an RS or US byte. These bytes are
+// the framing of the signed stream; smuggling one into any field would shift
+// the boundary of every subsequent field, so it is rejected before encoding.
+func containsSeparator(s string) bool {
+	return bytes.IndexByte([]byte(s), sepRS) >= 0 ||
+		bytes.IndexByte([]byte(s), sepUS) >= 0
 }
 
 // FormatVersionValid reports whether v matches ^byreis\.native\.v[0-9]+$ and
-// contains no 0x1e or 0x1f bytes.
+// contains no 0x1e or 0x1f bytes. The separator check is applied before the
+// regex so a smuggled control byte can never reach the encoder even if the
+// regex engine were somehow permissive.
 func FormatVersionValid(v string) bool {
-	panic("not implemented") // stub: real implementation pending
+	if containsSeparator(v) {
+		return false
+	}
+	return formatVersionRE.MatchString(v)
+}
+
+// perKeyDigest is the per-key digest: sha256(key_name ‖ 0x00 ‖ ciphertext).
+// The 0x00 domain separator prevents name‖ct ambiguity; binding the ciphertext
+// to the NAME (not sha256(ct) alone) defeats ciphertext-swap-between-keys.
+func perKeyDigest(name string, ciphertext []byte) string {
+	h := sha256.New()
+	h.Write([]byte(name))
+	h.Write([]byte{0x00})
+	h.Write(ciphertext)
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// Encode produces the canonical byte stream that Ed25519 signs.
+// It is deterministic: map iteration order is irrelevant because the encoder
+// sorts all variable-length fields internally over a private copy, so the
+// caller's map order is never observed by the signer.
+//
+// Field order (US between top-level fields, RS within list/records):
+//
+//  1. format_version (constrained)              US
+//  2. registry_project_id                       US
+//  3. logical_file_name                         US
+//  4. counter (8 bytes big-endian)              US
+//  5. for each SORTED key: name RS digest_hex (records RS-joined)  US
+//  6. for each SORTED fingerprint: fp_hex (RS-joined, NO trailing US)
+//
+// Returns ErrFormatVersion if FormatVersion is invalid or carries a separator
+// byte. Returns ErrSeparatorInjection if ProjectID, LogicalFileName, a key
+// name, or a fingerprint carries a separator byte. Never panics.
+func Encode(m Manifest) ([]byte, error) {
+	if !FormatVersionValid(m.FormatVersion) {
+		return nil, fmt.Errorf("%w: %q", ErrFormatVersion, m.FormatVersion)
+	}
+	// ProjectID / LogicalFileName are signed identity fields; a separator byte
+	// here would let an attacker re-frame the stream.
+	if containsSeparator(m.ProjectID) || containsSeparator(m.LogicalFileName) {
+		return nil, fmt.Errorf("%w: project_id or logical_file_name", ErrSeparatorInjection)
+	}
+
+	var buf bytes.Buffer
+	buf.WriteString(m.FormatVersion)
+	buf.WriteByte(sepUS)
+	buf.WriteString(m.ProjectID)
+	buf.WriteByte(sepUS)
+	buf.WriteString(m.LogicalFileName)
+	buf.WriteByte(sepUS)
+
+	var counter [8]byte
+	binary.BigEndian.PutUint64(counter[:], m.Counter)
+	buf.Write(counter[:])
+	buf.WriteByte(sepUS)
+
+	// Field 5: sorted key records. Sort a private copy of the key names so the
+	// input map's iteration order is never observed by the signer (defeats a
+	// key-reorder attack — a reordered map must not change the signed bytes).
+	keys := make([]string, 0, len(m.Values))
+	for k := range m.Values {
+		if containsSeparator(k) {
+			return nil, fmt.Errorf("%w: key name %q", ErrSeparatorInjection, k)
+		}
+		keys = append(keys, k)
+	}
+	sort.Strings(keys) // bytewise ascending on the UTF-8 key name
+	for i, k := range keys {
+		if i > 0 {
+			buf.WriteByte(sepRS)
+		}
+		buf.WriteString(k)
+		buf.WriteByte(sepRS)
+		buf.WriteString(perKeyDigest(k, m.Values[k]))
+	}
+	buf.WriteByte(sepUS)
+
+	// Field 6: sorted recipient fingerprints, RS-joined, NO trailing US.
+	fps := make([]string, len(m.RecipientFingerprints))
+	copy(fps, m.RecipientFingerprints)
+	for _, fp := range fps {
+		if containsSeparator(fp) {
+			return nil, fmt.Errorf("%w: fingerprint %q", ErrSeparatorInjection, fp)
+		}
+	}
+	sort.Strings(fps) // bytewise ascending on the lowercase-hex fingerprint
+	for i, fp := range fps {
+		if i > 0 {
+			buf.WriteByte(sepRS)
+		}
+		buf.WriteString(fp)
+	}
+
+	return buf.Bytes(), nil
 }

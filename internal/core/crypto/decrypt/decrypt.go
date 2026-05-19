@@ -5,14 +5,22 @@
 package decrypt
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"io"
+	"strings"
+
+	"filippo.io/age"
+	"filippo.io/age/armor"
 
 	"github.com/ByReisK/byreis/internal/core/crypto/artifact"
 	"github.com/ByReisK/byreis/internal/core/crypto/identity"
 )
 
-// ErrDecrypt is returned when no available identity could decrypt a value.
+// ErrDecrypt is returned when no available identity could decrypt a value. The
+// error never contains plaintext or key material.
 var ErrDecrypt = errors.New(
 	"no available identity could decrypt the value — " +
 		"run `byreis auth login` or check that your admin key is present")
@@ -28,9 +36,8 @@ type Decryptor interface {
 	Decrypt(ctx context.Context, art artifact.Signed, id identity.Identity) (map[string]string, error)
 
 	// RoundTripAll verifies that every value in the artifact can be decrypted
-	// by every recipient's identity (post-merge integrity check).
-	// Returns ErrDecrypt for any value that cannot be decrypted by any provided
-	// identity.
+	// by every provided identity (post-merge integrity check). Returns
+	// ErrDecrypt for any (identity, value) pair that fails.
 	RoundTripAll(ctx context.Context, art artifact.Signed, ids []identity.Identity) error
 }
 
@@ -41,10 +48,72 @@ func New() Decryptor {
 
 type decryptor struct{}
 
-func (d *decryptor) Decrypt(_ context.Context, _ artifact.Signed, _ identity.Identity) (map[string]string, error) {
-	panic("not implemented") // stub: real implementation pending
+func (d *decryptor) Decrypt(
+	ctx context.Context, art artifact.Signed, id identity.Identity,
+) (map[string]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("decrypt cancelled: %w", err)
+	}
+	if id == nil || id.AgeIdentity() == nil {
+		return nil, fmt.Errorf("%w: no admin identity provided", ErrDecrypt)
+	}
+
+	out := make(map[string]string, len(art.Values))
+	for name, ct := range art.Values {
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("decrypt cancelled: %w", err)
+		}
+		pt, err := decryptValue(string(ct), id.AgeIdentity())
+		if err != nil {
+			// Never include plaintext, ciphertext, or key material in the error.
+			return nil, fmt.Errorf("%w: key %q", ErrDecrypt, name)
+		}
+		out[name] = pt
+	}
+	return out, nil
 }
 
-func (d *decryptor) RoundTripAll(_ context.Context, _ artifact.Signed, _ []identity.Identity) error {
-	panic("not implemented") // stub: real implementation pending
+func (d *decryptor) RoundTripAll(
+	ctx context.Context, art artifact.Signed, ids []identity.Identity,
+) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("round-trip cancelled: %w", err)
+	}
+	if len(ids) == 0 {
+		return fmt.Errorf("%w: no identities provided for round-trip", ErrDecrypt)
+	}
+	// Every value MUST decrypt under EVERY recipient identity (post-merge
+	// integrity: confirms the live file is readable by all current admins).
+	for _, id := range ids {
+		if id == nil || id.AgeIdentity() == nil {
+			return fmt.Errorf("%w: nil identity in round-trip set", ErrDecrypt)
+		}
+		for name, ct := range art.Values {
+			if err := ctx.Err(); err != nil {
+				return fmt.Errorf("round-trip cancelled: %w", err)
+			}
+			if _, err := decryptValue(string(ct), id.AgeIdentity()); err != nil {
+				return fmt.Errorf("%w: key %q not decryptable by recipient %q",
+					ErrDecrypt, name, id.Recipient())
+			}
+		}
+	}
+	return nil
+}
+
+// decryptValue decrypts ONE armored age ciphertext with the given identity.
+// The plaintext is read fully into memory; the caller is responsible for
+// zeroizing the returned string's backing where practical.
+func decryptValue(armored string, id *age.X25519Identity) (string, error) {
+	ar := armor.NewReader(strings.NewReader(armored))
+	r, err := age.Decrypt(ar, id)
+	if err != nil {
+		// age error may name identities; do not propagate verbatim plaintext.
+		return "", fmt.Errorf("age decrypt: %w", err)
+	}
+	var buf bytes.Buffer
+	if _, err := io.Copy(&buf, r); err != nil {
+		return "", fmt.Errorf("read plaintext: %w", err)
+	}
+	return buf.String(), nil
 }

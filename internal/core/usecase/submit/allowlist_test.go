@@ -71,16 +71,37 @@ var allowedByreisPkgsSubmit = map[string]bool{
 // allowedThirdPartyPkgsSubmit enumerates the non-stdlib, non-byreis packages
 // permitted in the transitive set of usecase/submit. Only age recipient/encrypt
 // surface.
+//
+// AMENDMENT (B2, explicit review): mirrors the crypto/encrypt allowlist
+// amendment for filippo.io/age v1.3.1 (post-quantum hybrid path adds
+// filippo.io/hpke* + scrypt/pbkdf2 + age-internal bech32/format/stream). These
+// are age-internal recipient/encrypt-surface deps with NO private-key/identity
+// material reachable from the contributor path; age's graph has ZERO
+// crypto/ed25519 (the only ed25519 importer is the admin-side crypto/sign,
+// not reachable from submit). crypto/ed25519 remains forbidden.
 var allowedThirdPartyPkgsSubmit = map[string]bool{
 	"filippo.io/age":                        true,
 	"filippo.io/age/armor":                  true,
+	"filippo.io/age/internal/bech32":        true,
+	"filippo.io/age/internal/format":        true,
+	"filippo.io/age/internal/stream":        true,
+	"filippo.io/hpke":                       true,
+	"filippo.io/hpke/crypto":                true,
+	"filippo.io/hpke/crypto/ecdh":           true,
+	"filippo.io/hpke/internal/byteorder":    true,
 	"golang.org/x/crypto/chacha20":          true,
 	"golang.org/x/crypto/chacha20poly1305":  true,
 	"golang.org/x/crypto/hkdf":              true,
 	"golang.org/x/crypto/curve25519":        true,
+	"golang.org/x/crypto/pbkdf2":            true,
+	"golang.org/x/crypto/scrypt":            true,
 	"golang.org/x/crypto/internal/alias":    true,
 	"golang.org/x/crypto/internal/poly1305": true,
-	"golang.org/x/sys/cpu":                  true,
+	// golang.org/x/sys/cpu was previously listed defensively but is NOT in the
+	// real transitive set of filippo.io/age (verified via `go list -deps`);
+	// keeping it would dilute the "minimal necessary" claim. It is deliberately
+	// omitted — if a future age release pulls it in, the subset test fails and
+	// the addition goes through explicit review per ADR-0005.
 }
 
 // isStdlibOrInternal returns true if the package is a standard library package.
@@ -150,6 +171,34 @@ func TestAllowlist_Submit_ExplicitForbiddenAbsent(t *testing.T) {
 	}
 	if !t.Failed() {
 		t.Logf("PASS: no explicitly-forbidden packages appear in submit transitive set")
+	}
+}
+
+// TestAllowlist_Age_ExcludesEd25519AndIdentity pins, defense-in-depth, that
+// filippo.io/age's OWN transitive set carries no private-key/identity material:
+// no crypto/ed25519, and no separate age identity / X25519Identity-bearing
+// path. age is on the Submit allowlist as recipient/encrypt surface only; this
+// asserts admitting it cannot transitively reintroduce decrypt/identity
+// material. It mirrors the rectypes ed25519 pin.
+func TestAllowlist_Age_ExcludesEd25519AndIdentity(t *testing.T) {
+	deps := goListDepsSubmit(t, "filippo.io/age")
+	for _, dep := range deps {
+		if dep == "crypto/ed25519" || dep == "golang.org/x/crypto/ed25519" {
+			t.Errorf("FAIL: filippo.io/age transitively imports %s\n"+
+				"age must stay recipient/encrypt-surface only on the Submit allowlist.", dep)
+		}
+		low := strings.ToLower(dep)
+		if dep != "filippo.io/age" &&
+			(strings.Contains(low, "/identity") ||
+				strings.HasSuffix(low, "/identity") ||
+				strings.Contains(low, "x25519identity")) {
+			t.Errorf("FAIL: filippo.io/age transitively imports identity-bearing path %s\n"+
+				"This would give the contributor submit path a route to identity material.", dep)
+		}
+	}
+	if !t.Failed() {
+		t.Logf("PASS: filippo.io/age transitive set excludes crypto/ed25519 and "+
+			"separate identity/X25519Identity paths (%d total deps)", len(deps))
 	}
 }
 

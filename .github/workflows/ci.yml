@@ -16,6 +16,31 @@ jobs:
         with:
           go-version: "1.26.x"
           cache: true
+      - name: Assert shipped build carries no testhook / build-influencing env
+        # Fail-closed half of the testhook control gate (ADR-0006 / DESIGN
+        # §7.2-D1). The symbol-absence half is the Go AST test
+        # TestShippedSurface_* in internal/core/registry/countertypes (run by
+        # the 'test' and 'shipgate' jobs under DEFAULT tags). This step asserts
+        # the BUILD invocation itself is clean: no -tags testhook, and no
+        # GOFLAGS/GOEXPERIMENT that could smuggle a tag or alter codegen.
+        run: |
+          set -euo pipefail
+          if [ -n "${GOFLAGS:-}" ]; then
+            echo "::error::GOFLAGS is set ('${GOFLAGS}') for the shipped build step. It must be unset: it can inject -tags testhook out of band."
+            exit 1
+          fi
+          if [ -n "${GOEXPERIMENT:-}" ]; then
+            echo "::error::GOEXPERIMENT is set ('${GOEXPERIMENT}') for the shipped build step. It must be unset for a reproducible shipped build."
+            exit 1
+          fi
+          BUILD_CMD='go build ./cmd/byreis'
+          case "$BUILD_CMD" in
+            *testhook*)
+              echo "::error::shipped build invocation contains 'testhook' — the test hook must never be compiled into a shipped binary."
+              exit 1
+              ;;
+          esac
+          echo "shipped build invocation is clean: no -tags testhook, GOFLAGS/GOEXPERIMENT unset."
       - name: Build
         run: go build ./cmd/byreis
 
@@ -28,8 +53,36 @@ jobs:
         with:
           go-version: "1.26.x"
           cache: true
-      - name: Run tests with race detector
+      - name: Run tests with race detector (default tags)
+        # Runs under DEFAULT tags. This is where the shipped-surface mechanical
+        # guard (TestShippedSurface_* in internal/core/registry/countertypes)
+        # executes: it drives `go list -tags` itself, so it inspects the
+        # testhook surface WITHOUT this job compiling the hook into anything.
         run: go test -race -timeout=120s ./...
+
+  testhook-negatives:
+    name: Counter-decision negatives (-tags testhook)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+          cache: true
+      - name: Run testhook-gated decision-table negatives with race detector
+        # T4: the §3.4 step-4 counter-decision negatives (ErrReplay vs
+        # ErrCounterReconcile vs OK, and the ADR-0006 H-1 lost-intent row) are
+        # gated behind -tags testhook because they need a Valid()
+        # CounterAuthority. Without this job they never executed in CI. This
+        # job is the ONLY place the testhook tag is compiled, and it compiles
+        # ONLY tests (go test), never a shipped/release binary. It is paired
+        # with the build job's clean-invocation assertion and the default-tag
+        # TestShippedSurface_* guard: the tag is exercised in TEST CI and
+        # provably excluded from BUILD/RELEASE CI.
+        run: |
+          go test -race -timeout=120s -tags testhook \
+            ./internal/core/crypto/verify/... \
+            ./internal/core/registry/countertypes/...
 
   lint:
     name: Lint (golangci-lint)

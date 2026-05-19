@@ -18,9 +18,15 @@ package verify
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"fmt"
+	"sort"
 
 	"github.com/ByReisK/byreis/internal/core/crypto/artifact"
+	"github.com/ByReisK/byreis/internal/core/crypto/manifest"
+	"github.com/ByReisK/byreis/internal/core/crypto/sign"
 	"github.com/ByReisK/byreis/internal/core/registry/countertypes"
 	"github.com/ByReisK/byreis/internal/core/registry/rectypes"
 )
@@ -188,10 +194,294 @@ func New() interface {
 
 type verifier struct{}
 
-func (v *verifier) VerifyOfRecord(_ context.Context, _ OfRecordInput) error {
-	panic("not implemented") // stub: real implementation pending
+// ContentSHA is the core-side content hash for a signed file-of-record. It is
+// sha256 over a DETERMINISTIC byte sequence derived from the signed artifact:
+// the canonical manifest stream (the exact bytes Ed25519 signed) followed by a
+// US separator and the raw signature bytes. It is the post-sign hash: adding
+// the signature changes the file, and this hash binds exactly the signed-file
+// identity the next reader pins when reconciling the counter authority.
+// Adapters that hold the raw on-disk bytes hash that raw buffer at the
+// boundary; this is the core equivalent over the deterministic domain
+// representation, with zero normalization beyond the encoder's fixed framing.
+//
+// It returns the empty string if the manifest cannot be encoded (malformed
+// input); callers treat an empty SHA as a non-match (fail closed).
+func ContentSHA(s artifact.Signed) string {
+	man, err := manifestFrom(s.Values, s.Byreis)
+	if err != nil {
+		return ""
+	}
+	stream, err := manifest.Encode(man)
+	if err != nil {
+		return ""
+	}
+	sig, err := hex.DecodeString(s.ManifestSig.Sig)
+	if err != nil {
+		// An unsigned / malformed-sig artifact still has a stable identity over
+		// its canonical stream alone (used only for read-only comparison).
+		sig = nil
+	}
+	h := sha256.New()
+	h.Write(stream)
+	h.Write([]byte{0x1f})
+	h.Write(sig)
+	return hex.EncodeToString(h.Sum(nil))
 }
 
-func (v *verifier) VerifySubmission(_ context.Context, _ SubmissionInput) (SubmissionResult, error) {
-	panic("not implemented") // stub: real implementation pending
+// manifestFrom maps the artifact body + metadata to the canonical Manifest.
+// It does NOT trust the artifact's own recipient block as authority; the
+// recipient comparison against the verified registry is a separate step.
+func manifestFrom(
+	values map[string]artifact.EncryptedValue, meta artifact.Metadata,
+) (manifest.Manifest, error) {
+	m := manifest.Manifest{
+		FormatVersion:   meta.FormatVersion,
+		ProjectID:       meta.ProjectID,
+		LogicalFileName: meta.File,
+		Counter:         meta.Counter,
+		Values:          make(map[string][]byte, len(values)),
+	}
+	for k, v := range values {
+		m.Values[k] = []byte(v)
+	}
+	for _, re := range meta.Recipients {
+		m.RecipientFingerprints = append(m.RecipientFingerprints, re.FP)
+	}
+	return m, nil
+}
+
+// expectedFPSet returns the sorted lowercase-hex fingerprint set derived from
+// the caller-supplied ExpectedRecipients. The caller MUST source these from a
+// signature-verified registry fetch, never from the artifact's own block.
+func expectedFPSet(rs []rectypes.Recipient) []string {
+	out := make([]string, 0, len(rs))
+	for _, r := range rs {
+		out = append(out, hex.EncodeToString(r.Fingerprint[:]))
+	}
+	sort.Strings(out)
+	return out
+}
+
+func sortedCopy(in []string) []string {
+	out := append([]string(nil), in...)
+	sort.Strings(out)
+	return out
+}
+
+func equalStringSets(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// structuralCheck runs the verification steps shared by both entry points, in
+// fixed fail-closed order: format-version validity, canonical-encoding
+// derivability, project/file identity match, non-empty value set, and
+// recipient-set equality against the verified registry set. It returns the
+// recomputed manifest so VerifyOfRecord can reuse it for the signature step
+// without re-deriving it.
+func structuralCheck(
+	values map[string]artifact.EncryptedValue,
+	meta artifact.Metadata,
+	expectedProjectID, expectedFileName string,
+	expectedRecipients []rectypes.Recipient,
+) (manifest.Manifest, error) {
+	// format_version must be constrained and separator-free.
+	if !manifest.FormatVersionValid(meta.FormatVersion) {
+		return manifest.Manifest{}, fmt.Errorf("%w: %q", ErrFormatVersion, meta.FormatVersion)
+	}
+
+	man, err := manifestFrom(values, meta)
+	if err != nil {
+		return manifest.Manifest{}, err
+	}
+
+	// The canonical encoding must be derivable (rejects separator injection in
+	// ids/key names and any internal inconsistency).
+	if _, err := manifest.Encode(man); err != nil {
+		if errors.Is(err, manifest.ErrFormatVersion) {
+			return manifest.Manifest{}, fmt.Errorf("%w: %v", ErrFormatVersion, err)
+		}
+		return manifest.Manifest{}, fmt.Errorf("%w: %v", ErrManifestMismatch, err)
+	}
+
+	// project_id and file must match the caller's expected identity BEFORE any
+	// signature work — defeats cross-file/cross-project transplant.
+	if meta.ProjectID != expectedProjectID || meta.File != expectedFileName {
+		return manifest.Manifest{}, fmt.Errorf(
+			"%w: artifact is (%q,%q), caller expected (%q,%q)",
+			ErrIdentityMismatch, meta.ProjectID, meta.File,
+			expectedProjectID, expectedFileName)
+	}
+
+	// Each per-key digest and the key set are enforced implicitly: the
+	// canonical stream is recomputed from the artifact values, so any
+	// swapped/deleted/tampered ciphertext or key changes a per-key digest and
+	// therefore the stream the signature must cover.
+	if len(values) == 0 {
+		return manifest.Manifest{}, fmt.Errorf(
+			"%w: artifact has no values", ErrManifestMismatch)
+	}
+
+	// The recipient set must equal the caller's verified-registry set (NEVER
+	// the artifact's self-declared block as authority). The artifact's display
+	// block is compared too, so a recipient-strip is detected.
+	wantFPs := expectedFPSet(expectedRecipients)
+	gotFPs := sortedCopy(man.RecipientFingerprints)
+	if !equalStringSets(gotFPs, wantFPs) {
+		return manifest.Manifest{}, fmt.Errorf(
+			"%w: artifact recipient set has %d entries, verified registry has %d",
+			ErrRecipientMismatch, len(gotFPs), len(wantFPs))
+	}
+
+	return man, nil
+}
+
+// counterDecision implements the exhaustive verify-time counter decision. It
+// is pure and total: every (signed-counter, last-accepted, pending)
+// combination maps to exactly one outcome. A non-Valid() authority is a hard
+// ErrCounterReconcile — there is NO nil/zero-value path that skips this step,
+// so a forged or stale-cache counter authority can never pass.
+func counterDecision(sc uint64, ca countertypes.CounterAuthority, contentSHA string) error {
+	if !ca.Valid() {
+		return fmt.Errorf("%w: counter authority is not from a signature-verified "+
+			"registry fetch (zero-value/forged)", countertypes.ErrCounterReconcile)
+	}
+	la := ca.LastAccepted()
+	p := ca.Pending()
+
+	switch {
+	case sc < la:
+		return fmt.Errorf("%w: signed counter %d <= last accepted %d",
+			countertypes.ErrReplay, sc, la)
+	case sc == la:
+		// Steady-state live read of the committed file.
+		return nil
+	case sc == la+1:
+		switch {
+		case p != nil && p.PendingCounter == sc && p.TargetArtifactSHA == contentSHA:
+			// Legitimate in-flight: the merged-but-unbumped file whose
+			// commit-bump has not yet landed. Verify SUCCEEDS for this exact
+			// pinned artifact; a read-only caller does NOT drive CommitBump.
+			return nil
+		case p != nil && p.PendingCounter == sc && p.TargetArtifactSHA != contentSHA:
+			return fmt.Errorf("%w: a different artifact than the recorded "+
+				"write-ahead intent claims the pending counter %d",
+				countertypes.ErrCounterReconcile, sc)
+		default:
+			// p == nil OR p.PendingCounter != sc: the merged-but-unbumped /
+			// forged-advance / intent-lost state. Terminal, NOT auto-heal,
+			// and explicitly NOT ErrReplay (these two must stay distinct: a
+			// lost-intent advance is an integrity question, not an old file).
+			return fmt.Errorf("%w: signed counter %d claims last+1 with no "+
+				"matching write-ahead intent and no committed bump",
+				countertypes.ErrCounterReconcile, sc)
+		}
+	default: // sc > la+1
+		return fmt.Errorf("%w: signed counter %d skips ahead of authority "+
+			"(last accepted %d)", countertypes.ErrCounterReconcile, sc, la)
+	}
+}
+
+// VerifyOfRecord runs the full fail-closed ordered verification. The signature
+// is MANDATORY; there is no nil/empty input that skips the counter or
+// signature steps. It never writes anything (read-only): an in-flight
+// OK-resume outcome is reported as success and the caller — never this
+// method — drives any counter commit-bump.
+func (v *verifier) VerifyOfRecord(ctx context.Context, in OfRecordInput) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("verify cancelled: %w", err)
+	}
+
+	// Shared structural gate (format, identity, recipient set).
+	man, err := structuralCheck(
+		in.Artifact.Values, in.Artifact.Byreis,
+		in.ExpectedProjectID, in.ExpectedFileName, in.ExpectedRecipients)
+	if err != nil {
+		return err
+	}
+
+	// Counter decision vs the registry counter authority. The opaque value is
+	// consumed read-only; a zero-value/forged one is !Valid() and hard-errors.
+	// This package has no constructor for it, so it cannot be fabricated here.
+	if cErr := counterDecision(man.Counter, in.Counter, ContentSHA(in.Artifact)); cErr != nil {
+		return cErr
+	}
+
+	// The manifest MUST be signed. There is no downgrade-to-unsigned path.
+	if in.Artifact.ManifestSig.Signer == "" || in.Artifact.ManifestSig.Sig == "" {
+		return fmt.Errorf("%w", ErrUnsigned)
+	}
+
+	// The signer id must resolve in the non-empty, length-validated trusted
+	// signer set. An empty set or an unknown signer is terminal — never a
+	// downgrade to unsigned.
+	if len(in.TrustedSigners) == 0 {
+		return fmt.Errorf("%w: TrustedSigners is empty", ErrNoTrustedSigner)
+	}
+	pub, ok := in.TrustedSigners[in.Artifact.ManifestSig.Signer]
+	if !ok {
+		return fmt.Errorf("%w: signer id %q not in the verified registry signer set",
+			ErrNoTrustedSigner, in.Artifact.ManifestSig.Signer)
+	}
+	if len(pub) != ed25519.PublicKeySize {
+		// A wrong-length signer key is an unusable/absent signer, surfaced as
+		// ErrNoTrustedSigner (not a confusing ErrSignatureInvalid later).
+		return fmt.Errorf("%w: signer %q key is %d bytes (want 32)",
+			ErrNoTrustedSigner, in.Artifact.ManifestSig.Signer, len(pub))
+	}
+
+	// Ed25519 verify over the recomputed canonical stream.
+	sig, err := hexDecodeSig(in.Artifact.ManifestSig.Sig)
+	if err != nil {
+		return fmt.Errorf("%w: signature is not valid hex", ErrSignatureInvalid)
+	}
+	if err := sign.Verify(pub, man, sig); err != nil {
+		if errors.Is(err, sign.ErrBadSignerKeyLength) {
+			return fmt.Errorf("%w: %v", ErrNoTrustedSigner, err)
+		}
+		return fmt.Errorf("%w: %v", ErrSignatureInvalid, err)
+	}
+	return nil
+}
+
+func hexDecodeSig(s string) ([]byte, error) {
+	return hex.DecodeString(s)
+}
+
+// VerifySubmission runs the structural gate only on an UNSIGNED contributor
+// submission. It NEVER runs the counter or signature steps and can NEVER
+// return StateOfRecord. The recipient check still binds: ExpectedRecipients
+// MUST be sourced from a signature-verified registry fetch.
+func (v *verifier) VerifySubmission(
+	ctx context.Context, in SubmissionInput,
+) (SubmissionResult, error) {
+	if err := ctx.Err(); err != nil {
+		return SubmissionResult{}, fmt.Errorf("verify cancelled: %w", err)
+	}
+	if _, err := structuralCheck(
+		in.Artifact.Values, in.Artifact.Byreis,
+		in.ExpectedProjectID, in.ExpectedFileName, in.ExpectedRecipients,
+	); err != nil {
+		return SubmissionResult{State: StateUnverified}, err
+	}
+	keyNames := make([]string, 0, len(in.Artifact.Values))
+	for k := range in.Artifact.Values {
+		keyNames = append(keyNames, k)
+	}
+	sort.Strings(keyNames)
+	// State is ALWAYS StateUnverified. There is no code path to StateOfRecord:
+	// a submission carries no signature and the registry decides the counter at
+	// merge — VerifySubmission proves structure + recipient-set shape ONLY.
+	return SubmissionResult{
+		State:    StateUnverified,
+		KeyNames: keyNames,
+		Reason:   "structural check passed; submission is unsigned and not trust-equivalent",
+	}, nil
 }

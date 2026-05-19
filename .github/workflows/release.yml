@@ -41,6 +41,30 @@ jobs:
         with:
           go-version: "1.26.x"
           cache: true
+      - name: Assert release build carries no testhook / build-influencing env
+        # Fail-closed half of the testhook control gate (ADR-0006 / DESIGN
+        # §7.2-D1) on the RELEASE path. The symbol-absence half is the Go AST
+        # test TestShippedSurface_* (run by the shipgate job below under
+        # DEFAULT tags, which gates this release via needs: [shipgate]). This
+        # step asserts the release build invocation itself is clean.
+        run: |
+          set -euo pipefail
+          if [ -n "${GOFLAGS:-}" ]; then
+            echo "::error::GOFLAGS is set ('${GOFLAGS}') for the release build. It must be unset: it can inject -tags testhook out of band."
+            exit 1
+          fi
+          if [ -n "${GOEXPERIMENT:-}" ]; then
+            echo "::error::GOEXPERIMENT is set ('${GOEXPERIMENT}') for the release build. It must be unset for a reproducible release."
+            exit 1
+          fi
+          RELEASE_CMDS='go build -ldflags LDFLAGS -o byreis-OS-ARCH ./cmd/byreis'
+          case "$RELEASE_CMDS" in
+            *testhook*)
+              echo "::error::release build invocation contains 'testhook' — the test hook must never be compiled into a released binary."
+              exit 1
+              ;;
+          esac
+          echo "release build invocation is clean: no -tags testhook, GOFLAGS/GOEXPERIMENT unset."
       - name: Build release binary
         run: |
           VERSION="${GITHUB_REF_NAME}"
