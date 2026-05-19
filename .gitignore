@@ -8,6 +8,9 @@ design/
 CLAUDE.md
 .claude/
 
+# --- Local ops/setup tooling (gh org/repo setup; not part of the product) ---
+scripts/
+
 # --- Go ---
 # Binaries (root-anchored: the built `byreis` binary only — NOT the
 # cmd/byreis or pkg/byreis source directories)

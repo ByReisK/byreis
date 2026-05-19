@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"errors"
 	"os"
 
 	"github.com/ByReisK/byreis/internal/cli/render"
@@ -12,6 +13,10 @@ import (
 // It is populated by cmd/byreis/main.go (or test code) and passed into
 // NewRootCmdWithDeps. No CLI command constructs an adapter directly; that is
 // strictly the wiring layer's responsibility.
+//
+// Each read-path use-case (Getter, Decryptor, Editor) is typed to the NARROW
+// consumer-defined interface, never to a concrete adapter type. This preserves
+// the ISP contract: use-cases see only the minimal port they need.
 type Deps struct {
 	// Initializer is the Init use-case. May be nil when adapters are not yet
 	// wired; the init command will return a "not configured" error.
@@ -32,6 +37,60 @@ type Deps struct {
 
 	// ConfigDir is ~/.config/byreis/ (or $BYREIS_CONFIG).
 	ConfigDir string
+
+	// Getter is the admin Get use-case. Narrow interface: only usecase.Getter.
+	// May be nil when adapters are not yet wired; the get command will return a
+	// "not configured" error.
+	Getter usecase.Getter
+
+	// Decryptor is the admin Decrypt use-case. Narrow interface:
+	// usecase.DecryptUseCase. Also used by the CI-decrypt entrypoint (decrypt
+	// --ci). May be nil when adapters are not yet wired.
+	Decryptor usecase.DecryptUseCase
+
+	// Editor is the admin Edit use-case. Narrow interface: usecase.EditUseCase.
+	// May be nil when adapters are not yet wired.
+	Editor usecase.EditUseCase
+}
+
+// ExitCodeFromReadPathError maps a usecase.ExitClass to the corresponding
+// documented process exit code. The mapping is the single source of truth for
+// the CLI/CI layer; it is exported so the test layer can verify it directly
+// without driving through the full cobra dispatch.
+func ExitCodeFromReadPathError(class usecase.ExitClass) int {
+	switch class {
+	case usecase.ExitPermissionDenied:
+		return int(render.ExitPermissionDenied)
+	case usecase.ExitNotFound:
+		return int(render.ExitNotFound)
+	case usecase.ExitDecodeMalformed:
+		return int(render.ExitDecodeMalformed)
+	case usecase.ExitVerifyFailure:
+		return int(render.ExitVerifyFailure)
+	case usecase.ExitDecryptNoIdentity:
+		return int(render.ExitAuthError)
+	case usecase.ExitInternal:
+		return int(render.ExitGeneralError)
+	default:
+		return int(render.ExitGeneralError)
+	}
+}
+
+// exitCodeForErr extracts the exit code from a use-case error by inspecting it
+// for a *usecase.ReadPathError (read-path exit class) or mode.ErrPermissionDenied
+// (CLI-layer policy denial). Returns ExitGeneralError for all other errors.
+func exitCodeForErr(err error) render.ExitCode {
+	if err == nil {
+		return render.ExitOK
+	}
+	var rpe *usecase.ReadPathError
+	if errors.As(err, &rpe) {
+		return render.ExitCode(ExitCodeFromReadPathError(rpe.Class))
+	}
+	if errors.Is(err, mode.ErrPermissionDenied) {
+		return render.ExitPermissionDenied
+	}
+	return render.ExitGeneralError
 }
 
 // exitError is a typed error that carries a render.ExitCode. The CLI entry

@@ -33,9 +33,9 @@ func TestPolicyGate_ContributorMode_AdminCommandsDenied(t *testing.T) {
 	}{
 		{[]string{"review", "--pr", "1"}, "review"},
 		{[]string{"merge", "--pr", "1"}, "merge"},
-		{[]string{"get", "--key", "mykey"}, "get"},
-		{[]string{"decrypt"}, "decrypt"},
-		{[]string{"edit", "--key", "mykey"}, "edit"},
+		{[]string{"get", "--key", "mykey", "--project", "proj", "--file", "prod"}, "get"},
+		{[]string{"decrypt", "--project", "proj", "--file", "prod"}, "decrypt"},
+		{[]string{"edit", "--project", "proj", "--file", "prod"}, "edit"},
 	}
 
 	for _, tc := range adminCommands {
@@ -91,9 +91,9 @@ func TestPolicyGate_NilPolicy_AdminCommandsDenied(t *testing.T) {
 	}{
 		{[]string{"review", "--pr", "1"}, "review"},
 		{[]string{"merge", "--pr", "1"}, "merge"},
-		{[]string{"get", "--key", "mykey"}, "get"},
-		{[]string{"decrypt"}, "decrypt"},
-		{[]string{"edit", "--key", "mykey"}, "edit"},
+		{[]string{"get", "--key", "mykey", "--project", "proj", "--file", "prod"}, "get"},
+		{[]string{"decrypt", "--project", "proj", "--file", "prod"}, "decrypt"},
+		{[]string{"edit", "--project", "proj", "--file", "prod"}, "edit"},
 	}
 
 	for _, tc := range adminCommands {
