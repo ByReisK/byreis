@@ -13,7 +13,7 @@ LDFLAGS      := -X $(MODULE)/pkg/byreis.Version=$(VERSION)
 GOLANGCI     := golangci-lint
 GO_TEST_FLAGS := -race -timeout=120s
 
-.PHONY: build test test-testhook test-shipgate lint install clean check-allowlist check-publish-boundary ci-parity
+.PHONY: build test test-testhook test-shipgate lint install clean check-allowlist check-publish-boundary ci-parity ci-parity-windows-build
 
 ## build: compile the byreis binary to ./bin/byreis
 build:
@@ -116,7 +116,15 @@ ci-parity:
 		./internal/core/usecase/submit/ && \
 	echo "--- ship-gate suite ---" && \
 	go test -race -tags shipgate -run TestAsymmetryShipGate ./internal/core/usecase/ && \
+	echo "--- windows/amd64 trust build-parity ---" && \
+	GOOS=windows GOARCH=amd64 go build ./internal/core/trust/... && \
 	echo "--- ci-parity: ALL CHECKS PASSED ---"
+
+## ci-parity-windows-build: cross-compile internal/core/trust for windows/amd64 (compile-parity check only; no execution)
+ci-parity-windows-build:
+	@echo "--- ci-parity-windows-build: GOOS=windows GOARCH=amd64 go build ./internal/core/trust/... ---"
+	GOOS=windows GOARCH=amd64 go build ./internal/core/trust/...
+	@echo "--- ci-parity-windows-build: PASS ---"
 
 ## clean: remove build artifacts
 clean:
