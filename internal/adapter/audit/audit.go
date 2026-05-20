@@ -72,7 +72,7 @@ func (l *FileLogger) Append(ctx context.Context, e audit.Event) error {
 
 	b, err := json.Marshal(jsonEvent{
 		Kind:      string(e.Kind),
-		OccuredAt: e.OccuredAt.UTC().Format("2006-01-02T15:04:05Z"),
+		OccuredAt: e.OccurredAt.UTC().Format("2006-01-02T15:04:05Z"),
 		Actor:     e.Actor,
 		ProjectID: e.ProjectID,
 		FileName:  e.FileName,

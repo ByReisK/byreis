@@ -29,11 +29,11 @@ func TestFileLogger_AppendAndRead(t *testing.T) {
 	defer func() { _ = logger.Close() }()
 
 	ev := audit.Event{
-		Kind:      audit.EventKindModePromotion,
-		OccuredAt: time.Unix(1_700_000_000, 0).UTC(),
-		ProjectID: "proj-1",
-		Outcome:   "ok",
-		Details:   map[string]string{"resolved_mode": "ADMIN"},
+		Kind:       audit.EventKindModePromotion,
+		OccurredAt: time.Unix(1_700_000_000, 0).UTC(),
+		ProjectID:  "proj-1",
+		Outcome:    "ok",
+		Details:    map[string]string{"resolved_mode": "ADMIN"},
 	}
 
 	err = logger.Append(context.Background(), ev)
@@ -83,10 +83,10 @@ func TestFileLogger_MultipleAppends(t *testing.T) {
 
 	for i := 0; i < 5; i++ {
 		ev := audit.Event{
-			Kind:      audit.EventKindModePromotion,
-			OccuredAt: time.Now().UTC(),
-			ProjectID: "proj-1",
-			Outcome:   "ok",
+			Kind:       audit.EventKindModePromotion,
+			OccurredAt: time.Now().UTC(),
+			ProjectID:  "proj-1",
+			Outcome:    "ok",
 		}
 		appendErr := logger.Append(context.Background(), ev)
 		if appendErr != nil {
@@ -151,9 +151,9 @@ func TestFileLogger_CtxCancel_ReturnsError(t *testing.T) {
 	cancel()
 
 	ev := audit.Event{
-		Kind:      audit.EventKindModePromotion,
-		OccuredAt: time.Now().UTC(),
-		Outcome:   "ok",
+		Kind:       audit.EventKindModePromotion,
+		OccurredAt: time.Now().UTC(),
+		Outcome:    "ok",
 	}
 	err = logger.Append(ctx, ev)
 	if err == nil {

@@ -39,6 +39,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -46,6 +47,7 @@ import (
 	"go.yaml.in/yaml/v3"
 
 	"github.com/ByReisK/byreis/internal/adapter/registry/internal/fetchtransport"
+	"github.com/ByReisK/byreis/internal/core/audit"
 	coreregistry "github.com/ByReisK/byreis/internal/core/registry"
 	"github.com/ByReisK/byreis/internal/core/registry/countertypes"
 	"github.com/ByReisK/byreis/internal/core/registry/rectypes"
@@ -1179,6 +1181,421 @@ func buildCounterCommitMessageBody(
 		targetPR,
 		parentCommitSHA,
 	)
+}
+
+// CommitRotationTransport implements the optional rotationCommitTransport
+// extension interface. It is the V3 realisation of CommitRotation: one signed
+// registry commit that atomically advances last_accepted_counter for all N files,
+// clears all N pending records, updates the rotation_epoch for all N files, and
+// appends one audit/<project>.jsonl entry.
+//
+// The push uses --force-with-lease=refs/heads/main:<in.RegistryParentSHA>. The
+// RegistryParentSHA MUST be the post-Phase-1 registry tip (the registry HEAD
+// after all N RecordPendingBump commits have landed), not the pre-Phase-1 tip.
+// A CONTRIBUTOR-mode call returns ErrRegistryWriteAuth before any clone is
+// created (load-site mode-gate inherited from writeCfg.TokenProvider).
+func (t *productionFetchTransport) CommitRotationTransport(ctx context.Context, repoURL string, in coreregistry.CommitRotationInput) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return fmt.Errorf("CommitRotationTransport: context already cancelled: %w", ctxErr)
+	}
+	if t.writeCfg == nil || t.writeCfg.Signer == nil || t.writeCfg.TokenProvider == nil {
+		return fmt.Errorf("%w: CommitRotationTransport: no write configuration provided — "+
+			"run `byreis admin register` to add a registry-write token",
+			ErrRegistryWriteAuth)
+	}
+	if len(in.PerFile) == 0 {
+		return fmt.Errorf("CommitRotationTransport: PerFile is empty — " +
+			"at least one file must be present in a rotation commit; " +
+			"run `byreis admin rotation reconcile` to diagnose")
+	}
+	if err := fetchtransport.ValidateProjectID(in.ProjectID); err != nil {
+		return fmt.Errorf("CommitRotationTransport: invalid ProjectID: %w", err)
+	}
+	if !fetchtransport.IsValidSHA(in.RegistryParentSHA) {
+		return fmt.Errorf("CommitRotationTransport: RegistryParentSHA %q is not a valid SHA — "+
+			"pass the post-Phase-1 registry HEAD tip; run `byreis admin rotation reconcile`",
+			in.RegistryParentSHA)
+	}
+
+	// Load-site mode-gate: TokenProvider refuses to return the token in
+	// CONTRIBUTOR mode (credential-separation invariant).
+	token, tokenErr := t.writeCfg.TokenProvider.RegistryWriteToken(ctx, repoURL)
+	if tokenErr != nil {
+		return fmt.Errorf("%w: CommitRotationTransport: retrieving registry-write token: %v",
+			ErrRegistryWriteAuth, tokenErr)
+	}
+
+	return t.doCommitRotation(ctx, repoURL, token, in)
+}
+
+// doCommitRotation is the internal implementation of CommitRotationTransport.
+// It produces exactly ONE git commit and ONE git push per call.
+//
+// Commit body encoding: envelope head fields in a fixed order, then per-file
+// blocks sorted ascending by logical_file (no map iteration in the signing
+// stream). The canonical bytes are sha256-hashed into the signed body as
+// audit_entry_sha for the audit append.
+func (t *productionFetchTransport) doCommitRotation(
+	ctx context.Context,
+	repoURL, token string,
+	in coreregistry.CommitRotationInput,
+) error {
+	// Sort PerFile ascending by logical_file name for deterministic signing
+	// stream (no map iteration; sort slice by LogicalName).
+	sorted := make([]coreregistry.PerFileCommit, len(in.PerFile))
+	copy(sorted, in.PerFile)
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].LogicalName < sorted[j].LogicalName
+	})
+
+	// Create an isolated 0700 workspace for all git operations.
+	tmpDir, mkErr := os.MkdirTemp("", "byreis-rotation-commit-*")
+	if mkErr != nil {
+		return fmt.Errorf("doCommitRotation: cannot create temp workspace: %w — "+
+			"check filesystem permissions: run `byreis doctor`", mkErr)
+	}
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+
+	if chErr := os.Chmod(tmpDir, 0o700); chErr != nil { //nolint:gosec // 0700 on dir is intentional: owner-only scratch workspace
+		return fmt.Errorf("doCommitRotation: cannot chmod temp workspace to 0700: %w — "+
+			"check filesystem permissions: run `byreis doctor`", chErr)
+	}
+
+	cloneDir := filepath.Join(tmpDir, "repo")
+
+	hardenedEnv := func(extraEnv ...string) []string {
+		base := fetchtransport.CleanGitEnv()
+		env := append(base,
+			"GIT_CONFIG_NOSYSTEM=1",
+			"HOME="+tmpDir,
+			"GIT_TERMINAL_PROMPT=0",
+			"GIT_ALLOW_PROTOCOL=file:https:ssh",
+			"GIT_CONFIG_COUNT=2",
+			"GIT_CONFIG_KEY_0=core.hooksPath",
+			"GIT_CONFIG_VALUE_0=/dev/null",
+			"GIT_CONFIG_KEY_1=core.fsmonitor",
+			"GIT_CONFIG_VALUE_1=",
+		)
+		return append(env, extraEnv...)
+	}
+
+	authEnv := func() []string {
+		if token == "" {
+			return nil
+		}
+		return []string{
+			"GIT_CONFIG_COUNT=3",
+			"GIT_CONFIG_KEY_0=core.hooksPath",
+			"GIT_CONFIG_VALUE_0=/dev/null",
+			"GIT_CONFIG_KEY_1=core.fsmonitor",
+			"GIT_CONFIG_VALUE_1=",
+			"GIT_CONFIG_KEY_2=http.extraHeader",
+			"GIT_CONFIG_VALUE_2=Authorization: Bearer " + token,
+		}
+	}
+
+	// Clone the registry (shallow, full checkout for file writes). One clone,
+	// one commit, one push — no loop of commits.
+	cloneCtx, cloneCancel := fetchtransport.WithBoundedDeadline(ctx, writeTimeout)
+	defer cloneCancel()
+
+	_, cloneStderr, cloneExit, cloneErr := t.verifier.RunSubprocess(
+		cloneCtx, tmpDir,
+		append(hardenedEnv(), authEnv()...),
+		"git", "clone", "--depth=1", "--no-local", "--", repoURL, cloneDir,
+	)
+	if cloneErr != nil {
+		return fmt.Errorf("doCommitRotation: git clone exec error: %w — "+
+			"ensure git is installed and the registry URL is reachable: run `byreis doctor`",
+			cloneErr)
+	}
+	if cloneExit != 0 {
+		return fmt.Errorf("%w: doCommitRotation: git clone exited %d: %s",
+			ErrRegistryWriteAuth, cloneExit, fetchtransport.SanitizeOutput(cloneStderr))
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+
+	// Update all N counter files in the working tree. Each file is read, the
+	// pending record is cleared, last_accepted_counter is advanced, and
+	// rotation_epoch is set to in.NewEpoch. Files are processed in the sorted
+	// order so any filesystem-level determinism matches the signing stream.
+	for _, pf := range sorted {
+		if err := fetchtransport.ValidateFileName(pf.LogicalName); err != nil {
+			return fmt.Errorf("doCommitRotation: invalid LogicalName %q: %w", pf.LogicalName, err)
+		}
+
+		blobPath := fetchtransport.CounterBlobPath(in.ProjectID, pf.LogicalName)
+		counterFilePath := filepath.Join(cloneDir, filepath.FromSlash(blobPath))
+
+		currentRaw, readErr := os.ReadFile(counterFilePath) //nolint:gosec // path under tmpDir clone, composed from validated inputs
+		var existing counterFileParsed
+		if readErr != nil {
+			if !os.IsNotExist(readErr) {
+				return fmt.Errorf("doCommitRotation: reading counter file for %q: %w — "+
+					"run `byreis doctor`", pf.LogicalName, readErr)
+			}
+			// File absent: treat as zero counter (cold file). The pending should
+			// exist from RecordPendingBump but tolerate absent file at commit time.
+		} else {
+			if len(currentRaw) > maxCounterJSONBytes {
+				return fmt.Errorf("doCommitRotation: counter file for %q exceeds max size — "+
+					"run `byreis doctor`", pf.LogicalName)
+			}
+			if len(bytes.TrimSpace(currentRaw)) > 0 {
+				if dupErr := checkDuplicateJSONKeys(currentRaw); dupErr != nil {
+					return fmt.Errorf("%w: doCommitRotation: duplicate key in counter file for %q: %v",
+						coreregistry.ErrCounterStoreUnreadable, pf.LogicalName, dupErr)
+				}
+				var decErr error
+				existing, decErr = decodeCounterFile(currentRaw)
+				if decErr != nil {
+					return fmt.Errorf("%w: doCommitRotation: decoding counter file for %q: %v",
+						coreregistry.ErrCounterStoreUnreadable, pf.LogicalName, decErr)
+				}
+			}
+		}
+
+		// Build the updated counter JSON: advance counter, clear pending, set epoch.
+		wire := counterFileJSON{
+			ProjectID:           in.ProjectID,
+			File:                pf.LogicalName,
+			LastAcceptedCounter: json.Number(fmt.Sprintf("%d", pf.PendingCounter)),
+			LastPR:              pf.TargetPR,
+			UpdatedAt:           now,
+			Pending:             nil, // atomically cleared
+			RotationEpoch:       epochNumberOrOmit(in.NewEpoch),
+		}
+		_ = existing // existing counter data validated above; new values sourced from PerFileCommit
+
+		newJSON, marshalErr := json.MarshalIndent(wire, "", "  ")
+		if marshalErr != nil {
+			return fmt.Errorf("doCommitRotation: marshalling counter JSON for %q: %w",
+				pf.LogicalName, marshalErr)
+		}
+		newJSON = append(newJSON, '\n')
+
+		counterDir := filepath.Dir(counterFilePath)
+		if mkdirErr := os.MkdirAll(counterDir, 0o700); mkdirErr != nil {
+			return fmt.Errorf("doCommitRotation: creating counter directory for %q: %w — "+
+				"check filesystem permissions: run `byreis doctor`", pf.LogicalName, mkdirErr)
+		}
+		if writeErr := os.WriteFile(counterFilePath, newJSON, 0o600); writeErr != nil { //nolint:gosec // 0600 for counter file: owner-only
+			return fmt.Errorf("doCommitRotation: writing counter file for %q: %w — "+
+				"check filesystem permissions: run `byreis doctor`", pf.LogicalName, writeErr)
+		}
+	}
+
+	// Build and write the audit JSONL entry to audit/<project>.jsonl.
+	// The audit entry is part of the SAME commit as the counter advances
+	// (same-commit atomicity).
+	auditJSONLBytes, auditSHA, auditErr := buildAuditJSONLEntry(in.AuditEntry)
+	if auditErr != nil {
+		return fmt.Errorf("doCommitRotation: building audit JSONL entry: %w", auditErr)
+	}
+
+	auditFilePath := filepath.Join(cloneDir, "audit", in.ProjectID+".jsonl")
+	auditDir := filepath.Dir(auditFilePath)
+	if mkdirErr := os.MkdirAll(auditDir, 0o700); mkdirErr != nil {
+		return fmt.Errorf("doCommitRotation: creating audit directory: %w — "+
+			"check filesystem permissions: run `byreis doctor`", mkdirErr)
+	}
+
+	auditFile, openErr := os.OpenFile(auditFilePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600) //nolint:gosec // 0600 for audit file: owner-only
+	if openErr != nil {
+		return fmt.Errorf("doCommitRotation: opening audit file for append: %w — "+
+			"check filesystem permissions: run `byreis doctor`", openErr)
+	}
+	_, appendErr := auditFile.Write(auditJSONLBytes)
+	closeErr := auditFile.Close()
+	if appendErr != nil {
+		return fmt.Errorf("doCommitRotation: appending to audit file: %w — "+
+			"check filesystem permissions: run `byreis doctor`", appendErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("doCommitRotation: closing audit file: %w — "+
+			"check filesystem permissions: run `byreis doctor`", closeErr)
+	}
+
+	// Build the canonical signed commit message body.
+	commitMsgBody := buildRotationCommitMessageBody(in, sorted, auditSHA)
+
+	// Stage all changed files in a single git add invocation.
+	addCtx, addCancel := fetchtransport.WithBoundedDeadline(ctx, 10*time.Second)
+	defer addCancel()
+
+	_, addStderr, addExit, addErr := t.verifier.RunSubprocess(
+		addCtx, cloneDir, hardenedEnv(),
+		"git", "add", "-A",
+	)
+	if addErr != nil {
+		return fmt.Errorf("doCommitRotation: git add exec error: %w — run `byreis doctor`", addErr)
+	}
+	if addExit != 0 {
+		return fmt.Errorf("doCommitRotation: git add exited %d: %s — run `byreis doctor`",
+			addExit, fetchtransport.SanitizeOutput(addStderr))
+	}
+
+	// Configure git identity for the commit.
+	configCtx, configCancel := fetchtransport.WithBoundedDeadline(ctx, 10*time.Second)
+	defer configCancel()
+
+	_, _, nameExit, nameErr := t.verifier.RunSubprocess(
+		configCtx, cloneDir, hardenedEnv(),
+		"git", "config", "user.name", "byreis-admin",
+	)
+	if nameErr != nil || nameExit != 0 {
+		return fmt.Errorf("doCommitRotation: git config user.name failed — run `byreis doctor`")
+	}
+	_, _, emailExit, emailErr := t.verifier.RunSubprocess(
+		configCtx, cloneDir, hardenedEnv(),
+		"git", "config", "user.email", "byreis-admin@localhost",
+	)
+	if emailErr != nil || emailExit != 0 {
+		return fmt.Errorf("doCommitRotation: git config user.email failed — run `byreis doctor`")
+	}
+
+	// Sign the commit message body using the admin's ManifestSigner (same
+	// writesigner instance as doCounterWrite — no new key material).
+	signerID, sig, signErr := t.writeCfg.Signer.SignText(ctx, []byte(commitMsgBody))
+	if signErr != nil {
+		return fmt.Errorf("doCommitRotation: signing commit message body: %w — "+
+			"check admin identity configuration: run `byreis doctor`", signErr)
+	}
+
+	fullMessage := commitMsgBody + "\n\nbyreis-signer: " + signerID +
+		"\nbyreis-sig: " + fmt.Sprintf("%x", sig) + "\n"
+
+	// Create the signed commit — exactly ONE commit per rotation call.
+	commitCtx, commitCancel := fetchtransport.WithBoundedDeadline(ctx, 30*time.Second)
+	defer commitCancel()
+
+	_, commitStderr, commitExit, commitErr := t.verifier.RunSubprocess(
+		commitCtx, cloneDir, hardenedEnv(),
+		"git", "commit", "-m", fullMessage,
+	)
+	if commitErr != nil {
+		return fmt.Errorf("doCommitRotation: git commit exec error: %w — run `byreis doctor`", commitErr)
+	}
+	if commitExit != 0 {
+		return fmt.Errorf("doCommitRotation: git commit exited %d: %s — run `byreis doctor`",
+			commitExit, fetchtransport.SanitizeOutput(commitStderr))
+	}
+
+	// Conditional push — CAS via --force-with-lease=refs/heads/main:<RegistryParentSHA>.
+	// The lease value is in.RegistryParentSHA byte-for-byte (the post-Phase-1 tip).
+	// No per-step refresh inside doCommitRotation. Exactly ONE push per call.
+	pushCtx, pushCancel := fetchtransport.WithBoundedDeadline(ctx, writeTimeout)
+	defer pushCancel()
+
+	leaseRef := "refs/heads/main:" + in.RegistryParentSHA
+	_, pushStderr, pushExit, pushErr := t.verifier.RunSubprocess(
+		pushCtx, cloneDir,
+		append(hardenedEnv(), authEnv()...),
+		"git", "push", "--force-with-lease="+leaseRef, "origin", "main",
+	)
+	if pushErr != nil {
+		return fmt.Errorf("doCommitRotation: git push exec error: %w — "+
+			"check network connectivity: run `byreis doctor`", pushErr)
+	}
+	switch pushExit {
+	case 0:
+		return nil
+	case 1:
+		stderrStr := fetchtransport.SanitizeOutput(pushStderr)
+		if strings.Contains(stderrStr, "rejected") ||
+			strings.Contains(stderrStr, "non-fast-forward") ||
+			strings.Contains(stderrStr, "stale info") {
+			// Rotation-distinct hint: includes "rotation" and the actionable
+			// "byreis admin rotation reconcile" reference for recovery.
+			return fmt.Errorf("%w: rotation CommitRotation push rejected "+
+				"(non-fast-forward / concurrent write detected) — another admin write "+
+				"landed between Phase 1 and Phase 2 of this rotation; "+
+				"run `byreis admin rotation reconcile` to classify and recover: %s",
+				ErrRegistryConcurrentWrite, stderrStr)
+		}
+		return fmt.Errorf("%w: doCommitRotation: push rejected by remote: %s",
+			ErrRegistryWriteRejected, stderrStr)
+	default:
+		stderrStr := fetchtransport.SanitizeOutput(pushStderr)
+		if strings.Contains(stderrStr, "403") ||
+			strings.Contains(stderrStr, "401") ||
+			strings.Contains(stderrStr, "Authentication") {
+			return fmt.Errorf("%w: doCommitRotation: push authentication failure: %s",
+				ErrRegistryWriteAuth, stderrStr)
+		}
+		return fmt.Errorf("%w: doCommitRotation: git push exited %d: %s",
+			ErrRegistryWriteRejected, pushExit, stderrStr)
+	}
+}
+
+// buildAuditJSONLEntry serialises an audit.Event to its canonical JSONL bytes
+// (a single JSON object followed by a newline) and returns the sha256 hex digest
+// of those bytes. The digest is embedded in the signed commit body as
+// audit_entry_sha so the audit append is structurally inseparable from the
+// counter advance (same-commit atomicity).
+//
+// Field order within the JSON object is deterministic because encoding/json
+// serialises struct fields in declaration order. The Event struct has a fixed
+// field order, so the canonical bytes are byte-stable for the same logical event.
+//
+// ValidateEventFields is called before serialisation so that a malformed
+// Details map with a non-canonical value (e.g., high-entropy base64 run, bad
+// pubkey format) is rejected before being signed into the registry.
+func buildAuditJSONLEntry(e audit.Event) (jsonlBytes []byte, hexDigest string, err error) {
+	if validateErr := audit.ValidateEventFields(e); validateErr != nil {
+		return nil, "", fmt.Errorf("buildAuditJSONLEntry: event field validation failed: %w — "+
+			"verify the audit-event producer constructs canonical-typed Details values", validateErr)
+	}
+	raw, marshalErr := json.Marshal(e)
+	if marshalErr != nil {
+		return nil, "", fmt.Errorf("buildAuditJSONLEntry: marshalling audit event: %w", marshalErr)
+	}
+	line := append(raw, '\n')
+	sum := sha256.Sum256(line)
+	return line, fmt.Sprintf("%x", sum[:]), nil
+}
+
+// buildRotationCommitMessageBody returns the canonical signed-payload envelope
+// for a rotation commit message body. The encoding is:
+//
+//   - Envelope head: project_id, new_rotation_epoch, registry_parent_sha,
+//     audit_entry_sha — all project-level fields (new_rotation_epoch is single
+//     project-level, NOT per-file).
+//   - Per-file blocks: sorted ascending by logical_file (no map iteration);
+//     each carries logical_file, expected_previous_counter, pending_counter,
+//     target_artifact_sha, target_pr, parent_commit_sha.
+//
+// No map iteration appears in the signing stream; sort is explicit and
+// deterministic.
+func buildRotationCommitMessageBody(
+	in coreregistry.CommitRotationInput,
+	sortedFiles []coreregistry.PerFileCommit,
+	auditEntrySHA string,
+) string {
+	var b strings.Builder
+	b.WriteString("byreis: rotation commit\n\n")
+	fmt.Fprintf(&b, "project_id: %s\n", in.ProjectID)
+	fmt.Fprintf(&b, "new_rotation_epoch: %d\n", in.NewEpoch)
+	fmt.Fprintf(&b, "registry_parent_sha: %s\n", in.RegistryParentSHA)
+	fmt.Fprintf(&b, "audit_entry_sha: %s\n", auditEntrySHA)
+	for _, pf := range sortedFiles {
+		fmt.Fprintf(&b,
+			"file: %s\n"+
+				"  expected_previous_counter: %d\n"+
+				"  pending_counter: %d\n"+
+				"  target_artifact_sha: %s\n"+
+				"  target_pr: %s\n"+
+				"  parent_commit_sha: %s\n",
+			pf.LogicalName,
+			pf.PendingCounter-1, // expected_previous = pending - 1
+			pf.PendingCounter,
+			pf.TargetSHA,
+			pf.TargetPR,
+			in.RegistryParentSHA, // per-file parent_commit_sha = the shared post-Phase-1 tip
+		)
+	}
+	return b.String()
 }
 
 // isWarmProject reports whether the given (projectID, fileName) pair is

@@ -526,14 +526,14 @@ func (s *submitUseCase) Submit(ctx context.Context, in Input) (Result, error) {
 	// is non-fatal, but it must be surfaced (never silently dropped). No secret
 	// material is ever placed in the event or the log.
 	auditErr := s.d.Audit.Append(ctx, audit.Event{
-		Kind:      audit.EventKindSubmit,
-		OccuredAt: s.d.Clock.Now(),
-		ProjectID: in.ProjectID,
-		FileName:  in.LogicalFileName,
-		KeyName:   in.Key,
-		PRRef:     fmt.Sprintf("%s#%d", opened.Ref.Project, opened.Ref.Number),
-		Outcome:   "ok",
-		Details:   map[string]string{"action": action.String(), "branch": branch},
+		Kind:       audit.EventKindSubmit,
+		OccurredAt: s.d.Clock.Now(),
+		ProjectID:  in.ProjectID,
+		FileName:   in.LogicalFileName,
+		KeyName:    in.Key,
+		PRRef:      fmt.Sprintf("%s#%d", opened.Ref.Project, opened.Ref.Number),
+		Outcome:    "ok",
+		Details:    map[string]string{"action": action.String(), "branch": branch},
 	})
 	if auditErr != nil {
 		s.d.Log.Log(ctx, logging.LevelWarn,

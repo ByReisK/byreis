@@ -254,10 +254,10 @@ func (d *Detector) Detect(ctx context.Context, projectID string) (Result, error)
 	// Step 5: full chain satisfied → ADMIN, but only with a durable audit
 	// record. An unrecordable promotion fails closed.
 	ev := audit.Event{
-		Kind:      audit.EventKindModePromotion,
-		OccuredAt: nowTime(d.Clock),
-		ProjectID: projectID,
-		Outcome:   "ok",
+		Kind:       audit.EventKindModePromotion,
+		OccurredAt: nowTime(d.Clock),
+		ProjectID:  projectID,
+		Outcome:    "ok",
 		Details: map[string]string{
 			"resolved_mode": ModeAdmin.String(),
 			"reason":        "0600 key decrypts project file and public key is in a signature-verified registry",

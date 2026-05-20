@@ -21,20 +21,26 @@ const (
 	EventKindCommitBump      EventKind = "counter.commit_bump"
 	EventKindRegistryRefresh EventKind = "registry.refresh"
 	EventKindAuthLogin       EventKind = "auth.login"
+
+	// EventKindRotation is emitted when a rotation transaction completes
+	// successfully. It is appended in the same signed registry commit as the
+	// CommitRotation counter advance (same-commit atomicity per the rotation
+	// protocol). Only the registry-side audit sink persists this event kind.
+	EventKindRotation EventKind = "rotation"
 )
 
 // Event is an append-only audit log entry. No secret values are ever stored;
 // only key names, project IDs, and outcome metadata.
 type Event struct {
-	Kind      EventKind
-	OccuredAt time.Time
-	Actor     string // user/identity identifier; empty for contributor actions
-	ProjectID string
-	FileName  string
-	KeyName   string // NOT the secret value
-	PRRef     string
-	Outcome   string            // "ok" | "error: <hint>"
-	Details   map[string]string // additional diagnostic fields; NEVER secret values
+	Kind       EventKind         `json:"kind"`
+	OccurredAt time.Time         `json:"occurred_at"`
+	Actor      string            `json:"actor,omitempty"` // user/identity identifier; empty for contributor actions
+	ProjectID  string            `json:"project_id,omitempty"`
+	FileName   string            `json:"file_name,omitempty"`
+	KeyName    string            `json:"key_name,omitempty"` // NOT the secret value
+	PRRef      string            `json:"pr_ref,omitempty"`
+	Outcome    string            `json:"outcome,omitempty"` // "ok" | "error: <hint>"
+	Details    map[string]string `json:"details,omitempty"` // additional diagnostic fields; NEVER secret values
 }
 
 // Logger is the append-only audit log port. Implementations MUST be append-only

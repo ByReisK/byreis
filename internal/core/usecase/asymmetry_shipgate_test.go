@@ -81,6 +81,7 @@ import (
 	"github.com/ByReisK/byreis/internal/core/crypto/manifest"
 	"github.com/ByReisK/byreis/internal/core/crypto/sign"
 	"github.com/ByReisK/byreis/internal/core/mode"
+	coreregistry "github.com/ByReisK/byreis/internal/core/registry"
 	"github.com/ByReisK/byreis/internal/core/usecase"
 )
 
@@ -1087,6 +1088,118 @@ func shipgateGitMissing() bool {
 func shipgateSSHKeygenMissing() bool {
 	_, err := exec.LookPath("ssh-keygen")
 	return err != nil
+}
+
+// ─── BO-V3-8 — CommitRotation path cannot be used to acquire registry write ───
+
+// TestAsymmetryShipGate_ContributorCannotAcquireRegistryWriteTokenViaCommitRotation
+// proves that the CommitRotation path enforces the ADMIN-only credential gate
+// before any git operation when the TokenProvider refuses in CONTRIBUTOR mode.
+//
+// The production transport implements CommitRotationTransport. When its
+// TokenProvider returns an error (simulating CONTRIBUTOR mode), the call must
+// return ErrRegistryWriteAuth immediately — before any git clone, any push, or
+// any signing attempt. This is the BO-V3-8 defense-in-depth: the rotation commit
+// path cannot be used as an alternative channel for acquiring the write token.
+//
+// Proof mechanism: inject a TokenProvider that always refuses and a Signer that
+// panics on any call. If the mode gate fires first, the signer is never invoked
+// (no panic). If the signer were called before the token check, the test would
+// panic, surfacing as a test failure.
+func TestAsymmetryShipGate_ContributorCannotAcquireRegistryWriteTokenViaCommitRotation(t *testing.T) {
+	if shipgateGitMissing() {
+		t.Fatalf(
+			"ship-gate: required binary 'git' is not on PATH — " +
+				"a ship-gate that cannot run must fail, never pass")
+	}
+
+	// A TokenProvider that always refuses with ErrRegistryWriteAuth.
+	refusingProvider := &shipgateContributorTokenProvider{}
+
+	// A Signer that panics if called — proves the gate fires before signing.
+	panicSigner := &shipgatePanicSigner{}
+
+	writeCfg := &registryadapter.FetchTransportWriteConfig{
+		Signer:        panicSigner,
+		TokenProvider: refusingProvider,
+	}
+
+	// Construct a production transport with the refusing write config.
+	// NewProductionFetchTransportFromRunner requires git to be on PATH (checked
+	// above). The HeadVerifier is used only on FetchHead calls; CommitRotation's
+	// token gate fires before any FetchHead or git subprocess.
+	ft, err := registryadapter.NewProductionFetchTransportFromRunner(
+		registryadapter.SubprocessRunner{}, writeCfg)
+	if err != nil {
+		t.Fatalf("NewProductionFetchTransportFromRunner: %v", err)
+	}
+
+	c, err := registryadapter.New(registryadapter.ClientConfig{
+		RegistryURL:    "https://example.com/registry-v3-bo8",
+		ProjectID:      "proj-bo8",
+		TrustAnchorKey: make([]byte, 32),
+		Clock:          time.Now,
+		FetchTransport: ft,
+	})
+	if err != nil {
+		t.Fatalf("registry.New: %v", err)
+	}
+
+	in := coreregistry.CommitRotationInput{
+		ProjectID: "proj-bo8",
+		PerFile: []coreregistry.PerFileCommit{
+			{
+				LogicalName:    "secrets/bo8.enc.yaml",
+				PendingCounter: 1,
+				TargetSHA:      strings.Repeat("a", 64),
+				TargetPR:       "org/repo#99",
+			},
+		},
+		NewEpoch:          1,
+		RegistryParentSHA: strings.Repeat("b", 40),
+	}
+
+	_, callErr := c.CommitRotation(context.Background(), in)
+	if callErr == nil {
+		t.Fatal("BO-V3-8: CommitRotation with contributor-mode TokenProvider returned nil — " +
+			"the credential gate must refuse before any git operation")
+	}
+	if !errors.Is(callErr, registryadapter.ErrRegistryWriteAuth) {
+		t.Errorf("BO-V3-8: want errors.Is(err, ErrRegistryWriteAuth), got: %v", callErr)
+	}
+	// Prove the token provider was consulted (gate fired on the right path).
+	if refusingProvider.calls == 0 {
+		t.Error("BO-V3-8: TokenProvider.RegistryWriteToken was not called — " +
+			"the credential gate must be on the CommitRotation execution path")
+	}
+	// The signer must have been left untouched.
+	if panicSigner.signCalls != 0 {
+		t.Errorf("BO-V3-8: SignText was called %d time(s) — must not be called before the token gate",
+			panicSigner.signCalls)
+	}
+}
+
+// shipgateContributorTokenProvider is a RegistryWriteTokenProvider that always
+// returns ErrRegistryWriteAuth, simulating a CONTRIBUTOR-mode refusal.
+type shipgateContributorTokenProvider struct {
+	calls int
+}
+
+func (p *shipgateContributorTokenProvider) RegistryWriteToken(_ context.Context, _ string) (string, error) {
+	p.calls++
+	return "", fmt.Errorf("%w: contributor mode — registry write token denied",
+		registryadapter.ErrRegistryWriteAuth)
+}
+
+// shipgatePanicSigner is a RegistryWriteSigner that panics if SignText is ever
+// called. It proves that the mode gate fires before any signing attempt.
+type shipgatePanicSigner struct {
+	signCalls int
+}
+
+func (s *shipgatePanicSigner) SignText(_ context.Context, _ []byte) (string, []byte, error) {
+	s.signCalls++
+	panic("shipgatePanicSigner.SignText was called — mode gate did NOT fire before signing")
 }
 
 // ─── unused-symbol guards (avoid dead-code lints in the test package) ────────

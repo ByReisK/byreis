@@ -951,6 +951,15 @@ func (c *Client) CommitRotation(ctx context.Context, in coreregistry.CommitRotat
 			"registry CommitRotation cancelled: %w", err)
 	}
 
+	// Guard: an empty PerFile slice is a caller error — nothing to commit.
+	// Fail closed before any signing or transport call.
+	if len(in.PerFile) == 0 {
+		return coreregistry.CommitRotationResult{}, fmt.Errorf(
+			"registry CommitRotation: PerFile is empty — " +
+				"at least one file must be included in a rotation commit; " +
+				"check the rotation use-case input construction")
+	}
+
 	// Check if the transport supports CommitRotation (optional duck-typed extension).
 	if rct, ok := c.cfg.FetchTransport.(rotationCommitTransport); ok {
 		if err := rct.CommitRotationTransport(ctx, c.cfg.RegistryURL, in); err != nil {

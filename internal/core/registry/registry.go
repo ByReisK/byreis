@@ -25,6 +25,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/ByReisK/byreis/internal/core/audit"
 	"github.com/ByReisK/byreis/internal/core/registry/countertypes"
 	"github.com/ByReisK/byreis/internal/core/registry/rectypes"
 )
@@ -235,11 +236,33 @@ type PerFileCommit struct {
 // CommitRotationInput carries the atomic-N-file rotation commit intent.
 // All N files advance last_accepted_counter, clear pending, and record
 // the new rotation epoch in one signed registry commit.
+//
+// The AuditEntry is appended to audit/<project>.jsonl inside the same
+// signed registry commit as the counter advance, providing structural
+// atomicity: a CommitRotation that does not land also has no audit entry.
 type CommitRotationInput struct {
-	ProjectID         string
-	PerFile           []PerFileCommit // N entries — one per file in the rotation
-	NewEpoch          uint64          // new rotation_epoch for all N files
-	RegistryParentSHA string          // CAS lease (captured at first RecordPendingBump)
+	ProjectID string
+	PerFile   []PerFileCommit // N entries — one per file in the rotation
+	NewEpoch  uint64          // new rotation_epoch for all N files
+
+	// RegistryParentSHA is the CAS lease for the CommitRotation push. It is the
+	// registry repository HEAD tip after all N RecordPendingBump commits for
+	// this rotation have landed — the post-Phase-1 registry tip, NOT the HEAD
+	// captured before file-1's RecordPendingBump. Using the post-Phase-1 tip is
+	// the only physically realisable CAS: each RecordPendingBump advances the
+	// registry HEAD by one commit, so by the time Phase 2 starts the tip is N
+	// commits ahead of where it was before Phase 1. The per-file CAS property
+	// (all-or-nothing under a peer admin merge landing between files) is enforced
+	// by each RecordPendingBump's own per-call CAS lease — this field is
+	// independent of those per-call leases.
+	RegistryParentSHA string
+
+	// AuditEntry is the rotation audit event to persist in the same signed
+	// registry commit. It must carry EventKindRotation. The adapter computes
+	// sha256(canonical-JSONL-bytes-of-AuditEntry) and embeds the hex digest in
+	// the signed commit message body as audit_entry_sha, so the audit append is
+	// structurally inseparable from the counter advance.
+	AuditEntry audit.Event
 }
 
 // CommitRotationResult is returned on a successful CommitRotation.
