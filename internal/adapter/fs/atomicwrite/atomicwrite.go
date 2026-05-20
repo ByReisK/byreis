@@ -43,6 +43,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"syscall"
 
 	"github.com/ByReisK/byreis/internal/core/usecase"
 )
@@ -164,10 +165,11 @@ func (w *Writer) WriteFileOfRecord(ctx context.Context, in usecase.AtomicWriteIn
 			in.ProjectID, in.FileName, ctxErr)
 	}
 
-	// (3) Create the temp file in the SAME directory as the live file.
-	// O_EXCL ensures we never silently overwrite an existing temp file.
+	// (3) Create the temp file in the SAME directory as the live file using
+	// O_CREAT|O_EXCL|O_WRONLY|O_NOFOLLOW with a crypto/rand suffix to prevent
+	// symlink injection at the temp path.
 	dir := filepath.Dir(livePath)
-	tmp, err := os.CreateTemp(dir, ".byreis-atomic-*")
+	tmp, err := newAtomicTempFile(dir, ".byreis-atomic-")
 	if err != nil {
 		return fmt.Errorf(
 			"WriteFileOfRecord: creating temp file in %q for project %q file %q: %w — "+
@@ -187,46 +189,53 @@ func (w *Writer) WriteFileOfRecord(ctx context.Context, in usecase.AtomicWriteIn
 
 	// Immediately restrict the temp file to 0600 (O_EXCL guarantees it was
 	// just created; we set mode before writing anything).
-	if err := tmp.Chmod(0o600); err != nil {
+	err = tmp.Chmod(0o600)
+	if err != nil {
 		return fmt.Errorf(
 			"WriteFileOfRecord: chmod temp file %q to 0600: %w",
 			tmpPath, err)
 	}
 
-	if err := ctx.Err(); err != nil {
+	err = ctx.Err()
+	if err != nil {
 		return fmt.Errorf(
 			"WriteFileOfRecord cancelled after temp create for project %q file %q: %w",
 			in.ProjectID, in.FileName, err)
 	}
 
 	// (4) Write SignedBytes verbatim — no re-encode, no normalization.
-	if _, err := tmp.Write(in.SignedBytes); err != nil {
+	_, err = tmp.Write(in.SignedBytes)
+	if err != nil {
 		return fmt.Errorf(
 			"WriteFileOfRecord: writing to temp file %q for project %q file %q: %w",
 			tmpPath, in.ProjectID, in.FileName, err)
 	}
 
-	if err := ctx.Err(); err != nil {
+	err = ctx.Err()
+	if err != nil {
 		return fmt.Errorf(
 			"WriteFileOfRecord cancelled after write for project %q file %q: %w",
 			in.ProjectID, in.FileName, err)
 	}
 
 	// (5) fsync the temp file before rename.
-	if err := tmp.Sync(); err != nil {
+	err = tmp.Sync()
+	if err != nil {
 		return fmt.Errorf(
 			"WriteFileOfRecord: fsync temp file %q for project %q file %q: %w",
 			tmpPath, in.ProjectID, in.FileName, err)
 	}
 
 	// Close the temp file before rename to avoid cross-platform issues.
-	if err := tmp.Close(); err != nil {
+	err = tmp.Close()
+	if err != nil {
 		return fmt.Errorf(
 			"WriteFileOfRecord: closing temp file %q for project %q file %q: %w",
 			tmpPath, in.ProjectID, in.FileName, err)
 	}
 
-	if err := ctx.Err(); err != nil {
+	err = ctx.Err()
+	if err != nil {
 		return fmt.Errorf(
 			"WriteFileOfRecord cancelled before rename for project %q file %q: %w",
 			in.ProjectID, in.FileName, err)
@@ -235,7 +244,8 @@ func (w *Writer) WriteFileOfRecord(ctx context.Context, in usecase.AtomicWriteIn
 	// (6) Apply the target mode to the temp file BEFORE the rename. This ensures
 	// the live file's mode is not widened: if a file existed at 0600, we keep
 	// it at 0600; if it didn't exist, we use the default 0600.
-	if err := os.Chmod(tmpPath, targetMode); err != nil {
+	err = os.Chmod(tmpPath, targetMode)
+	if err != nil {
 		return fmt.Errorf(
 			"WriteFileOfRecord: setting mode %04o on temp file %q: %w",
 			targetMode, tmpPath, err)
@@ -243,22 +253,31 @@ func (w *Writer) WriteFileOfRecord(ctx context.Context, in usecase.AtomicWriteIn
 
 	// (7) Atomic rename: the ONLY live-path mutation. performAtomicRename
 	// opens the parent directory with O_NOFOLLOW-equivalent semantics,
-	// captures an inode snapshot, and verifies the snapshot immediately
-	// before the rename to detect any concurrent directory swap.
-	if err := performAtomicRename(tmpPath, livePath, dir); err != nil {
+	// captures an inode snapshot, verifies the snapshot immediately before the
+	// rename, and returns the still-open parent fd on success. The caller owns
+	// closing the fd after dirSyncFd.
+	parentFd, err := performAtomicRename(tmpPath, livePath, dir)
+	if err != nil {
 		return fmt.Errorf(
 			"WriteFileOfRecord: atomic rename %q -> %q for project %q file %q: %w — "+
 				"the live file is unchanged",
 			tmpPath, livePath, in.ProjectID, in.FileName, err)
 	}
+	// performAtomicRename returned the open parent fd; take ownership.
+	defer func() { _ = syscall.Close(parentFd) }()
 
 	// Rename succeeded: clear retErr so the defer does not clean up the temp
 	// (it's now the live file). The temp path no longer exists.
 	retErr = nil
 
-	// (8) fsync the parent directory after rename (best-effort durability;
-	// a failure here is non-fatal because the rename already succeeded).
-	dirSync(dir)
+	// (8) fsync the parent directory via the verified fd (best-effort durability;
+	// non-fatal — the rename already succeeded). Using the fd rather than
+	// re-opening by path closes the symlink-swap window between rename and fsync.
+	if fsErr := dirSyncFd(parentFd); fsErr != nil {
+		// Non-fatal: log at warn level is not available here (no logger); the
+		// error is intentionally ignored consistent with the best-effort semantics.
+		_ = fsErr
+	}
 
 	return nil
 }
@@ -344,7 +363,7 @@ func WriteFile(ctx context.Context, path string, data []byte, mode os.FileMode) 
 
 	dir := filepath.Dir(path)
 
-	tmp, err := os.CreateTemp(dir, ".byreis-cache-*")
+	tmp, err := newAtomicTempFile(dir, ".byreis-cache-")
 	if err != nil {
 		return fmt.Errorf("WriteFile: creating temp file in %q for path %q: %w — "+
 			"check directory write permissions", dir, path, err)
@@ -358,51 +377,57 @@ func WriteFile(ctx context.Context, path string, data []byte, mode os.FileMode) 
 		}
 	}()
 
-	if err := tmp.Chmod(mode); err != nil {
+	err = tmp.Chmod(mode)
+	if err != nil {
 		return fmt.Errorf("WriteFile: chmod temp file %q to %04o: %w", tmpPath, mode, err)
 	}
 
-	if err := ctx.Err(); err != nil {
+	err = ctx.Err()
+	if err != nil {
 		return fmt.Errorf("WriteFile cancelled after temp create for path %q: %w", path, err)
 	}
 
-	if _, err := tmp.Write(data); err != nil {
+	_, err = tmp.Write(data)
+	if err != nil {
 		return fmt.Errorf("WriteFile: writing to temp file %q for path %q: %w", tmpPath, path, err)
 	}
 
-	if err := ctx.Err(); err != nil {
+	err = ctx.Err()
+	if err != nil {
 		return fmt.Errorf("WriteFile cancelled after write for path %q: %w", path, err)
 	}
 
-	if err := tmp.Sync(); err != nil {
+	err = tmp.Sync()
+	if err != nil {
 		return fmt.Errorf("WriteFile: fsync temp file %q for path %q: %w", tmpPath, path, err)
 	}
 
-	if err := tmp.Close(); err != nil {
+	err = tmp.Close()
+	if err != nil {
 		return fmt.Errorf("WriteFile: closing temp file %q for path %q: %w", tmpPath, path, err)
 	}
 
-	if err := ctx.Err(); err != nil {
+	err = ctx.Err()
+	if err != nil {
 		return fmt.Errorf("WriteFile cancelled before rename for path %q: %w", path, err)
 	}
 
-	if err := performAtomicRename(tmpPath, path, dir); err != nil {
+	parentFd, err := performAtomicRename(tmpPath, path, dir)
+	if err != nil {
 		return fmt.Errorf("WriteFile: atomic rename %q -> %q: %w — the target file is unchanged",
 			tmpPath, path, err)
 	}
+	// performAtomicRename returned the open parent fd; take ownership.
+	defer func() { _ = syscall.Close(parentFd) }()
 
 	retErr = nil
-	dirSync(dir)
-	return nil
-}
 
-// dirSync best-effort fsyncs a directory. A failure is logged as a warning
-// but does not fail the write (the rename already succeeded).
-func dirSync(dir string) {
-	d, err := os.Open(dir)
-	if err != nil {
-		return
+	// fsync the parent directory via the verified fd (best-effort durability;
+	// non-fatal — the rename already succeeded). Using the fd rather than
+	// re-opening by path closes the symlink-swap window between rename and fsync.
+	if fsErr := dirSyncFd(parentFd); fsErr != nil {
+		_ = fsErr
 	}
-	_ = d.Sync()
-	_ = d.Close()
+
+	return nil
 }

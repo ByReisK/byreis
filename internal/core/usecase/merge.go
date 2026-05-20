@@ -112,7 +112,7 @@ type MergeDeps struct {
 	Git           git.GitProvider
 	Decryptor     decrypt.Decryptor
 	Encryptor     encrypt.Encryptor
-	IDLoader      identity.Loader
+	IDLoader      IDLoader
 	ArtifactCodec ArtifactCodec
 	Recipients    RecipientSource
 	Counter       CounterStore

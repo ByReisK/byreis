@@ -27,6 +27,13 @@ import (
 // go-keyring directly. It matches keyring.ErrNotFound.
 var ErrNotFound = keyring.ErrNotFound
 
+// ErrKeychainAccess is the stable sentinel for non-not-found errors from the
+// generic keychain methods (GetToken, SetToken, DeleteToken, GetIdentitySecret).
+// Wrap with %w; embed the sanitised string with %s — never %w on the raw error.
+var ErrKeychainAccess = errors.New(
+	"keychain access error — check that the OS keychain is unlocked and accessible; " +
+		"run `byreis auth login` if the credential is missing")
+
 // identityService / identityAccount are the keychain slot constants for the
 // admin age identity. These mirror the slot written by `byreis auth login`.
 const identityService = "byreis"
@@ -39,6 +46,18 @@ const identityAccount = "admin-identity"
 var tokenSanitiseRE = regexp.MustCompile(
 	`(?i)(ghp_|ghs_|token=|secret=|password=|key=|/etc/|/home/|/root/|/proc/|/var/|/tmp/)[^\s]*`)
 
+// sanitiseKeychainText strips any path-like or token-like substring from a
+// raw string before it is embedded in a returned error. The returned string is
+// always safe to include in structured logs and JSON.
+func sanitiseKeychainText(s string) string {
+	out := tokenSanitiseRE.ReplaceAllString(s, "<redacted>")
+	// Also replace any long (~20+char) alphanumeric strings that look like
+	// tokens (e.g. personal-access-tokens, UUIDs).
+	tokenLike := regexp.MustCompile(`[A-Za-z0-9_\-]{20,}`)
+	out = tokenLike.ReplaceAllString(out, "<redacted>")
+	return out
+}
+
 // sanitiseKeychainError strips any path-like or token-like substring from the
 // raw go-keyring error message before it is embedded in a returned error. The
 // returned string is always safe to include in structured logs and JSON.
@@ -46,13 +65,7 @@ func sanitiseKeychainError(raw error) string {
 	if raw == nil {
 		return ""
 	}
-	msg := raw.Error()
-	sanitised := tokenSanitiseRE.ReplaceAllString(msg, "<redacted>")
-	// Also replace any long (~20+char) alphanumeric strings that look like
-	// tokens (e.g. personal-access-tokens, UUIDs).
-	tokenLike := regexp.MustCompile(`[A-Za-z0-9_\-]{20,}`)
-	sanitised = tokenLike.ReplaceAllString(sanitised, "<redacted>")
-	return sanitised
+	return sanitiseKeychainText(raw.Error())
 }
 
 // classifyKeychainError maps a raw go-keyring error to a stable suffix for the
@@ -215,8 +228,11 @@ func (s *Store) GetToken(_ context.Context, service, account string) (string, er
 		if errors.Is(err, keyring.ErrNotFound) {
 			return "", nil
 		}
-		return "", fmt.Errorf("keychain GetToken(%q, %q): %w",
-			service, account, err)
+		sanitised := sanitiseKeychainError(err)
+		safeSvc := sanitiseKeychainText(service)
+		safeAcc := sanitiseKeychainText(account)
+		return "", fmt.Errorf("%w: keychain GetToken(%q, %q): %s",
+			ErrKeychainAccess, safeSvc, safeAcc, sanitised)
 	}
 	return tok, nil
 }
@@ -224,18 +240,27 @@ func (s *Store) GetToken(_ context.Context, service, account string) (string, er
 // SetToken stores an OAuth token for the given service/account pair.
 func (s *Store) SetToken(_ context.Context, service, account, token string) error {
 	if err := s.kr.Set(service, account, token); err != nil {
-		return fmt.Errorf("keychain SetToken(%q, %q): %w", service, account, err)
+		sanitised := sanitiseKeychainError(err)
+		safeSvc := sanitiseKeychainText(service)
+		safeAcc := sanitiseKeychainText(account)
+		return fmt.Errorf("%w: keychain SetToken(%q, %q): %s",
+			ErrKeychainAccess, safeSvc, safeAcc, sanitised)
 	}
 	return nil
 }
 
 // DeleteToken removes the stored token for the given service/account pair.
+// Returns nil when no entry exists (idempotent-delete contract).
 func (s *Store) DeleteToken(_ context.Context, service, account string) error {
 	if err := s.kr.Delete(service, account); err != nil {
 		if errors.Is(err, keyring.ErrNotFound) {
 			return nil // idempotent delete
 		}
-		return fmt.Errorf("keychain DeleteToken(%q, %q): %w", service, account, err)
+		sanitised := sanitiseKeychainError(err)
+		safeSvc := sanitiseKeychainText(service)
+		safeAcc := sanitiseKeychainText(account)
+		return fmt.Errorf("%w: keychain DeleteToken(%q, %q): %s",
+			ErrKeychainAccess, safeSvc, safeAcc, sanitised)
 	}
 	return nil
 }
@@ -250,7 +275,9 @@ func (s *Store) GetIdentitySecret(_ context.Context) (string, error) {
 		if errors.Is(err, keyring.ErrNotFound) {
 			return "", nil
 		}
-		return "", fmt.Errorf("keychain GetIdentitySecret: %w", err)
+		sanitised := sanitiseKeychainError(err)
+		return "", fmt.Errorf("%w: keychain GetIdentitySecret: %s",
+			ErrKeychainAccess, sanitised)
 	}
 	return secret, nil
 }

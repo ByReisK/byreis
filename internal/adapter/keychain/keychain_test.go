@@ -315,6 +315,226 @@ func TestSanitiseKeychainError_StripsTokenLikeContent(t *testing.T) {
 	}
 }
 
+// richFakeKeychain is a richer fake KeyringClient that supports per-method
+// error injection (used by the sibling-sanitiser tests).
+type richFakeKeychain struct {
+	getCalls    int
+	getErr      error
+	getToken    string
+	setErr      error
+	deleteErr   error
+	deleteCalls int
+}
+
+func (f *richFakeKeychain) Get(_, _ string) (string, error) {
+	f.getCalls++
+	return f.getToken, f.getErr
+}
+
+func (f *richFakeKeychain) Set(_, _, _ string) error {
+	return f.setErr
+}
+
+func (f *richFakeKeychain) Delete(_, _ string) error {
+	f.deleteCalls++
+	return f.deleteErr
+}
+
+// TestKeychainSiblingMethods_NoMaterialInErrorText proves that GetToken,
+// SetToken, DeleteToken, and GetIdentitySecret never include token-like
+// material in their returned error text, including when the service/account
+// arguments themselves are token-shaped (Amendment A2/A3 pins).
+func TestKeychainSiblingMethods_NoMaterialInErrorText(t *testing.T) {
+	t.Parallel()
+
+	// sensitiveLeakShape represents one case where the backend error or the
+	// caller-supplied service/account arg contains sensitive material that must
+	// NOT appear in the returned error text.
+	type sensitiveLeakShape struct {
+		name string
+		// sensitiveInErr is token-like material embedded by the fake keyring in its
+		// error message. Empty when the leak vector is the arg, not the error.
+		sensitiveInErr string
+		// sensitiveInArgs is a token-shaped service/account arg (Amendment A2/A3).
+		// Empty when the leak vector is the error, not the arg.
+		sensitiveInArgs string
+	}
+	shapes := []sensitiveLeakShape{
+		{
+			name:           "path_in_error",
+			sensitiveInErr: "/home/user/.config/byreis/identity.key",
+		},
+		{
+			name:           "base64ish_token_in_error",
+			sensitiveInErr: "ghp_BASE64AAAAAAAAAAAAAAAAAAAAAAAAA",
+		},
+		{
+			name:           "hex_token_in_error",
+			sensitiveInErr: "abcdef0123456789abcdef0123456789ab",
+		},
+		{
+			name:           "dbus_address_in_error",
+			sensitiveInErr: "unix:path=/tmp/dbus-ABCDEFGHij,guid=cafebabe12345678",
+		},
+		{
+			name:           "percent_q_escaped_material_in_error",
+			sensitiveInErr: `secret=VERYLONGSECRETTOKEN1234567890`,
+		},
+		{
+			// Amendment A2/A3: service arg is itself token-shaped.
+			name:            "token_shaped_service_arg",
+			sensitiveInArgs: "ghp_TOKEN_IN_SERVICE_NAME_1234567890AB",
+		},
+		{
+			// Amendment A3: account arg is itself token-shaped (hex-like).
+			name:            "token_shaped_account_arg",
+			sensitiveInArgs: "abcdef0123456789abcdef0123456789ab",
+		},
+	}
+
+	for _, shape := range shapes {
+		shape := shape
+
+		// Build the error the keyring backend will return.
+		// For arg-leak shapes the keyring error is generic (non-sensitive).
+		backendErr := func() error {
+			if shape.sensitiveInErr != "" {
+				return fmt.Errorf("backend err: %s", shape.sensitiveInErr)
+			}
+			return fmt.Errorf("backend: generic keychain failure")
+		}
+
+		// Choose which arg to pass as service/account.
+		argVal := func() string {
+			if shape.sensitiveInArgs != "" {
+				return shape.sensitiveInArgs
+			}
+			return "normal-service"
+		}
+
+		t.Run(shape.name+"/GetToken", func(t *testing.T) {
+			t.Parallel()
+			fk := &richFakeKeychain{getErr: backendErr()}
+			s := keychain.NewWithKeychainOnly(fk)
+			_, err := s.GetToken(context.Background(), argVal(), argVal())
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			errText := err.Error()
+			if shape.sensitiveInErr != "" && strings.Contains(errText, shape.sensitiveInErr) {
+				t.Errorf("error text must not contain sensitive err material %q; got: %q",
+					shape.sensitiveInErr, errText)
+			}
+			if shape.sensitiveInArgs != "" && strings.Contains(errText, shape.sensitiveInArgs) {
+				t.Errorf("error text must not contain token-shaped arg %q; got: %q",
+					shape.sensitiveInArgs, errText)
+			}
+		})
+
+		t.Run(shape.name+"/SetToken", func(t *testing.T) {
+			t.Parallel()
+			fk := &richFakeKeychain{setErr: backendErr()}
+			s := keychain.NewWithKeychainOnly(fk)
+			err := s.SetToken(context.Background(), argVal(), argVal(), "value")
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			errText := err.Error()
+			if shape.sensitiveInErr != "" && strings.Contains(errText, shape.sensitiveInErr) {
+				t.Errorf("error text must not contain sensitive err material %q; got: %q",
+					shape.sensitiveInErr, errText)
+			}
+			if shape.sensitiveInArgs != "" && strings.Contains(errText, shape.sensitiveInArgs) {
+				t.Errorf("error text must not contain token-shaped arg %q; got: %q",
+					shape.sensitiveInArgs, errText)
+			}
+		})
+
+		t.Run(shape.name+"/DeleteToken", func(t *testing.T) {
+			t.Parallel()
+			fk := &richFakeKeychain{deleteErr: backendErr()}
+			s := keychain.NewWithKeychainOnly(fk)
+			err := s.DeleteToken(context.Background(), argVal(), argVal())
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			errText := err.Error()
+			if shape.sensitiveInErr != "" && strings.Contains(errText, shape.sensitiveInErr) {
+				t.Errorf("error text must not contain sensitive err material %q; got: %q",
+					shape.sensitiveInErr, errText)
+			}
+			if shape.sensitiveInArgs != "" && strings.Contains(errText, shape.sensitiveInArgs) {
+				t.Errorf("error text must not contain token-shaped arg %q; got: %q",
+					shape.sensitiveInArgs, errText)
+			}
+		})
+
+		t.Run(shape.name+"/GetIdentitySecret", func(t *testing.T) {
+			t.Parallel()
+			// GetIdentitySecret uses fixed internal service/account so only
+			// the backend error leak applies (no caller-supplied arg vector).
+			if shape.sensitiveInErr == "" {
+				t.Skip("arg-leak shape not applicable to GetIdentitySecret (uses fixed slot)")
+			}
+			fk := &richFakeKeychain{getErr: backendErr()}
+			s := keychain.NewWithKeychainOnly(fk)
+			_, err := s.GetIdentitySecret(context.Background())
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			errText := err.Error()
+			if strings.Contains(errText, shape.sensitiveInErr) {
+				t.Errorf("error text must not contain sensitive err material %q; got: %q",
+					shape.sensitiveInErr, errText)
+			}
+		})
+	}
+}
+
+// TestKeychainSiblingMethods_PreserveErrNotFound proves that GetToken,
+// DeleteToken, and GetIdentitySecret return their documented zero-values on
+// not-found (per Amendment A3: the contracts are ("",nil), nil, and ("",nil)
+// respectively, NOT an errors.Is chain check).
+func TestKeychainSiblingMethods_PreserveErrNotFound(t *testing.T) {
+	t.Parallel()
+
+	t.Run("GetToken/not_found", func(t *testing.T) {
+		t.Parallel()
+		fk := &richFakeKeychain{getErr: keychain.ErrNotFound}
+		s := keychain.NewWithKeychainOnly(fk)
+		tok, err := s.GetToken(context.Background(), "svc", "acc")
+		if err != nil {
+			t.Errorf("GetToken not-found: want (nil error), got: %v", err)
+		}
+		if tok != "" {
+			t.Errorf("GetToken not-found: want empty string, got %q", tok)
+		}
+	})
+
+	t.Run("DeleteToken/not_found_is_idempotent", func(t *testing.T) {
+		t.Parallel()
+		fk := &richFakeKeychain{deleteErr: keychain.ErrNotFound}
+		s := keychain.NewWithKeychainOnly(fk)
+		err := s.DeleteToken(context.Background(), "svc", "acc")
+		if err != nil {
+			t.Errorf("DeleteToken not-found: want nil, got: %v", err)
+		}
+	})
+
+	t.Run("GetIdentitySecret/not_found", func(t *testing.T) {
+		t.Parallel()
+		fk := &richFakeKeychain{getErr: keychain.ErrNotFound}
+		s := keychain.NewWithKeychainOnly(fk)
+		secret, err := s.GetIdentitySecret(context.Background())
+		if err != nil {
+			t.Errorf("GetIdentitySecret not-found: want (nil error), got: %v", err)
+		}
+		if secret != "" {
+			t.Errorf("GetIdentitySecret not-found: want empty string, got %q", secret)
+		}
+	})
+}
+
 // Tests for the generic TokenStore methods (GetToken, SetToken, DeleteToken).
 // These also must be real go-keyring calls, not panics.
 func TestStore_GetToken_UsesKeyring(t *testing.T) {

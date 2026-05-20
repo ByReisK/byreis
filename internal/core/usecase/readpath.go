@@ -139,7 +139,7 @@ type readPathDeps struct {
 	source     FileOfRecordSource
 	codec      ArtifactCodec
 	decryptor  decrypt.Decryptor
-	idLoader   identity.Loader
+	idLoader   IDLoader
 	verifier   verify.VerifierOfRecord
 	recipients RecipientSource
 	counter    CounterStore
@@ -315,7 +315,7 @@ type GetDeps struct {
 	Source     FileOfRecordSource
 	Codec      ArtifactCodec
 	Decryptor  decrypt.Decryptor
-	IDLoader   identity.Loader
+	IDLoader   IDLoader
 	Verifier   verify.VerifierOfRecord
 	Recipients RecipientSource
 	Counter    CounterStore
@@ -421,7 +421,7 @@ type DecryptDeps struct {
 	Source     FileOfRecordSource
 	Codec      ArtifactCodec
 	Decryptor  decrypt.Decryptor
-	IDLoader   identity.Loader
+	IDLoader   IDLoader
 	Verifier   verify.VerifierOfRecord
 	Recipients RecipientSource
 	Counter    CounterStore

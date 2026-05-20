@@ -10,7 +10,6 @@ import (
 	"github.com/ByReisK/byreis/internal/core/crypto/artifact"
 	"github.com/ByReisK/byreis/internal/core/crypto/decrypt"
 	"github.com/ByReisK/byreis/internal/core/crypto/encrypt"
-	"github.com/ByReisK/byreis/internal/core/crypto/identity"
 	"github.com/ByReisK/byreis/internal/core/crypto/verify"
 	"github.com/ByReisK/byreis/internal/core/logging"
 	"github.com/ByReisK/byreis/internal/core/mode"
@@ -55,7 +54,7 @@ type EditDeps struct {
 	Codec      ArtifactCodec
 	Decryptor  decrypt.Decryptor
 	Encryptor  encrypt.Encryptor
-	IDLoader   identity.Loader
+	IDLoader   IDLoader
 	Verifier   verify.VerifierOfRecord
 	Recipients RecipientSource
 	Counter    CounterStore

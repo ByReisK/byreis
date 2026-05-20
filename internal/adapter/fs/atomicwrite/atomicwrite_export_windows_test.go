@@ -13,3 +13,19 @@ package atomicwrite
 func SetPreRenameHook(fn func()) {
 	preRenameHook = fn
 }
+
+// SetPostRenameHook is the Windows stub for the post-rename test hook. On
+// Windows, performAtomicRename returns ErrAtomicWriteWindowsUnsupported before
+// any rename occurs, so the hook is never invoked. This symbol is retained for
+// cross-platform test-file compilation.
+func SetPostRenameHook(fn func()) {
+	postRenameHook = fn
+}
+
+// SetNextTempSuffixHook is the Windows stub for the temp-suffix test hook.
+// On Windows, the temp-create path is not reached (performAtomicRename returns
+// ErrAtomicWriteWindowsUnsupported before temp creation). This symbol is
+// retained for cross-platform test-file compilation.
+func SetNextTempSuffixHook(fn func(suffix string)) {
+	nextTempSuffixHook = fn
+}

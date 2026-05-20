@@ -124,7 +124,7 @@ func BuildProductionDeps(ctx context.Context) (*cli.Deps, error) {
 	// registry transport runs in read-only mode. The mode is captured at
 	// composition time — never re-detected at token-load time.
 	writeSigner, writeTokenProvider, _ := buildRegistryWriteWiringProd(
-		currentMode, manifestSigner, keychain.New(),
+		currentMode, manifestSigner,
 	)
 
 	// When write wiring is available, rebuild the registry client with a write-
@@ -1409,7 +1409,6 @@ func (p *capturedModeProvider) CurrentMode(_ context.Context) (mode.Mode, error)
 func buildRegistryWriteWiringProd(
 	currentMode mode.Mode,
 	manifestSigner usecase.ManifestSigner,
-	keychainStore *keychain.Store,
 ) (registryadapter.RegistryWriteSigner, registryadapter.RegistryWriteTokenProvider, error) {
 	if manifestSigner == nil {
 		return nil, nil, nil

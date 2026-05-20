@@ -72,6 +72,8 @@ import (
 	"filippo.io/age/armor"
 	"go.yaml.in/yaml/v3"
 
+	"github.com/ByReisK/byreis/internal/adapter/keychain"
+	registryadapter "github.com/ByReisK/byreis/internal/adapter/registry"
 	"github.com/ByReisK/byreis/internal/app"
 	"github.com/ByReisK/byreis/internal/cli"
 	"github.com/ByReisK/byreis/internal/cli/render"
@@ -481,41 +483,64 @@ func TestAsymmetryShipGate(t *testing.T) {
 	})
 
 	t.Run("CONTRIBUTOR/RegistryWriteToken/KeychainGateDeniesBeforeRead", func(t *testing.T) {
-		// BO-TM-13-4 (token-store sub-test): in CONTRIBUTOR mode, the
-		// O-CARRY-1 credential-separation invariant requires that the keychain
-		// adapter returns ErrRegistryWriteAuth WITHOUT reading the OS keychain.
-		// This is enforced at the load-site in keychain.Store.GetRegistryWriteToken
-		// (the mode gate is consulted first, before the keyring.Get call).
+		// Credential-separation invariant: in CONTRIBUTOR mode, the keychain
+		// Store's load-site mode gate must fire BEFORE any keychain read occurs.
 		//
-		// We prove the invariant by constructing a keychain.Store with an
-		// injected ModeProvider that always returns ModeContributor and a fake
-		// KeyringClient that panics on Get. If the mode gate fires first, the
-		// panic is never reached and ErrRegistryWriteAuth is returned. If the
-		// keychain is read first, the test panics (failure).
+		// Proof mechanism: inject a panicking KeyringClient whose Get method
+		// increments a counter and panics. Wire it with a ModeProvider that
+		// always returns ModeContributor. If the mode gate fires first,
+		// GetRegistryWriteToken returns ErrRegistryWriteAuth immediately and the
+		// Get method is never called (counter stays 0). If the keychain is read
+		// first, the test panics — which surfaces as a test failure.
 		//
-		// This is a white-box unit test pinned here because the shipgate suite
-		// is the non-skippable release gate for the asymmetric-access guarantee;
-		// the specific invariant is also covered by the keychain unit tests but
-		// is duplicated here at the shipgate level to ensure it is in scope for
-		// the release gate.
+		// This is the release-gate level of the same invariant covered at unit
+		// level in the keychain adapter tests; the duplication here ensures the
+		// invariant is in scope for the non-skippable ship-gate.
+		panicker := &shipgatePanickingKeyring{}
+		contributorMP := &shipgateContributorModeProvider{}
+		store := keychain.NewWithDeps(contributorMP, panicker)
 
-		// Build CONTRIBUTOR-mode deps (env wired by applyContributorEnv above).
-		fx.applyContributorEnv(t)
-		deps, err := app.BuildProductionDeps(context.Background())
-		if err != nil {
-			t.Fatalf("BuildProductionDeps (CONTRIBUTOR): %v", err)
+		_, err := store.GetRegistryWriteToken(context.Background(), "https://github.com/org/registry")
+		if err == nil {
+			t.Fatal("expected ErrRegistryWriteAuth in CONTRIBUTOR mode, got nil")
 		}
-		if deps.CurrentMode != mode.ModeContributor {
-			t.Fatalf("CurrentMode = %v, want ModeContributor", deps.CurrentMode)
+		if !errors.Is(err, registryadapter.ErrRegistryWriteAuth) {
+			t.Errorf("want errors.Is(err, ErrRegistryWriteAuth), got: %v", err)
 		}
-		// The shipgate fixture does not provision a registry-write token in the
-		// OS keychain. The CONTRIBUTOR mode gate fires first anyway; asserting
-		// that deps.MergeExitCode maps auth errors to ExitAuthError proves the
-		// MergeExitCode function is wired in CONTRIBUTOR-mode production deps.
-		if deps.MergeExitCode == nil {
-			t.Fatal("CONTRIBUTOR deps.MergeExitCode is nil — the wiring is incomplete")
+		if panicker.getCalls != 0 {
+			t.Errorf("keychain Get must NOT be called in CONTRIBUTOR mode; got %d call(s)",
+				panicker.getCalls)
 		}
 	})
+}
+
+// shipgatePanickingKeyring is a KeyringClient whose Get method panics if called.
+// It is used to prove that the mode gate fires BEFORE any keychain read in
+// CONTRIBUTOR mode — if Get is called, the panic surfaces as a test failure.
+type shipgatePanickingKeyring struct {
+	getCalls int
+}
+
+func (k *shipgatePanickingKeyring) Get(_, _ string) (string, error) {
+	k.getCalls++
+	panic("shipgatePanickingKeyring.Get was called — the mode gate did NOT fire before the keychain read")
+}
+
+func (k *shipgatePanickingKeyring) Set(_, _, _ string) error {
+	panic("shipgatePanickingKeyring.Set was called unexpectedly")
+}
+
+func (k *shipgatePanickingKeyring) Delete(_, _ string) error {
+	panic("shipgatePanickingKeyring.Delete was called unexpectedly")
+}
+
+// shipgateContributorModeProvider is a ModeProvider that always returns
+// ModeContributor. Used to wire the credential-gate denial test without
+// running the full mode detector.
+type shipgateContributorModeProvider struct{}
+
+func (*shipgateContributorModeProvider) CurrentMode(_ context.Context) (mode.Mode, error) {
+	return mode.ModeContributor, nil
 }
 
 // shipgatePanicMerger panics if Merge is ever invoked. It is used to assert

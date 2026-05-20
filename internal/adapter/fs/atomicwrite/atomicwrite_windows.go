@@ -101,16 +101,35 @@ func verifyParentInodeByHandle(path string, h windows.Handle, snap parentInodeWi
 	return nil
 }
 
-// performAtomicRename is the Windows implementation of the TOCTOU-hardened
-// rename. Windows is not a supported release target for byreis write
-// operations; this function fails closed immediately with
-// ErrAtomicWriteWindowsUnsupported before performing any side-effecting work.
+// performAtomicRename is the Windows stub. Windows is not a supported release
+// target for byreis write operations; this function fails closed immediately
+// with ErrAtomicWriteWindowsUnsupported before performing any side-effecting
+// work. Returns (-1, err) to match the Unix signature.
 //
 // The openParentNoFollow / verifyParentInodeByHandle infrastructure above is
 // retained as the starting point for the future Windows-write-path slice.
-func performAtomicRename(_, _, _ string) error {
-	return fmt.Errorf("%w: Windows is not currently a supported release target "+
+func performAtomicRename(_, _, _ string) (int, error) {
+	return -1, fmt.Errorf("%w: Windows is not currently a supported release target "+
 		"for byreis write operations; use the Linux or macOS build, or pin to a "+
 		"follow-up release that supports the Windows write path",
 		ErrAtomicWriteWindowsUnsupported)
 }
+
+// dirSyncFd is a no-op on Windows. The path-based dirSync is
+// deleted; this stub satisfies the call sites on Windows builds.
+func dirSyncFd(_ int) error { return nil }
+
+// newAtomicTempFile is the Windows stub. The Windows write path
+// short-circuits here — before any temp file is created — so no residue
+// is left when performAtomicRename returns ErrAtomicWriteWindowsUnsupported.
+func newAtomicTempFile(_, _ string) (*os.File, error) {
+	return nil, fmt.Errorf("%w: Windows is not currently a supported release target "+
+		"for byreis write operations; use the Linux or macOS build",
+		ErrAtomicWriteWindowsUnsupported)
+}
+
+// postRenameHook is the Windows stub for the post-rename test hook variable.
+var postRenameHook func()
+
+// nextTempSuffixHook is the Windows stub for the temp-suffix test hook variable.
+var nextTempSuffixHook func(name string)

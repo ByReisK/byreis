@@ -9,7 +9,6 @@ import (
 	"github.com/ByReisK/byreis/internal/core/audit"
 	"github.com/ByReisK/byreis/internal/core/crypto/artifact"
 	"github.com/ByReisK/byreis/internal/core/crypto/decrypt"
-	"github.com/ByReisK/byreis/internal/core/crypto/identity"
 	"github.com/ByReisK/byreis/internal/core/crypto/verify"
 	"github.com/ByReisK/byreis/internal/core/git"
 	"github.com/ByReisK/byreis/internal/core/logging"
@@ -72,7 +71,7 @@ type ReviewResult struct {
 type ReviewDeps struct {
 	Git           git.GitProvider
 	Decryptor     decrypt.Decryptor
-	IDLoader      identity.Loader
+	IDLoader      IDLoader
 	ArtifactCodec ArtifactCodec
 	Mode          ModeGate
 	Audit         audit.Logger

@@ -427,7 +427,9 @@ func (c *Client) FetchAdminSet(ctx context.Context, projectID string) (coreregis
 	// Update the cache and head cache. This write happens AFTER all validation
 	// passes — a fatal verified-but-broken fetch returns before reaching here.
 	c.setCached(projectID, adminSet)
-	c.setHeadCached(projectID, commit)
+	if err := c.setHeadCached(ctx, projectID, commit); err != nil {
+		return coreregistry.AdminSet{}, fmt.Errorf("registry FetchAdminSet: %w", err)
+	}
 
 	return adminSet, nil
 }
@@ -497,7 +499,9 @@ func (c *Client) VerifyRegistryFreshness(ctx context.Context, projectID string) 
 			coreregistry.ErrRegistryRollback, lastHead, commit)
 	}
 
-	c.setHeadCached(projectID, commit)
+	if err := c.setHeadCached(ctx, projectID, commit); err != nil {
+		return fmt.Errorf("registry VerifyRegistryFreshness: %w", err)
+	}
 	return nil
 }
 
@@ -652,7 +656,9 @@ func (c *Client) CounterAuthority(ctx context.Context, projectID, fileName strin
 	}
 
 	// Update head cache: the freshness check passed (or there was no prior observation).
-	c.setHeadCached(projectID, headCommit)
+	if err := c.setHeadCached(ctx, projectID, headCommit); err != nil {
+		return countertypes.CounterAuthority{}, fmt.Errorf("registry CounterAuthority: %w", err)
+	}
 
 	// All preconditions satisfied. Produce a Valid() CounterAuthority via capmint.
 	return capmint.Mint(lastAccepted, pending), nil
@@ -819,22 +825,24 @@ func (c *Client) setCached(projectID string, set coreregistry.AdminSet) {
 	c.cache[projectID] = set
 }
 
-func (c *Client) setHeadCached(projectID, commit string) {
+func (c *Client) setHeadCached(ctx context.Context, projectID, commit string) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("setHeadCached cancelled for project %q: %w", projectID, err)
+	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	// Set the in-memory floor BEFORE the disk write-through: a disk failure must
+	// not destroy the within-process anti-rollback floor.
 	c.headCache[projectID] = commit
+	c.mu.Unlock()
 	// Write-through to the on-disk cache when configured.
 	if c.cfg.DiskCache != nil {
-		if err := c.cfg.DiskCache.StoreHead(context.Background(), projectID, commit); err != nil {
-			// Wrap and propagate is the D8 contract; callers of setHeadCached
-			// currently do not return the error. Log via the exported error sentinel
-			// so the operator sees it without crashing (the write-through failure
-			// degrades durability, not correctness of the current process).
-			_ = fmt.Errorf("registry: write-through to disk cache failed for HEAD (project=%q): %w — "+
+		if err := c.cfg.DiskCache.StoreHead(ctx, projectID, commit); err != nil {
+			return fmt.Errorf("registry: write-through to disk cache failed for HEAD (project=%q): %w — "+
 				"delete the cache and re-fetch: rm -rf ~/.cache/byreis/registry",
 				projectID, err)
 		}
 	}
+	return nil
 }
 
 // SeedHeadCacheForTest injects a known HEAD commit into the headCache for the
@@ -877,9 +885,11 @@ func (c *Client) offlineFallback(projectID, reason string) (coreregistry.AdminSe
 // production paths.
 
 // SeedCache seeds the in-memory cache with a pre-built AdminSet for testing.
-func (c *Client) SeedCache(_ context.Context, projectID string, set coreregistry.AdminSet) error {
+func (c *Client) SeedCache(ctx context.Context, projectID string, set coreregistry.AdminSet) error {
 	c.setCached(projectID, set)
-	c.setHeadCached(projectID, set.HeadCommit)
+	if err := c.setHeadCached(ctx, projectID, set.HeadCommit); err != nil {
+		return err
+	}
 	if set.HeadCommit != "" {
 		cacheKey := projectID + "/" // head-only seed
 		_ = cacheKey
@@ -892,7 +902,9 @@ func (c *Client) SeedCache(_ context.Context, projectID string, set coreregistry
 // newCommit, which is not a descendant (simulated by a fake transport that
 // always returns false for IsAncestor).
 func (c *Client) SimulateRollback(ctx context.Context, projectID, lastObservedCommit, newCommit string) error {
-	c.setHeadCached(projectID, lastObservedCommit)
+	if err := c.setHeadCached(ctx, projectID, lastObservedCommit); err != nil {
+		return err
+	}
 	// Without a real transport, we directly invoke the anti-rollback logic.
 	// A non-ancestor HEAD is detected by comparing commit strings; for the
 	// simulation we treat any different commit as non-ancestor.
