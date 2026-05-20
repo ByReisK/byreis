@@ -37,6 +37,18 @@ func (f *fakeRegistryClient) CommitBump(_ context.Context, _ coreregistry.Commit
 	return nil
 }
 
+func (f *fakeRegistryClient) FetchRotationEpochs(_ context.Context, _ string) (map[string]uint64, error) {
+	return map[string]uint64{}, nil
+}
+
+func (f *fakeRegistryClient) CommitRotation(_ context.Context, _ coreregistry.CommitRotationInput) (coreregistry.CommitRotationResult, error) {
+	return coreregistry.CommitRotationResult{}, coreregistry.ErrCommitRotationNotImplemented
+}
+
+func (f *fakeRegistryClient) RotationInFlight(_ context.Context, _, _ string) (bool, error) {
+	return false, nil
+}
+
 var _ coreregistry.RegistryClient = (*fakeRegistryClient)(nil)
 
 // TestResolver_NilRegistryClient_ReturnsTypedError asserts that when the

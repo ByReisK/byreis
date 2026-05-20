@@ -287,6 +287,9 @@ func (p *pluggableTransport) ReadAdmins(ctx context.Context, repoURL, headCommit
 	return registry.ParsedAdminData{}, fmt.Errorf("pluggableTransport: no readAdminsFn configured")
 }
 func (p *pluggableTransport) DiscardCounterSession(_ context.Context, _ string) {}
+func (p *pluggableTransport) ReadRotationEpoch(_ context.Context, _, _, _, _ string) (uint64, error) {
+	return 0, nil
+}
 
 // newVerifiedTransport returns a pluggableTransport with verified=true and the
 // given readAdminsFn. headCommit defaults to a well-formed test SHA.

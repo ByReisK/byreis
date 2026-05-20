@@ -33,6 +33,7 @@ import (
 	"time"
 
 	"github.com/ByReisK/byreis/internal/adapter/registry/internal/capmint"
+	"github.com/ByReisK/byreis/internal/core/logging"
 	coreregistry "github.com/ByReisK/byreis/internal/core/registry"
 	"github.com/ByReisK/byreis/internal/core/registry/countertypes"
 	"github.com/ByReisK/byreis/internal/core/registry/rectypes"
@@ -147,6 +148,11 @@ type ClientConfig struct {
 	// behaviour). When non-nil, counter/head observations are written through
 	// to disk; on cold-start the in-memory maps are hydrated from disk.
 	DiskCache coreregistry.CounterCacheStore
+
+	// Logger is the structured-log sink for operational warnings emitted by
+	// the registry adapter. When nil a no-op logger is substituted at
+	// construction time so callers do not need to guard nil before logging.
+	Logger logging.Logger
 }
 
 // ProjectConfig holds the per-project configuration parsed from the registry
@@ -236,11 +242,19 @@ type FetchTransport interface {
 	// skipped. Implementations that do not maintain session state (e.g. test
 	// fakes) implement this as a no-op.
 	DiscardCounterSession(ctx context.Context, headCommit string)
+
+	// ReadRotationEpoch reads the rotation_epoch field from the counter store
+	// file for the given (projectID, fileName) at the given verified headCommit.
+	// Returns 0 and nil if the file is absent or the field is missing (backwards-
+	// compatible default for v0.1-produced counter files). Implementations that
+	// do not maintain rotation epoch state return (0, nil).
+	ReadRotationEpoch(ctx context.Context, repoURL, headCommit, projectID, fileName string) (uint64, error)
 }
 
 // Client is the RegistryClient implementation.
 type Client struct {
-	cfg ClientConfig
+	cfg    ClientConfig
+	logger logging.Logger
 
 	mu sync.Mutex
 
@@ -278,8 +292,13 @@ func New(cfg ClientConfig) (*Client, error) {
 		return nil, fmt.Errorf("registry.Client requires an injected Clock — " +
 			"do not use time.Now() directly in unit tests")
 	}
+	logger := cfg.Logger
+	if logger == nil {
+		logger = logging.Discard
+	}
 	return &Client{
 		cfg:          cfg,
+		logger:       logger,
 		cache:        make(map[string]coreregistry.AdminSet),
 		headCache:    make(map[string]string),
 		counterCache: make(map[string]uint64),
@@ -790,6 +809,240 @@ func (c *Client) CommitBump(ctx context.Context, in coreregistry.CommitBumpInput
 	return nil
 }
 
+// rotationCommitTransport is an optional extension of FetchTransport that
+// transports can implement to support CommitRotation. It is checked via
+// interface assertion at runtime; transports that do not implement it cause
+// Client.CommitRotation to return ErrCommitRotationNotImplemented.
+//
+// The method is not part of the FetchTransport interface because the full
+// rotation transport is shipped in a later release; V2 declares the port but
+// the transport wiring lands in V3.
+type rotationCommitTransport interface {
+	// CommitRotationTransport atomically advances last_accepted_counter for all
+	// N files, clears pending, and records the new rotation_epoch in a single
+	// signed registry commit. repoURL is the registry repository URL.
+	CommitRotationTransport(ctx context.Context, repoURL string, in coreregistry.CommitRotationInput) error
+}
+
+// FetchRotationEpochs returns the per-file rotation_epoch for all files in a
+// project from the registry counter store at the current verified HEAD.
+//
+// File discovery uses three sources, merged in order:
+//  1. The in-memory counterCache: files that CounterAuthority has already read
+//     in this process lifetime.
+//  2. The project config from ReadProjectConfig at the verified HEAD: logical
+//     file names listed in projects/<projectID>.yaml.
+//  3. The in-memory admin set cache (ConfiguredFiles from the last verified
+//     FetchAdminSet call for this project).
+//
+// Files whose counter file is absent or whose rotation_epoch field is missing
+// default to epoch 0 (backwards compatibility with v0.1-produced counter files).
+//
+// If FetchTransport is nil (offline mode) or FetchHead returns an error, the
+// method returns an empty map wrapped in ErrRegistryOffline. A nil map is never
+// returned; callers can always range over the result safely.
+func (c *Client) FetchRotationEpochs(ctx context.Context, projectID string) (map[string]uint64, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("registry FetchRotationEpochs cancelled: %w", err)
+	}
+
+	if c.cfg.FetchTransport == nil {
+		return map[string]uint64{}, fmt.Errorf("%w: no registry transport configured — "+
+			"run `byreis doctor` to diagnose", coreregistry.ErrRegistryOffline)
+	}
+
+	headCommit, _, verified, fetchErr := c.cfg.FetchTransport.FetchHead(
+		ctx, c.cfg.RegistryURL, c.cfg.TrustAnchorKey)
+	if fetchErr != nil {
+		return map[string]uint64{}, fmt.Errorf("%w: registry fetch failed: %v — "+
+			"using empty epoch map; run `byreis doctor` to diagnose",
+			coreregistry.ErrRegistryOffline, fetchErr)
+	}
+	if !verified {
+		return map[string]uint64{}, fmt.Errorf("%w: registry HEAD is not signature-verified — "+
+			"FetchRotationEpochs requires a verified HEAD; run `byreis doctor` to diagnose",
+			coreregistry.ErrUnsignedRegistry)
+	}
+
+	// Collect file names from three sources.
+	seen := make(map[string]struct{})
+	var fileNames []string
+	addFile := func(fn string) {
+		if _, already := seen[fn]; !already {
+			seen[fn] = struct{}{}
+			fileNames = append(fileNames, fn)
+		}
+	}
+
+	// Source 1: in-memory counterCache (files seen by CounterAuthority).
+	c.mu.Lock()
+	prefix := projectID + "/"
+	for k := range c.counterCache {
+		if len(k) > len(prefix) && k[:len(prefix)] == prefix {
+			addFile(k[len(prefix):])
+		}
+	}
+	// Source 3: ConfiguredFiles from the last verified FetchAdminSet.
+	if adminSet, hasCached := c.cache[projectID]; hasCached {
+		for logicalName := range adminSet.ConfiguredFiles {
+			addFile(logicalName)
+		}
+	}
+	c.mu.Unlock()
+
+	// Source 2: ReadProjectConfig at the verified HEAD.
+	// This provides file discovery in the common case where no prior
+	// CounterAuthority call has been made for this project in this session.
+	// The headCommit passed here is the same verified SHA from FetchHead above
+	// (same-invocation provenance — no second FetchHead, no TOCTOU window).
+	// ReadProjectConfig does NOT consume a session from FetchHead on the
+	// FetchRotationEpochs path (the session pipeline is only active during
+	// FetchAdminSet which uses a different session queue). This is safe because
+	// ReadRotationEpoch is an independent read that does not require the session.
+	projCfg, cfgErr := c.cfg.FetchTransport.ReadProjectConfig(
+		ctx, c.cfg.RegistryURL, headCommit, projectID)
+	if cfgErr != nil {
+		c.logger.Log(ctx, logging.LevelWarn,
+			"FetchRotationEpochs: project config unreadable; falling back to in-memory + admin-set sources",
+			"projectID", projectID,
+			"error", cfgErr.Error(),
+		)
+	} else {
+		for logicalName := range projCfg.Files {
+			addFile(logicalName)
+		}
+	}
+	// Config read failures are non-fatal for epoch discovery: if the project
+	// config is unreadable, we fall back to the in-memory sources above.
+
+	// Discard any counter session deposited by FetchHead on this path. The
+	// FetchRotationEpochs flow does not invoke ReadCounter or IsAncestor, so
+	// the counter-active session (if any) is not consumed. DiscardCounterSession
+	// is a no-op on transports that do not use session tracking.
+	defer c.cfg.FetchTransport.DiscardCounterSession(ctx, headCommit)
+
+	result := make(map[string]uint64, len(fileNames))
+	for _, fn := range fileNames {
+		epoch, epochErr := c.cfg.FetchTransport.ReadRotationEpoch(
+			ctx, c.cfg.RegistryURL, headCommit, projectID, fn)
+		if epochErr != nil {
+			return nil, fmt.Errorf(
+				"registry FetchRotationEpochs: reading epoch for (%s,%s): %w — "+
+					"run `byreis doctor` to diagnose",
+				projectID, fn, epochErr)
+		}
+		result[fn] = epoch
+	}
+
+	return result, nil
+}
+
+// CommitRotation atomically advances last_accepted_counter for all N files,
+// clears all N pending records, and increments rotation_epoch to in.NewEpoch
+// in one signed registry commit.
+//
+// V2 note: the full transport wiring lands in V3. In V2, the method delegates
+// to the transport only when it implements the optional rotationCommitTransport
+// extension. Otherwise it returns ErrCommitRotationNotImplemented so callers
+// receive the actionable hint: "rotation transport not available in this build".
+func (c *Client) CommitRotation(ctx context.Context, in coreregistry.CommitRotationInput) (coreregistry.CommitRotationResult, error) {
+	if err := ctx.Err(); err != nil {
+		return coreregistry.CommitRotationResult{}, fmt.Errorf(
+			"registry CommitRotation cancelled: %w", err)
+	}
+
+	// Check if the transport supports CommitRotation (optional duck-typed extension).
+	if rct, ok := c.cfg.FetchTransport.(rotationCommitTransport); ok {
+		if err := rct.CommitRotationTransport(ctx, c.cfg.RegistryURL, in); err != nil {
+			return coreregistry.CommitRotationResult{}, fmt.Errorf(
+				"registry CommitRotation: transport call failed: %w", err)
+		}
+		return coreregistry.CommitRotationResult{
+			NewEpoch:      in.NewEpoch,
+			AdvancedFiles: len(in.PerFile),
+		}, nil
+	}
+
+	// Transport does not implement CommitRotation — V3 wires the full transport.
+	return coreregistry.CommitRotationResult{}, fmt.Errorf(
+		"%w: transport does not implement CommitRotation — "+
+			"upgrade to a build with full rotation support",
+		coreregistry.ErrCommitRotationNotImplemented)
+}
+
+// RotationInFlight reports whether a rotation commit is in progress for the
+// given (projectID, fileName) pair. A rotation is in flight when:
+//   - The counter store for the file has a non-nil pending record (a merge is
+//     pending), AND
+//   - The rotation_epoch field is > 0 (the pending was recorded as part of a
+//     rotation, not a single-file merge).
+//
+// Callers that observe RotationInFlight == true MUST drive CommitRotation (not
+// per-file CommitBump) to advance the counter. Read-only callers MUST NOT call
+// CommitRotation — routing the resume through CommitRotation is the only
+// permitted path when a rotation is in flight.
+//
+// Returns (false, nil) when no counter record exists (file has never been
+// written). Returns (true, err) on uncertainty — if the registry cannot be
+// reached, the transport is nil, or signature verification fails, the caller
+// MUST treat the project as in-flight to avoid corrupting a partial rotation
+// by advancing a single file's counter (fail closed toward rotation protection).
+func (c *Client) RotationInFlight(ctx context.Context, projectID, fileName string) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, fmt.Errorf("registry RotationInFlight cancelled: %w", err)
+	}
+
+	if c.cfg.FetchTransport == nil {
+		return true, fmt.Errorf(
+			"registry RotationInFlight: no transport configured — cannot confirm rotation " +
+				"state; treating as in-flight: run `byreis doctor` to diagnose")
+	}
+
+	headCommit, _, verified, fetchErr := c.cfg.FetchTransport.FetchHead(
+		ctx, c.cfg.RegistryURL, c.cfg.TrustAnchorKey)
+	if fetchErr != nil {
+		if headCommit != "" {
+			c.cfg.FetchTransport.DiscardCounterSession(ctx, headCommit)
+		}
+		return true, fmt.Errorf(
+			"rotation-in-flight check failed: registry fetch error: %w — "+
+				"treating as in-flight: run `byreis doctor` to diagnose", fetchErr)
+	}
+	if !verified {
+		c.cfg.FetchTransport.DiscardCounterSession(ctx, headCommit)
+		return true, fmt.Errorf(
+			"rotation-in-flight check failed: registry HEAD is not signature-verified — " +
+				"treating as in-flight: run `byreis doctor` to diagnose")
+	}
+
+	// Read the counter to check for pending + rotation_epoch.
+	_, pending, readErr := c.cfg.FetchTransport.ReadCounter(
+		ctx, c.cfg.RegistryURL, headCommit, projectID, fileName)
+	if readErr != nil {
+		c.cfg.FetchTransport.DiscardCounterSession(ctx, headCommit)
+		return false, fmt.Errorf(
+			"registry RotationInFlight: reading counter: %w — run `byreis doctor`", readErr)
+	}
+
+	if pending == nil {
+		// No pending record — not in flight.
+		c.cfg.FetchTransport.DiscardCounterSession(ctx, headCommit)
+		return false, nil
+	}
+
+	// Read rotation_epoch: > 0 indicates this pending was recorded for a rotation.
+	epoch, epochErr := c.cfg.FetchTransport.ReadRotationEpoch(
+		ctx, c.cfg.RegistryURL, headCommit, projectID, fileName)
+	if epochErr != nil {
+		c.cfg.FetchTransport.DiscardCounterSession(ctx, headCommit)
+		return false, fmt.Errorf(
+			"registry RotationInFlight: reading rotation_epoch: %w — run `byreis doctor`", epochErr)
+	}
+
+	c.cfg.FetchTransport.DiscardCounterSession(ctx, headCommit)
+	return epoch > 0, nil
+}
+
 // ValidateSignerKeyLengths validates that all signer keys in an AdminSet are
 // exactly 32 bytes (ed25519.PublicKeySize). A wrong-length entry returns
 // coreregistry.ErrNoTrustedSigner at this boundary: a bad key at parse time
@@ -1004,6 +1257,10 @@ func (f *fakeAncestryTransport) ReadAdmins(_ context.Context, _, _, _ string) (P
 
 func (f *fakeAncestryTransport) DiscardCounterSession(_ context.Context, _ string) {}
 
+func (f *fakeAncestryTransport) ReadRotationEpoch(_ context.Context, _, _, _, _ string) (uint64, error) {
+	return 0, nil
+}
+
 // fakeUnsignedHeadTransport simulates a registry whose HEAD is not
 // signature-verified (unsigned commit).
 type fakeUnsignedHeadTransport struct{}
@@ -1037,3 +1294,7 @@ func (f *fakeUnsignedHeadTransport) ReadAdmins(_ context.Context, _, _, _ string
 }
 
 func (f *fakeUnsignedHeadTransport) DiscardCounterSession(_ context.Context, _ string) {}
+
+func (f *fakeUnsignedHeadTransport) ReadRotationEpoch(_ context.Context, _, _, _, _ string) (uint64, error) {
+	return 0, nil
+}

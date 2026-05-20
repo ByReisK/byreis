@@ -118,6 +118,11 @@ func (s *Store) pendingFilePath() string {
 	return filepath.Join(s.registryDir(), "pending.json")
 }
 
+// epochsFilePath returns the path to epochs.json for this registry.
+func (s *Store) epochsFilePath() string {
+	return filepath.Join(s.registryDir(), "epochs.json")
+}
+
 // ---- JSON envelope types ----------------------------------------------------
 
 // envelope is the on-disk JSON schema. schema_version and
@@ -136,6 +141,10 @@ type counterEntries = map[string]uint64
 
 // pendingEntries maps "projectID/fileName" → PendingBump.
 type pendingEntries = map[string]*countertypes.PendingBump
+
+// epochEntries maps "projectID/fileName" → uint64 rotation_epoch.
+// A missing key means no rotation has occurred (epoch == 0).
+type epochEntries = map[string]uint64
 
 // ---- context check helper ---------------------------------------------------
 
@@ -182,6 +191,8 @@ func unmarshalEnvelope[T any](data []byte, registryURL string) (T, error) {
 
 // ---- Compile-time interface assertion ---------------------------------------
 
+// Ensure Store satisfies the CounterCacheStore port including the V2 rotation
+// epoch methods.
 var _ coreregistry.CounterCacheStore = (*Store)(nil)
 
 // ---- noOpWriter for discard logger ------------------------------------------
@@ -289,6 +300,38 @@ func (s *Store) ClearPending(ctx context.Context, projectID, fileName string) er
 	})
 }
 
+// ---- LoadRotationEpoch / StoreRotationEpoch ---------------------------------
+
+// LoadRotationEpoch returns the rotation_epoch for the given (projectID, fileName)
+// pair from the on-disk epochs.json. Returns (0, nil) on cold cache or when
+// the field is absent (backwards-compatible default for v0.1-written files).
+func (s *Store) LoadRotationEpoch(ctx context.Context, projectID, fileName string) (uint64, error) {
+	if err := ctxCheck(ctx); err != nil {
+		return 0, err
+	}
+
+	entries, err := s.loadEpochEntries(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if entries == nil {
+		return 0, nil
+	}
+	return entries[projectID+"/"+fileName], nil
+}
+
+// StoreRotationEpoch writes the rotation_epoch for the given (projectID, fileName)
+// pair to the on-disk epochs.json. Uses the same fail-closed atomic-write
+// semantics as StoreCounter.
+func (s *Store) StoreRotationEpoch(ctx context.Context, projectID, fileName string, epoch uint64) error {
+	if err := ctxCheck(ctx); err != nil {
+		return err
+	}
+	return s.updateEpochEntries(ctx, func(entries epochEntries) {
+		entries[projectID+"/"+fileName] = epoch
+	})
+}
+
 // ---- Generic read/update helpers --------------------------------------------
 // The platform-specific load/write primitives (readSecureFile, ensureRegistryDir,
 // writeSecureFile) are in cache_unix.go and cache_windows.go respectively.
@@ -318,6 +361,15 @@ func (s *Store) loadPendingEntries(ctx context.Context) (pendingEntries, error) 
 func (s *Store) updatePendingEntries(ctx context.Context, fn func(pendingEntries)) error {
 	return updateEntries[pendingEntries](ctx, s, s.pendingFilePath(),
 		func() pendingEntries { return make(pendingEntries) }, fn)
+}
+
+func (s *Store) loadEpochEntries(ctx context.Context) (epochEntries, error) {
+	return loadEntries[epochEntries](ctx, s, s.epochsFilePath())
+}
+
+func (s *Store) updateEpochEntries(ctx context.Context, fn func(epochEntries)) error {
+	return updateEntries[epochEntries](ctx, s, s.epochsFilePath(),
+		func() epochEntries { return make(epochEntries) }, fn)
 }
 
 // mapIsNil reports whether a generic map value is nil. Required because a Go

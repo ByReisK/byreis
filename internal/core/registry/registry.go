@@ -182,6 +182,15 @@ type CounterCacheStore interface {
 	// ClearPending removes the pending bump for the given pair. A missing
 	// record is not an error.
 	ClearPending(ctx context.Context, projectID, fileName string) error
+
+	// LoadRotationEpoch returns the durably-persisted rotation_epoch for the
+	// given (projectID, fileName) pair, or (0, nil) if no record exists.
+	// A missing field in an existing cache file is treated as 0 for
+	// backwards-compatibility with v0.1-written cache files.
+	LoadRotationEpoch(ctx context.Context, projectID, fileName string) (uint64, error)
+
+	// StoreRotationEpoch writes the rotation_epoch durably for the given pair.
+	StoreRotationEpoch(ctx context.Context, projectID, fileName string, epoch uint64) error
 }
 
 // PendingBumpInput carries the write-ahead intent recorded before a
@@ -202,6 +211,42 @@ type CommitBumpInput struct {
 	FileName       string
 	PendingCounter uint64 // must match the open pending's pending_counter
 	PRRef          string // audit linkage
+}
+
+// ErrCommitRotationNotImplemented is returned by CommitRotation when the full
+// rotation transport has not yet been wired (V3 ships the implementation).
+// Callers must treat this as a typed not-implemented sentinel and surface an
+// actionable hint: "rotation transport not available in this build".
+var ErrCommitRotationNotImplemented = errors.New(
+	"CommitRotation transport is not yet available in this build — " +
+		"full rotation support lands in the next release")
+
+// PerFileCommit is one entry in a CommitRotation call: the logical file name,
+// the pending counter that was recorded at RecordPendingBump, the content SHA
+// of the signed artifact that was pushed to the rotation branch, and the PR ref
+// for audit linkage.
+type PerFileCommit struct {
+	LogicalName    string
+	PendingCounter uint64
+	TargetSHA      string
+	TargetPR       string
+}
+
+// CommitRotationInput carries the atomic-N-file rotation commit intent.
+// All N files advance last_accepted_counter, clear pending, and record
+// the new rotation epoch in one signed registry commit.
+type CommitRotationInput struct {
+	ProjectID         string
+	PerFile           []PerFileCommit // N entries — one per file in the rotation
+	NewEpoch          uint64          // new rotation_epoch for all N files
+	RegistryParentSHA string          // CAS lease (captured at first RecordPendingBump)
+}
+
+// CommitRotationResult is returned on a successful CommitRotation.
+type CommitRotationResult struct {
+	CommitSHA     string
+	NewEpoch      uint64
+	AdvancedFiles int // equals len(input.PerFile)
 }
 
 // RegistryClient is the consumer-defined port for registry operations. The
@@ -258,4 +303,39 @@ type RegistryClient interface {
 	// pendingCounter must equal the open pending's pending_counter, otherwise
 	// countertypes.ErrCounterReconcile.
 	CommitBump(ctx context.Context, in CommitBumpInput) error
+
+	// FetchRotationEpochs returns the per-file rotation_epoch for all files in
+	// a project, sourced from the registry counter store. The map is keyed by
+	// logical file name (e.g. "secrets/prod.enc.yaml"). An empty map means no
+	// rotation has occurred for any file in the project.
+	//
+	// Missing rotation_epoch field in a counter-store file is treated as 0
+	// (backwards-compatible read of v0.1-produced counter files).
+	//
+	// If the registry is unreachable and a stale cache is available, the stale
+	// cache value is returned. If neither is available, returns ErrRegistryOffline.
+	FetchRotationEpochs(ctx context.Context, projectID string) (map[string]uint64, error)
+
+	// CommitRotation atomically advances last_accepted_counter for all N files in
+	// one signed registry commit, clears all N pending records, and increments the
+	// rotation_epoch for all N files to in.NewEpoch. Returns the commit SHA on
+	// success. CAS rejection returns ErrRegistryConcurrentWrite.
+	//
+	// V2 note: the full transport implementation lands in V3. V2 declares the
+	// method signature and the adapter returns ErrCommitRotationNotImplemented
+	// until V3 wires the transport.
+	CommitRotation(ctx context.Context, in CommitRotationInput) (CommitRotationResult, error)
+
+	// RotationInFlight reports whether a rotation transaction is currently
+	// in flight for the given (project, file) — i.e., there is a pending
+	// counter bump AND the file's rotation_epoch is non-zero. Read-only
+	// callers must use this to refuse single-file CommitBump while a
+	// rotation is mid-flight, routing the resume through CommitRotation
+	// instead.
+	//
+	// Returns true on uncertainty (fail closed toward rotation protection:
+	// if the registry cannot be reached or the source-verified gate fails,
+	// callers MUST treat the project as in-flight to avoid corrupting a
+	// partial rotation by advancing a single file's counter).
+	RotationInFlight(ctx context.Context, projectID, fileName string) (bool, error)
 }

@@ -492,6 +492,9 @@ func (s *stubCounterTransport) ReadAdmins(_ context.Context, _, _, _ string) (re
 	return registry.ParsedAdminData{}, nil
 }
 func (s *stubCounterTransport) DiscardCounterSession(_ context.Context, _ string) {}
+func (s *stubCounterTransport) ReadRotationEpoch(_ context.Context, _, _, _, _ string) (uint64, error) {
+	return 0, nil
+}
 
 // ----- E1: ConfiguredFiles populated from SourceVerified fetch ---------------
 
@@ -541,6 +544,9 @@ func (s *stubVerifiedTransportWithConfig) ReadAdmins(_ context.Context, _, headC
 	}, nil
 }
 func (s *stubVerifiedTransportWithConfig) DiscardCounterSession(_ context.Context, _ string) {}
+func (s *stubVerifiedTransportWithConfig) ReadRotationEpoch(_ context.Context, _, _, _, _ string) (uint64, error) {
+	return 0, nil
+}
 
 // TestE1_ConfiguredFiles_PopulatedFromSourceVerifiedFetch is the E1 positive
 // test: a SourceVerified fetch with a known projects/<id>.yaml populates
@@ -763,6 +769,14 @@ func (s *stubFailDiskCache) StorePending(_ context.Context, _, _ string, _ *coun
 }
 
 func (s *stubFailDiskCache) ClearPending(_ context.Context, _, _ string) error {
+	return nil
+}
+
+func (s *stubFailDiskCache) LoadRotationEpoch(_ context.Context, _, _ string) (uint64, error) {
+	return 0, nil
+}
+
+func (s *stubFailDiskCache) StoreRotationEpoch(_ context.Context, _, _ string, _ uint64) error {
 	return nil
 }
 

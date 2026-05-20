@@ -383,6 +383,9 @@ func (u *unverifiedHeadCounterTransport) ReadAdmins(_ context.Context, _, _, _ s
 	return registry.ParsedAdminData{}, nil
 }
 func (u *unverifiedHeadCounterTransport) DiscardCounterSession(_ context.Context, _ string) {}
+func (u *unverifiedHeadCounterTransport) ReadRotationEpoch(_ context.Context, _, _, _, _ string) (uint64, error) {
+	return 0, nil
+}
 
 // ancestryErrorTransport simulates a transport where FetchHead returns a
 // different HEAD commit (triggering an ancestry check) but IsAncestor returns
@@ -415,6 +418,9 @@ func (a *ancestryErrorTransport) ReadAdmins(_ context.Context, _, _, _ string) (
 	return registry.ParsedAdminData{}, nil
 }
 func (a *ancestryErrorTransport) DiscardCounterSession(_ context.Context, _ string) {}
+func (a *ancestryErrorTransport) ReadRotationEpoch(_ context.Context, _, _, _, _ string) (uint64, error) {
+	return 0, nil
+}
 
 // verifiedSourceTransport simulates a fully-verified transport for the positive
 // end-to-end test: FetchHead returns verified=true, IsAncestor returns true,
@@ -446,3 +452,6 @@ func (v *verifiedSourceTransport) ReadAdmins(_ context.Context, _, _, _ string) 
 	return registry.ParsedAdminData{}, nil
 }
 func (v *verifiedSourceTransport) DiscardCounterSession(_ context.Context, _ string) {}
+func (v *verifiedSourceTransport) ReadRotationEpoch(_ context.Context, _, _, _, _ string) (uint64, error) {
+	return 0, nil
+}

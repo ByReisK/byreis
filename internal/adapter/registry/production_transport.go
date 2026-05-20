@@ -1074,6 +1074,11 @@ func (t *productionFetchTransport) buildWritePendingJSON(
 		LastPR:              existing.LastPR,
 		UpdatedAt:           now,
 		Pending:             pendingJSON,
+		// Preserve the existing rotation_epoch: single-file RecordPendingBump
+		// must NOT touch the rotation_epoch field; only an atomic N-file
+		// rotation commit changes it. A zero epoch is serialised as omitempty
+		// (absent from JSON), which is wire-identical to a v0.1-written file.
+		RotationEpoch: epochNumberOrOmit(existing.RotationEpoch),
 	}
 
 	raw, err := json.MarshalIndent(wire, "", "  ")
@@ -1114,6 +1119,10 @@ func (t *productionFetchTransport) buildCommitPendingJSON(
 		LastPR:              existing.Pending.TargetPR,
 		UpdatedAt:           now,
 		Pending:             nil, // atomically cleared in this single commit
+		// Preserve the existing rotation_epoch: CommitBump (single-file merge) must
+		// NOT touch the rotation_epoch field; only an atomic N-file rotation commit
+		// changes it. The epoch is advanced exclusively by CommitRotation.
+		RotationEpoch: epochNumberOrOmit(existing.RotationEpoch),
 	}
 
 	raw, err := json.MarshalIndent(wire, "", "  ")
@@ -1567,6 +1576,18 @@ func ageKeyFingerprint(agePubKey string) rectypes.Fingerprint {
 	return rectypes.Fingerprint(sum)
 }
 
+// epochNumberOrOmit converts a uint64 epoch to a json.Number suitable for
+// the counterFileJSON.RotationEpoch field. When epoch == 0, it returns an
+// empty json.Number so the omitempty tag omits the field from the JSON output,
+// producing a file wire-identical to a v0.1-written file for epoch-zero state.
+// When epoch > 0, it returns the decimal string representation.
+func epochNumberOrOmit(epoch uint64) json.Number {
+	if epoch == 0 {
+		return "" // omitempty: field absent from JSON output
+	}
+	return json.Number(fmt.Sprintf("%d", epoch))
+}
+
 // isAllZeroKey returns true if all bytes in b are zero.
 func isAllZeroKey(b []byte) bool {
 	for _, v := range b {
@@ -1594,18 +1615,36 @@ type counterPendingJSON struct {
 	ParentCommitSHA string `json:"parent_commit_sha"`
 }
 
-// counterFileJSON is the strict wire format for the counter store JSON file,
+// counterFileJSON is the wire format for the counter store JSON file,
 // matching the documented counter store wire format.
-// Field names must match exactly; DisallowUnknownFields rejects extra fields.
+// Field names must match exactly.
 // json.Number mode is used for the counter fields to reject scientific notation,
 // floats, and out-of-range values.
+//
+// DisallowUnknownFields IS used in decodeCounterFile: truly unknown keys are
+// rejected (ErrCounterStoreUnreadable). The RotationEpoch field was added in
+// v0.2 and is declared here, so v0.2 files are accepted by DisallowUnknownFields.
+// V0.1 writes omit rotation_epoch; the omitempty tag means v0.2 also omits it
+// when epoch == 0, preserving wire compatibility for the counter-zero case.
+//
+// Note: a strict-decoder reader that rejects unknown JSON keys cannot parse
+// counter-store files written with this rotation_epoch field present.
+// The v0.2-and-later decoder accepts the field; pre-rotation files (where the
+// field is absent) parse fine via the omitempty default-zero path.
 type counterFileJSON struct {
-	ProjectID           string              `json:"project_id"`
-	File                string              `json:"file"`
-	LastAcceptedCounter json.Number         `json:"last_accepted_counter"`
-	LastPR              string              `json:"last_pr"`
-	UpdatedAt           string              `json:"updated_at"`
-	Pending             *counterPendingJSON `json:"pending"`
+	ProjectID           string      `json:"project_id"`
+	File                string      `json:"file"`
+	LastAcceptedCounter json.Number `json:"last_accepted_counter"`
+	LastPR              string      `json:"last_pr"`
+	UpdatedAt           string      `json:"updated_at"`
+	// RotationEpoch is the project-level rotation epoch for this file, added in
+	// v0.2. It is incremented by CommitRotation for all N files atomically.
+	// Single-file CommitBump leaves this field unchanged. The omitempty tag
+	// omits the field when epoch == 0, so v0.2 writes of epoch-zero files are
+	// wire-identical to v0.1 writes — a v0.1 binary reading a new epoch=0
+	// file sees no unknown field.
+	RotationEpoch json.Number         `json:"rotation_epoch,omitempty"`
+	Pending       *counterPendingJSON `json:"pending"`
 }
 
 // counterFileParsed is the fully-decoded, post-semantic-validation counter file
@@ -1616,6 +1655,7 @@ type counterFileParsed struct {
 	LastAcceptedCounter uint64
 	LastPR              string
 	UpdatedAt           string
+	RotationEpoch       uint64 // 0 when absent (backwards-compatible default)
 	Pending             *counterPendingParsed
 }
 
@@ -1693,13 +1733,17 @@ func checkDuplicateJSONKeys(raw []byte) error {
 }
 
 // decodeCounterFile decodes the raw JSON bytes into a counterFileParsed using
-// strict DisallowUnknownFields mode plus integer-only counter fields.
+// UseNumber mode for integer-only counter fields. DisallowUnknownFields is used
+// to reject keys not declared in counterFileJSON — the counterFileJSON struct
+// includes rotation_epoch (added in v0.2), so v0.2 files are accepted and
+// truly unknown keys are rejected. The checkDuplicateJSONKeys pre-scan is the
+// guard against malicious duplicate keys.
 // The caller must have already run checkDuplicateJSONKeys and the pre-decode
 // size check before calling this function.
 func decodeCounterFile(raw []byte) (counterFileParsed, error) {
 	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.DisallowUnknownFields()
 	dec.UseNumber()
+	dec.DisallowUnknownFields()
 
 	var wire counterFileJSON
 	if err := dec.Decode(&wire); err != nil {
@@ -1713,12 +1757,24 @@ func decodeCounterFile(raw []byte) (counterFileParsed, error) {
 		return counterFileParsed{}, err
 	}
 
+	// Parse rotation_epoch: present only in v0.2+ files. When absent (empty
+	// json.Number from omitempty), defaults to 0 for backwards compatibility
+	// with v0.1-produced files.
+	var rotationEpoch uint64
+	if wire.RotationEpoch != "" {
+		rotationEpoch, err = parseCounterNumber(wire.RotationEpoch, "rotation_epoch")
+		if err != nil {
+			return counterFileParsed{}, err
+		}
+	}
+
 	result := counterFileParsed{
 		ProjectID:           wire.ProjectID,
 		File:                wire.File,
 		LastAcceptedCounter: la,
 		LastPR:              wire.LastPR,
 		UpdatedAt:           wire.UpdatedAt,
+		RotationEpoch:       rotationEpoch,
 	}
 
 	if wire.Pending != nil {
@@ -1882,6 +1938,117 @@ func validateCounterFileSemantics(cf counterFileParsed, projectID, fileName stri
 		}
 	}
 	return nil
+}
+
+// ReadRotationEpoch reads the rotation_epoch field from the counter store file
+// for the given (projectID, fileName) at the given verified headCommit. It does
+// not use the session pipeline (ReadCounter's clone session); it opens a
+// temporary clone to read the blob directly. Returns 0 and nil when the counter
+// file is absent or when the rotation_epoch field is missing.
+//
+// This is a read-only operation: it does not advance any counter or deposit any
+// session. Context cancellation is honoured; a cancelled context returns (0, err).
+func (t *productionFetchTransport) ReadRotationEpoch(ctx context.Context, repoURL, headCommit, projectID, fileName string) (uint64, error) {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return 0, fmt.Errorf(
+			"ReadRotationEpoch: context already cancelled: %w — run `byreis doctor`", ctxErr)
+	}
+
+	if err := fetchtransport.ValidateProjectID(projectID); err != nil {
+		return 0, fmt.Errorf(
+			"%w: ReadRotationEpoch: invalid projectID: %v — run `byreis doctor`",
+			coreregistry.ErrCounterStoreUnreadable, err)
+	}
+	if err := fetchtransport.ValidateFileName(fileName); err != nil {
+		return 0, fmt.Errorf(
+			"%w: ReadRotationEpoch: invalid fileName: %v — run `byreis doctor`",
+			coreregistry.ErrCounterStoreUnreadable, err)
+	}
+	if !fetchtransport.IsValidSHA(headCommit) {
+		return 0, fmt.Errorf(
+			"%w: ReadRotationEpoch: headCommit %q is not a valid SHA — "+
+				"internal invariant violated; run `byreis doctor`",
+			coreregistry.ErrCounterStoreUnreadable, headCommit)
+	}
+
+	// Create a temporary workspace for the clone.
+	tmpDir, mkErr := os.MkdirTemp("", "byreis-epoch-read-*")
+	if mkErr != nil {
+		return 0, fmt.Errorf("ReadRotationEpoch: cannot create temp workspace: %w — "+
+			"check filesystem permissions: run `byreis doctor`", mkErr)
+	}
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+
+	if chErr := os.Chmod(tmpDir, 0o700); chErr != nil { //nolint:gosec // 0700 on dir is intentional: owner-only scratch workspace
+		return 0, fmt.Errorf("ReadRotationEpoch: cannot chmod temp workspace to 0700: %w — "+
+			"check filesystem permissions: run `byreis doctor`", chErr)
+	}
+
+	cloneDir := filepath.Join(tmpDir, "repo")
+
+	hardenedEnv := func() []string {
+		base := fetchtransport.CleanGitEnv()
+		return append(base,
+			"GIT_CONFIG_NOSYSTEM=1",
+			"HOME="+tmpDir,
+			"GIT_TERMINAL_PROMPT=0",
+			"GIT_ALLOW_PROTOCOL=file:https:ssh",
+			"GIT_CONFIG_COUNT=2",
+			"GIT_CONFIG_KEY_0=core.hooksPath",
+			"GIT_CONFIG_VALUE_0=/dev/null",
+			"GIT_CONFIG_KEY_1=core.fsmonitor",
+			"GIT_CONFIG_VALUE_1=",
+		)
+	}
+
+	cloneCtx, cloneCancel := fetchtransport.WithBoundedDeadline(ctx, 30*time.Second)
+	defer cloneCancel()
+
+	_, cloneStderr, cloneExit, cloneErr := t.verifier.RunSubprocess(
+		cloneCtx, tmpDir, hardenedEnv(),
+		"git", "clone", "--depth=1", "--no-local", "--", repoURL, cloneDir,
+	)
+	if cloneErr != nil {
+		return 0, fmt.Errorf("ReadRotationEpoch: git clone exec error: %w — "+
+			"run `byreis doctor`", cloneErr)
+	}
+	if cloneExit != 0 {
+		return 0, fmt.Errorf("%w: ReadRotationEpoch: git clone exited %d: %s — "+
+			"run `byreis doctor`",
+			coreregistry.ErrCounterStoreUnreadable, cloneExit,
+			fetchtransport.SanitizeOutput(cloneStderr))
+	}
+
+	blobPath := fetchtransport.CounterBlobPath(projectID, fileName)
+	raw, readErr := t.verifier.ReadBlobAtSHA(ctx, cloneDir, headCommit, blobPath)
+	if readErr != nil {
+		if fetchtransport.IsBlobNotFound(readErr) {
+			return 0, nil // absent counter file defaults to epoch 0
+		}
+		return 0, fmt.Errorf(
+			"%w: ReadRotationEpoch: reading %q at %q: %v — run `byreis doctor`",
+			coreregistry.ErrCounterStoreUnreadable, blobPath, headCommit, readErr)
+	}
+
+	if len(raw) > maxCounterJSONBytes {
+		return 0, fmt.Errorf(
+			"%w: ReadRotationEpoch: counter blob %q at %q exceeds max size %d bytes — "+
+				"run `byreis doctor`",
+			coreregistry.ErrCounterStoreUnreadable, blobPath, headCommit, maxCounterJSONBytes)
+	}
+
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return 0, nil // empty blob: treat as epoch 0
+	}
+
+	cf, decErr := decodeCounterFile(raw)
+	if decErr != nil {
+		return 0, fmt.Errorf(
+			"%w: ReadRotationEpoch: decoding counter blob %q at %q: %v — run `byreis doctor`",
+			coreregistry.ErrCounterStoreUnreadable, blobPath, headCommit, decErr)
+	}
+
+	return cf.RotationEpoch, nil
 }
 
 // Compile-time assertion: productionFetchTransport satisfies FetchTransport.
