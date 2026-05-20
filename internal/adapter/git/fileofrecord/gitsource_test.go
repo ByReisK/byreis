@@ -880,29 +880,6 @@ func TestGitSource_ProjectURL_FromConfig(t *testing.T) {
 	}
 }
 
-// ---- ReadBlobAtRef has no non-test callers (structural) ---------------------
-
-// TestGitSource_ReadBlobAtRef_NoNonTestCaller is a structural assertion that
-// ReadBlobAtRef (the single-clone primitive that was NOT chosen for the
-// file-of-record path) has no non-test callers in the production codebase.
-// This test documents the invariant rather than replying on grep at review time.
-//
-// The actual grep is performed by the CI gate; this test records the design
-// constraint so that any future wiring to ReadBlobAtRef shows up as a test
-// failure in review.
-func TestGitSource_ReadBlobAtRef_NoNonTestCaller(t *testing.T) {
-	t.Parallel()
-
-	// The real check is the structural production-code grep in the CI gate
-	// (grep -rn 'ReadBlobAtRef' internal/ --include='*.go' | grep -v _test.go).
-	// Here we verify the GitSource interface uses ProjectBlobReader, not ReadBlobAtRef.
-	// If the seam were rewired to ReadBlobAtRef this compile-time assertion would
-	// catch it: the interface method signatures would change.
-	var _ fileofrecord.ProjectBlobReader = (*fakeBlobReader)(nil)
-	// The interface has ReadProjectBlob, not ReadBlobAtRef.
-	// This declaration fails to compile if the interface changes.
-}
-
 // ---- usecase.FileOfRecordSource compile-time assertion ----------------------
 
 // TestGitSource_ImplementsFileOfRecordSource is a compile-time gate that

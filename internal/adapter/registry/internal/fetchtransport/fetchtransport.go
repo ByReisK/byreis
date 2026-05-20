@@ -610,9 +610,10 @@ func withBoundedDeadline(parent context.Context, bound time.Duration) (context.C
 // derives from the manifest signature, not from the project commit.
 //
 // This function is the canonical git-based file-of-record read primitive and
-// MUST be used by the production file-of-record source. ReadBlobAtRef MUST NOT
-// be used for the file-of-record path (it self-clones and re-resolves a ref,
-// violating the single-clone / no-re-resolution invariant).
+// MUST be used by the production file-of-record source. It reads at the exact
+// SHA that HeadVerifier.VerifyHead signature-verified, from the same clone,
+// with no second network round-trip, preserving the single-clone /
+// no-re-resolution invariant.
 //
 // Hardening: the clone and every subsequent git leg run with the full hardened
 // isolated env (GIT_CONFIG_NOSYSTEM, HOME=tmpDir, GIT_ALLOW_PROTOCOL, hooks
@@ -782,113 +783,6 @@ func (v *HeadVerifier) ReadProjectBlob(ctx context.Context, projectURL, branch, 
 	}
 
 	return sProjSHA, raw, nil
-}
-
-// ReadBlobAtRef clones repoURL (shallow), resolves ref to a SHA, then reads
-// path from the clone via `git cat-file blob <sha>:<path>`. The clone is
-// created in a fresh 0700 temp directory and removed on return. No signature
-// verification is performed; this is for advisory reads (e.g. file-of-record).
-//
-// Returns ErrBlobNotFound when the path does not exist in the tree at that ref.
-//
-// Deprecated: ReadBlobAtRef performs a self-contained clone + ref re-resolution
-// with no signature verification, violating the verified-SHA / no-ref-re-resolution
-// discipline required on the production trust path. The canonical primitive for
-// caller-supplied verified SHAs is ReadBlobAtSHA; the production file-of-record
-// and registry-admins read paths use ReadProjectBlob (reads at the exact SHA that
-// HeadVerifier.VerifyHead signature-verified, from the same clone, with no second
-// network round-trip). This function has zero non-test production callers and is
-// scheduled for deletion at the next dead-code sweep. Do not wire
-// into any new production path.
-func (v *HeadVerifier) ReadBlobAtRef(ctx context.Context, repoURL, ref, path string) ([]byte, error) {
-	if ctxErr := ctx.Err(); ctxErr != nil {
-		return nil, fmt.Errorf(
-			"ReadBlobAtRef: context already cancelled: %w — run `byreis doctor`", ctxErr)
-	}
-
-	tmpDir, mkErr := v.mkdirTemp("", "byreis-blobref-*")
-	if mkErr != nil {
-		return nil, fmt.Errorf(
-			"ReadBlobAtRef: cannot create temp workspace: %w — "+
-				"check filesystem permissions: run `byreis doctor`", mkErr)
-	}
-	defer func() { _ = v.removeAll(tmpDir) }()
-
-	if chErr := os.Chmod(tmpDir, 0o700); chErr != nil { //nolint:gosec // 0700 on dir is intentional: owner-only scratch workspace
-		return nil, fmt.Errorf(
-			"ReadBlobAtRef: cannot chmod temp workspace: %w — "+
-				"check filesystem permissions: run `byreis doctor`", chErr)
-	}
-
-	hardenedEnvRef := func() []string {
-		base := cleanGitEnv()
-		env := append(base,
-			"GIT_CONFIG_NOSYSTEM=1",
-			"HOME="+tmpDir,
-			"GIT_TERMINAL_PROMPT=0",
-			"GIT_ALLOW_PROTOCOL=file:https:ssh",
-			"GIT_CONFIG_COUNT=2",
-			"GIT_CONFIG_KEY_0=core.hooksPath",
-			"GIT_CONFIG_VALUE_0=/dev/null",
-			"GIT_CONFIG_KEY_1=core.fsmonitor",
-			"GIT_CONFIG_VALUE_1=",
-		)
-		return append(env, v.extraEnv...)
-	}
-
-	cloneDir := filepath.Join(tmpDir, "repo")
-	cloneCtx, cloneCancel := withBoundedDeadline(ctx, cloneTimeout)
-	defer cloneCancel()
-
-	_, cloneStderr, cloneExit, cloneErr := v.runner.Run(
-		cloneCtx, tmpDir,
-		hardenedEnvRef(),
-		"git", "clone", "--depth=1", "--no-checkout", "--no-local", "--",
-		repoURL, cloneDir,
-	)
-	if cloneErr != nil {
-		if isContextError(cloneCtx, ctx) {
-			return nil, fmt.Errorf(
-				"ReadBlobAtRef: git clone cancelled: %w — run `byreis doctor`", ctx.Err())
-		}
-		return nil, fmt.Errorf(
-			"ReadBlobAtRef: git clone exec error: %w — "+
-				"ensure git is installed and the URL is reachable: run `byreis doctor`", cloneErr)
-	}
-	if cloneExit != 0 {
-		return nil, fmt.Errorf(
-			"ReadBlobAtRef: git clone exited %d: %s — run `byreis doctor`",
-			cloneExit, sanitizeOutput(cloneStderr))
-	}
-
-	revCtx, revCancel := withBoundedDeadline(ctx, 10*time.Second)
-	defer revCancel()
-
-	revStdout, _, revExit, revErr := v.runner.Run(
-		revCtx, cloneDir,
-		hardenedEnvRef(),
-		"git", "rev-parse", "HEAD",
-	)
-	if revErr != nil {
-		if isContextError(revCtx, ctx) {
-			return nil, fmt.Errorf(
-				"ReadBlobAtRef: git rev-parse cancelled: %w — run `byreis doctor`", ctx.Err())
-		}
-		return nil, fmt.Errorf(
-			"ReadBlobAtRef: git rev-parse HEAD exec error: %w — run `byreis doctor`", revErr)
-	}
-	if revExit != 0 {
-		return nil, fmt.Errorf(
-			"ReadBlobAtRef: git rev-parse HEAD exited %d — run `byreis doctor`", revExit)
-	}
-
-	sha := strings.TrimSpace(string(revStdout))
-	if !isValidSHA(sha) {
-		return nil, fmt.Errorf(
-			"ReadBlobAtRef: git rev-parse returned non-SHA output %q — run `byreis doctor`", sha)
-	}
-
-	return v.ReadBlobAtSHA(ctx, cloneDir, sha, path)
 }
 
 // isContextError reports whether the subprocess context or the parent context
