@@ -141,6 +141,12 @@ type ClientConfig struct {
 	// ErrRegistryWriteAuth. The implementation must refuse to return the token
 	// in CONTRIBUTOR mode (contributor/admin credential separation).
 	WriteTokenProvider RegistryWriteTokenProvider
+
+	// DiskCache is an optional durable counter+head cache that survives process
+	// restart. When nil, the client operates in-memory only (the pre-v0.1
+	// behaviour). When non-nil, counter/head observations are written through
+	// to disk; on cold-start the in-memory maps are hydrated from disk.
+	DiskCache coreregistry.CounterCacheStore
 }
 
 // ProjectConfig holds the per-project configuration parsed from the registry
@@ -254,6 +260,10 @@ type Client struct {
 	// Currently in-memory only; the real implementation writes to the
 	// registry repo via FetchTransport.WriteCounter.
 	pendingStore map[string]*countertypes.PendingBump
+
+	// diskHydrated tracks whether the in-memory maps have been hydrated from
+	// the on-disk cache for each (project, file) key. Protected by mu.
+	diskHydrated map[string]bool
 }
 
 // New constructs a Client with the given config. Returns an error if the
@@ -274,6 +284,7 @@ func New(cfg ClientConfig) (*Client, error) {
 		headCache:    make(map[string]string),
 		counterCache: make(map[string]uint64),
 		pendingStore: make(map[string]*countertypes.PendingBump),
+		diskHydrated: make(map[string]bool),
 	}, nil
 }
 
@@ -429,7 +440,23 @@ func (c *Client) VerifyRegistryFreshness(ctx context.Context, projectID string) 
 		return fmt.Errorf("registry VerifyRegistryFreshness cancelled: %w", err)
 	}
 
+	// Hydrate the head floor from disk on first call for this project so a
+	// process restart restores the anti-rollback floor.
+	headHydKey := "__head__/" + projectID
 	c.mu.Lock()
+	if c.cfg.DiskCache != nil && !c.diskHydrated[headHydKey] {
+		c.diskHydrated[headHydKey] = true
+		c.mu.Unlock()
+		diskHead, diskErr := c.cfg.DiskCache.LoadHead(ctx, projectID)
+		if diskErr == nil && diskHead != "" {
+			c.mu.Lock()
+			if _, has := c.headCache[projectID]; !has {
+				c.headCache[projectID] = diskHead
+			}
+			c.mu.Unlock()
+		}
+		c.mu.Lock()
+	}
 	lastHead, hasLastHead := c.headCache[projectID]
 	c.mu.Unlock()
 
@@ -544,7 +571,22 @@ func (c *Client) CounterAuthority(ctx context.Context, projectID, fileName strin
 
 	// Precondition 3: anti-rollback cache check. The fetched last_accepted must
 	// not be less than the last cached value (regression = possible tamper).
+	// Hydrate from disk on the first observation of this (project, file) key
+	// so a process restart restores the anti-rollback floor durably.
 	c.mu.Lock()
+	if c.cfg.DiskCache != nil && !c.diskHydrated[cacheKey] {
+		c.diskHydrated[cacheKey] = true
+		c.mu.Unlock()
+		diskCounter, diskErr := c.cfg.DiskCache.LoadCounter(ctx, projectID, fileName)
+		if diskErr == nil && diskCounter > 0 {
+			c.mu.Lock()
+			if _, has := c.counterCache[cacheKey]; !has {
+				c.counterCache[cacheKey] = diskCounter
+			}
+			c.mu.Unlock()
+		}
+		c.mu.Lock()
+	}
 	cachedCounter, hasCachedCounter := c.counterCache[cacheKey]
 	c.mu.Unlock()
 
@@ -556,10 +598,20 @@ func (c *Client) CounterAuthority(ctx context.Context, projectID, fileName strin
 			coreregistry.ErrCacheTampered, lastAccepted, projectID, fileName, cachedCounter)
 	}
 
-	// Update the counter cache with the latest observed value.
+	// Update the counter cache with the latest observed value and write through
+	// to the on-disk cache.
 	c.mu.Lock()
 	c.counterCache[cacheKey] = lastAccepted
 	c.mu.Unlock()
+	if c.cfg.DiskCache != nil {
+		if diskErr := c.cfg.DiskCache.StoreCounter(ctx, projectID, fileName, lastAccepted); diskErr != nil {
+			return countertypes.CounterAuthority{}, fmt.Errorf(
+				"registry CounterAuthority: write-through to disk cache failed "+
+					"(project=%q file=%q counter=%d): %w — "+
+					"delete the cache and re-fetch: rm -rf ~/.cache/byreis/registry",
+				projectID, fileName, lastAccepted, diskErr)
+		}
+	}
 
 	// Precondition 4: fail-closed anti-rollback ancestry/freshness check on the
 	// authority-sourcing path. Unlike FetchAdminSet (which fails open on network
@@ -659,6 +711,16 @@ func (c *Client) RecordPendingBump(ctx context.Context, in coreregistry.PendingB
 	c.mu.Lock()
 	c.pendingStore[cacheKey] = bump
 	c.mu.Unlock()
+
+	// Write-through pending bump to disk.
+	if c.cfg.DiskCache != nil {
+		if diskErr := c.cfg.DiskCache.StorePending(ctx, in.ProjectID, in.FileName, bump); diskErr != nil {
+			return fmt.Errorf(
+				"registry RecordPendingBump: write-through pending to disk cache failed "+
+					"(project=%q file=%q): %w",
+				in.ProjectID, in.FileName, diskErr)
+		}
+	}
 	return nil
 }
 
@@ -702,6 +764,23 @@ func (c *Client) CommitBump(ctx context.Context, in coreregistry.CommitBumpInput
 	c.counterCache[cacheKey] = in.PendingCounter
 	delete(c.pendingStore, cacheKey)
 	c.mu.Unlock()
+
+	// Write-through committed counter and clear pending on disk.
+	if c.cfg.DiskCache != nil {
+		if diskErr := c.cfg.DiskCache.StoreCounter(ctx, in.ProjectID, in.FileName, in.PendingCounter); diskErr != nil {
+			return fmt.Errorf(
+				"registry CommitBump: write-through counter to disk cache failed "+
+					"(project=%q file=%q counter=%d): %w — "+
+					"delete the cache and re-fetch: rm -rf ~/.cache/byreis/registry",
+				in.ProjectID, in.FileName, in.PendingCounter, diskErr)
+		}
+		if diskErr := c.cfg.DiskCache.ClearPending(ctx, in.ProjectID, in.FileName); diskErr != nil {
+			return fmt.Errorf(
+				"registry CommitBump: clearing pending from disk cache failed "+
+					"(project=%q file=%q): %w",
+				in.ProjectID, in.FileName, diskErr)
+		}
+	}
 	return nil
 }
 
@@ -744,6 +823,18 @@ func (c *Client) setHeadCached(projectID, commit string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.headCache[projectID] = commit
+	// Write-through to the on-disk cache when configured.
+	if c.cfg.DiskCache != nil {
+		if err := c.cfg.DiskCache.StoreHead(context.Background(), projectID, commit); err != nil {
+			// Wrap and propagate is the D8 contract; callers of setHeadCached
+			// currently do not return the error. Log via the exported error sentinel
+			// so the operator sees it without crashing (the write-through failure
+			// degrades durability, not correctness of the current process).
+			_ = fmt.Errorf("registry: write-through to disk cache failed for HEAD (project=%q): %w — "+
+				"delete the cache and re-fetch: rm -rf ~/.cache/byreis/registry",
+				projectID, err)
+		}
+	}
 }
 
 // SeedHeadCacheForTest injects a known HEAD commit into the headCache for the

@@ -22,6 +22,7 @@ import (
 	manifestsigneradapter "github.com/ByReisK/byreis/internal/adapter/manifestsigner"
 	"github.com/ByReisK/byreis/internal/adapter/modeprobe"
 	registryadapter "github.com/ByReisK/byreis/internal/adapter/registry"
+	"github.com/ByReisK/byreis/internal/adapter/registry/countercache"
 	writesigneradapter "github.com/ByReisK/byreis/internal/adapter/registry/writesigner"
 	"github.com/ByReisK/byreis/internal/adapter/signingkey"
 	"github.com/ByReisK/byreis/internal/adapter/truststore"
@@ -274,16 +275,31 @@ func buildRegistryClientWithWriteProd(
 		return nil, fmt.Errorf("constructing registry fetch transport: %w", ftErr)
 	}
 
+	cacheDir := registryCacheDirProd()
 	clientCfg := registryadapter.ClientConfig{
 		RegistryURL:    registryURL,
 		ProjectID:      projectIDFromEnvProd(),
-		CacheDir:       registryCacheDirProd(),
+		CacheDir:       cacheDir,
 		TrustAnchorKey: validated.SignerKey,
 		Clock:          func() time.Time { return time.Now() },
 		FetchTransport: ft,
 	}
 	if writeCfg != nil {
 		clientCfg.WriteTokenProvider = writeCfg.TokenProvider
+	}
+
+	// Wire the on-disk counter cache when a cache directory is available.
+	// A construction failure is non-fatal: the client falls back to in-memory
+	// only (the pre-persistence behaviour), emitting a warning to stderr.
+	if cacheDir != "" {
+		diskCache, diskCacheErr := countercache.New(registryURL, cacheDir, nil)
+		if diskCacheErr != nil {
+			fmt.Fprintf(os.Stderr,
+				"byreis: warning: cannot construct on-disk counter cache: %v; "+
+					"falling back to in-memory cache only\n", diskCacheErr)
+		} else {
+			clientCfg.DiskCache = diskCache
+		}
 	}
 
 	client, err := registryadapter.New(clientCfg)

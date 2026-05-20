@@ -326,6 +326,76 @@ func inspectLivePath(livePath string) (os.FileMode, bool, error) {
 	return fi.Mode().Perm(), true, nil
 }
 
+// WriteFile writes data to path atomically with mode 0600, using the same
+// TOCTOU-hardened rename semantics as WriteFileOfRecord. It is a lower-level
+// entry point for callers (such as the counter cache) that manage the path
+// themselves and do not need the repo-root / live-rel-path resolver.
+//
+// On Unix the write transits performAtomicRename with O_NOFOLLOW + inode
+// snapshot + Renameat(2). On Windows it returns ErrAtomicWriteWindowsUnsupported.
+//
+// The parent directory must exist and be owned by the current euid before this
+// call; WriteFile does not create or verify the parent directory — that is the
+// caller's responsibility. ctx cancellation is honored at every I/O step.
+func WriteFile(ctx context.Context, path string, data []byte, mode os.FileMode) (retErr error) {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("WriteFile cancelled before starting for path %q: %w", path, err)
+	}
+
+	dir := filepath.Dir(path)
+
+	tmp, err := os.CreateTemp(dir, ".byreis-cache-*")
+	if err != nil {
+		return fmt.Errorf("WriteFile: creating temp file in %q for path %q: %w — "+
+			"check directory write permissions", dir, path, err)
+	}
+	tmpPath := tmp.Name()
+
+	defer func() {
+		if retErr != nil {
+			_ = tmp.Close()
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	if err := tmp.Chmod(mode); err != nil {
+		return fmt.Errorf("WriteFile: chmod temp file %q to %04o: %w", tmpPath, mode, err)
+	}
+
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("WriteFile cancelled after temp create for path %q: %w", path, err)
+	}
+
+	if _, err := tmp.Write(data); err != nil {
+		return fmt.Errorf("WriteFile: writing to temp file %q for path %q: %w", tmpPath, path, err)
+	}
+
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("WriteFile cancelled after write for path %q: %w", path, err)
+	}
+
+	if err := tmp.Sync(); err != nil {
+		return fmt.Errorf("WriteFile: fsync temp file %q for path %q: %w", tmpPath, path, err)
+	}
+
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("WriteFile: closing temp file %q for path %q: %w", tmpPath, path, err)
+	}
+
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("WriteFile cancelled before rename for path %q: %w", path, err)
+	}
+
+	if err := performAtomicRename(tmpPath, path, dir); err != nil {
+		return fmt.Errorf("WriteFile: atomic rename %q -> %q: %w — the target file is unchanged",
+			tmpPath, path, err)
+	}
+
+	retErr = nil
+	dirSync(dir)
+	return nil
+}
+
 // dirSync best-effort fsyncs a directory. A failure is logged as a warning
 // but does not fail the write (the rename already succeeded).
 func dirSync(dir string) {

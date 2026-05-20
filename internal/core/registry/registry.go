@@ -144,6 +144,46 @@ var (
 			"counter authority cannot be established; run `byreis doctor` to diagnose")
 )
 
+// CounterCacheStore is the consumer-defined port for a durable counter+head
+// cache that survives process restart. Implementations are supplied by outer
+// adapters (e.g. countercache.Store).
+//
+// All methods are context-aware; all I/O is bounded; all errors are wrapped
+// with %w. The port carries domain values only (string project id, string file
+// name, uint64 counter, string HEAD SHA) — no SDK, transport, or YAML types
+// cross this boundary.
+type CounterCacheStore interface {
+	// LoadHead returns the durably-persisted last observed HEAD SHA for a
+	// project, or ("", nil) if no record exists. A tampered/unbindable record
+	// is treated as "no record" after the cache has been securely deleted.
+	// ErrCacheTampered is returned only when the file exists, is bound, and
+	// yet the contained counter regressed (the existing semantics are unchanged).
+	LoadHead(ctx context.Context, projectID string) (string, error)
+
+	// StoreHead writes the observed HEAD SHA durably. On Windows returns
+	// ErrCounterCacheWindowsUnsupported; the caller treats persistence as a
+	// no-op for the rest of the process lifetime.
+	StoreHead(ctx context.Context, projectID, commitSHA string) error
+
+	// LoadCounter returns the durably-persisted last observed counter for the
+	// given (projectID, fileName) pair, or (0, nil) if no record exists.
+	LoadCounter(ctx context.Context, projectID, fileName string) (uint64, error)
+
+	// StoreCounter writes the counter durably for the given (projectID, fileName) pair.
+	StoreCounter(ctx context.Context, projectID, fileName string, counter uint64) error
+
+	// LoadPending returns the durably-persisted pending bump for the given
+	// (projectID, fileName) pair, or (nil, nil) if no record exists.
+	LoadPending(ctx context.Context, projectID, fileName string) (*countertypes.PendingBump, error)
+
+	// StorePending writes the pending bump durably for the given pair.
+	StorePending(ctx context.Context, projectID, fileName string, pending *countertypes.PendingBump) error
+
+	// ClearPending removes the pending bump for the given pair. A missing
+	// record is not an error.
+	ClearPending(ctx context.Context, projectID, fileName string) error
+}
+
 // PendingBumpInput carries the write-ahead intent recorded before a
 // secrets-repo merge.
 type PendingBumpInput struct {
