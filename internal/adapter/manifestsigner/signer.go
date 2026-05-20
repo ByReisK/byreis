@@ -164,6 +164,53 @@ func (s *signer) Sign(ctx context.Context, m manifest.Manifest) (signerID string
 	return resolvedID, rawSig, nil
 }
 
+// TextSigner is the port for raw-bytes signing using the same key-bearing path
+// as ManifestSigner. It is defined here so writesigner can hold a narrow
+// interface without widening the exported ManifestSigner surface or introducing
+// a parallel ed25519 import.
+//
+// SignText returns the registry-attested signer identity and a raw Ed25519
+// signature over text. The same key-length validation, zeroization, and
+// attested-id-lookup disciplines apply as in Sign. No manifest encoding is
+// performed; text is signed verbatim after domain-separation is applied by the
+// caller.
+type TextSigner interface {
+	SignText(ctx context.Context, text []byte) (signerID string, sig []byte, err error)
+}
+
+// SignText signs arbitrary bytes using the same key-bearing path as Sign.
+// Domain-separation is the caller's responsibility; writesigner applies the
+// fixed "byreis-registry-write/v1\n" prefix before calling this method.
+//
+// Key-length validation, unconditional zeroization, and attested-id-lookup
+// are identical to Sign. No manifest encoding is performed.
+func (s *signer) SignText(ctx context.Context, text []byte) (signerID string, sig []byte, err error) {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return "", nil, fmt.Errorf("manifestsigner: SignText cancelled: %w", ctxErr)
+	}
+
+	rawKey, err := s.keySource.ProvideKey(ctx)
+	if err != nil {
+		return "", nil, fmt.Errorf("manifestsigner: loading Ed25519 signing key for SignText: %w", err)
+	}
+
+	defer identity.ZeroizeBuffer(rawKey)
+
+	if len(rawKey) != ed25519.PrivateKeySize {
+		return "", nil, fmt.Errorf("%w: got %d bytes (SignText path)", ErrWrongKeySize, len(rawKey))
+	}
+
+	priv := ed25519.PrivateKey(rawKey)
+	pub := priv.Public().(ed25519.PublicKey)
+	resolvedID, ok := s.lookupSignerID(pub)
+	if !ok {
+		return "", nil, ErrKeyNotAttested
+	}
+
+	rawSig := ed25519.Sign(priv, text)
+	return resolvedID, rawSig, nil
+}
+
 // lookupSignerID searches the trustedSigners map for an entry whose Ed25519
 // public key matches pub. Because TrustedSigners is a map from id to pubkey, we
 // iterate and compare by value (ed25519.PublicKey is []byte; we use

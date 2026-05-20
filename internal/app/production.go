@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -15,18 +16,24 @@ import (
 	editadapter "github.com/ByReisK/byreis/internal/adapter/editor"
 	"github.com/ByReisK/byreis/internal/adapter/fs/atomicwrite"
 	"github.com/ByReisK/byreis/internal/adapter/git/fileofrecord"
+	gitadapter "github.com/ByReisK/byreis/internal/adapter/git/github"
 	identityadapter "github.com/ByReisK/byreis/internal/adapter/identity"
 	"github.com/ByReisK/byreis/internal/adapter/keychain"
 	manifestsigneradapter "github.com/ByReisK/byreis/internal/adapter/manifestsigner"
 	"github.com/ByReisK/byreis/internal/adapter/modeprobe"
 	registryadapter "github.com/ByReisK/byreis/internal/adapter/registry"
+	writesigneradapter "github.com/ByReisK/byreis/internal/adapter/registry/writesigner"
 	"github.com/ByReisK/byreis/internal/adapter/signingkey"
 	"github.com/ByReisK/byreis/internal/adapter/truststore"
 	"github.com/ByReisK/byreis/internal/cli"
+	"github.com/ByReisK/byreis/internal/cli/render"
 	"github.com/ByReisK/byreis/internal/core/audit"
 	"github.com/ByReisK/byreis/internal/core/crypto/decrypt"
 	"github.com/ByReisK/byreis/internal/core/crypto/encrypt"
+	"github.com/ByReisK/byreis/internal/core/crypto/identity"
 	"github.com/ByReisK/byreis/internal/core/crypto/verify"
+	coregit "github.com/ByReisK/byreis/internal/core/git"
+	"github.com/ByReisK/byreis/internal/core/logging"
 	"github.com/ByReisK/byreis/internal/core/mode"
 	coreregistry "github.com/ByReisK/byreis/internal/core/registry"
 	"github.com/ByReisK/byreis/internal/core/registry/countertypes"
@@ -110,6 +117,32 @@ func BuildProductionDeps(ctx context.Context) (*cli.Deps, error) {
 		manifestSigner, _ = buildManifestSignerProd(ctx, configDir, regClient)
 	}
 
+	// Build the registry-write wiring: RegistryWriteSigner and
+	// RegistryWriteTokenProvider. When manifestSigner is nil (registry
+	// unavailable or no attested signer key), returns (nil, nil, nil) and the
+	// registry transport runs in read-only mode. The mode is captured at
+	// composition time — never re-detected at token-load time.
+	writeSigner, writeTokenProvider, _ := buildRegistryWriteWiringProd(
+		currentMode, manifestSigner, keychain.New(),
+	)
+
+	// When write wiring is available, rebuild the registry client with a write-
+	// enabled transport. The project-repo reader (buildFileOfRecordSourceProd)
+	// is ALWAYS constructed with nil write config — it has no business writing
+	// counter commits and a credential leak to a project-repo path would be a
+	// category error. The regClient variable is reassigned so counter/recips
+	// below point to the write-enabled instance.
+	if regClient != nil && writeSigner != nil && writeTokenProvider != nil {
+		writeCfg := &registryadapter.FetchTransportWriteConfig{
+			Signer:        writeSigner,
+			TokenProvider: writeTokenProvider,
+		}
+		registryURL := os.Getenv("BYREIS_REGISTRY")
+		if writeRegClient, err := buildRegistryClientWithWriteProd(ctx, configDir, registryURL, writeCfg); err == nil {
+			regClient = writeRegClient
+		}
+	}
+
 	// Build the AtomicFileWriter rooted at the project repo root.
 	atomicWriter := buildAtomicWriterProd()
 
@@ -164,13 +197,26 @@ func BuildProductionDeps(ctx context.Context) (*cli.Deps, error) {
 		fmt.Fprintf(os.Stderr, "byreis: warning: %s\n", w)
 	}
 
+	// Build the Merger use-case (admin merge path). When any required port is
+	// unavailable (registry, git, signer), the Merger is nil and the CLI surfaces
+	// a "not configured" error at command time. The MergeExitCode function maps
+	// adapter-layer and core-registry sentinel errors to documented exit codes
+	// without the cli package importing internal/adapter directly.
+	merger, mergeExitCode := buildMergerProd(
+		ctx, configDir, currentMode, regClient, gate, manifestSigner,
+		decrypt.New(), encrypt.New(), idLoader, codec, recips, counter,
+		buildAuditSinkProd(configDir),
+	)
+
 	return &cli.Deps{
-		Policy:      pol,
-		CurrentMode: currentMode,
-		ConfigDir:   configDir,
-		Getter:      getter,
-		Decryptor:   decryptor,
-		Editor:      editorUC,
+		Policy:        pol,
+		CurrentMode:   currentMode,
+		ConfigDir:     configDir,
+		Getter:        getter,
+		Decryptor:     decryptor,
+		Editor:        editorUC,
+		Merger:        merger,
+		MergeExitCode: mergeExitCode,
 	}, nil
 }
 
@@ -180,6 +226,20 @@ func BuildProductionDeps(ctx context.Context) (*cli.Deps, error) {
 // `byreis init` yet, in which case the binary starts in CONTRIBUTOR mode.
 func buildRegistryClientProd(ctx context.Context, configDir string) (coreregistry.RegistryClient, error) {
 	registryURL := os.Getenv("BYREIS_REGISTRY")
+	return buildRegistryClientWithWriteProd(ctx, configDir, registryURL, nil)
+}
+
+// buildRegistryClientWithWriteProd constructs the registry client with an
+// optional FetchTransportWriteConfig. When writeCfg is nil the transport is
+// read-only. This is the single canonical builder used both at initial
+// construction (nil writeCfg, read-only) and after write wiring is available
+// (non-nil writeCfg, counter-write enabled).
+func buildRegistryClientWithWriteProd(
+	ctx context.Context,
+	configDir string,
+	registryURL string,
+	writeCfg *registryadapter.FetchTransportWriteConfig,
+) (coreregistry.RegistryClient, error) {
 	if registryURL == "" {
 		return nil, fmt.Errorf(
 			"BYREIS_REGISTRY is not set — run `byreis init` to configure the registry")
@@ -209,19 +269,24 @@ func buildRegistryClientProd(ctx context.Context, configDir string) (coreregistr
 			err)
 	}
 
-	ft, ftErr := buildRegistryFetchTransportProd(registryURL)
+	ft, ftErr := buildRegistryFetchTransportWithWriteProd(registryURL, writeCfg)
 	if ftErr != nil {
 		return nil, fmt.Errorf("constructing registry fetch transport: %w", ftErr)
 	}
 
-	client, err := registryadapter.New(registryadapter.ClientConfig{
+	clientCfg := registryadapter.ClientConfig{
 		RegistryURL:    registryURL,
 		ProjectID:      projectIDFromEnvProd(),
 		CacheDir:       registryCacheDirProd(),
 		TrustAnchorKey: validated.SignerKey,
 		Clock:          func() time.Time { return time.Now() },
 		FetchTransport: ft,
-	})
+	}
+	if writeCfg != nil {
+		clientCfg.WriteTokenProvider = writeCfg.TokenProvider
+	}
+
+	client, err := registryadapter.New(clientCfg)
 	if err != nil {
 		return nil, fmt.Errorf("constructing registry client: %w", err)
 	}
@@ -364,6 +429,128 @@ func buildManifestSignerProd(ctx context.Context, configDir string, regClient co
 		return nil, fmt.Errorf("constructing manifest signer: %w", err)
 	}
 	return signer, nil
+}
+
+// buildMergerProd constructs the Merger use-case and the MergeExitCode mapping
+// function for the production wiring. The MergeExitCode function is returned
+// separately so the cli package can map adapter-layer sentinel errors to
+// render.ExitCode values without importing internal/adapter/registry directly.
+//
+// When any required port is unavailable (registry client nil, git provider
+// construction fails, manifest signer nil), this function returns (nil, nonNilFn)
+// — the Merger is nil (the CLI surfaces "not configured" at command time) but the
+// MergeExitCode function is always non-nil.
+func buildMergerProd(
+	ctx context.Context,
+	configDir string,
+	currentMode mode.Mode,
+	regClient coreregistry.RegistryClient,
+	gate usecase.ModeGate,
+	manifestSigner usecase.ManifestSigner,
+	decryptor decrypt.Decryptor,
+	encryptor encrypt.Encryptor,
+	idLoader identity.Loader,
+	codec usecase.ArtifactCodec,
+	recips usecase.RecipientSource,
+	counter usecase.CounterStore,
+	auditLog audit.Logger,
+) (usecase.Merger, func(error) render.ExitCode) {
+	// MergeExitCode is always returned, even when the Merger itself is nil.
+	// This function maps adapter-layer and core-registry sentinel errors to
+	// documented exit codes; the CLI layer calls it without importing adapter.
+	mergeExitCode := func(err error) render.ExitCode {
+		if err == nil {
+			return render.ExitOK
+		}
+		if isErr(err, registryadapter.ErrRegistryWriteAuth) {
+			return render.ExitAuthError
+		}
+		if isErr(err, registryadapter.ErrRegistryConcurrentWrite) {
+			return render.ExitCounterReconcile
+		}
+		if isErr(err, registryadapter.ErrRegistryWriteRejected) {
+			return render.ExitTrustError
+		}
+		if isErr(err, countertypes.ErrCounterReconcile) {
+			return render.ExitCounterReconcile
+		}
+		if isErr(err, coreregistry.ErrCacheTampered) {
+			return render.ExitReplay
+		}
+		if isErr(err, coreregistry.ErrRegistryRollback) {
+			return render.ExitReplay
+		}
+		return render.ExitGeneralError
+	}
+
+	// Guard: all required ports must be available.
+	if regClient == nil || manifestSigner == nil || gate == nil ||
+		decryptor == nil || encryptor == nil || idLoader == nil ||
+		codec == nil || recips == nil || counter == nil {
+		return nil, mergeExitCode
+	}
+
+	// Build the GitHub git provider. The project and base branch must be set.
+	project := projectIDFromEnvProd()
+	baseBranch := baseBranchFromEnvProd()
+	token := githubTokenProd()
+
+	gitProvider, err := buildGitProviderProd(token, project, baseBranch)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "byreis: warning: admin merge not available: git provider: %v\n", err)
+		return nil, mergeExitCode
+	}
+
+	merger, err := usecase.NewMerger(usecase.MergeDeps{
+		Git:           gitProvider,
+		Decryptor:     decryptor,
+		Encryptor:     encryptor,
+		IDLoader:      idLoader,
+		ArtifactCodec: codec,
+		Recipients:    recips,
+		Counter:       counter,
+		Signer:        manifestSigner,
+		Verifier:      verify.New(),
+		Mode:          gate,
+		Audit:         auditLog,
+		Log:           logging.Discard,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "byreis: warning: admin merge not available: %v\n", err)
+		return nil, mergeExitCode
+	}
+
+	_ = ctx // held for future use (e.g. preflight checks)
+	_ = configDir
+	_ = currentMode
+	return merger, mergeExitCode
+}
+
+// isErr is a tiny helper that wraps errors.Is to avoid a separate import in the
+// inline mergeExitCode closure (errors is already imported above).
+func isErr(err, target error) bool {
+	return errors.Is(err, target)
+}
+
+// buildGitProviderProd constructs the GitHub git.GitProvider for the admin
+// merge path. The token may be empty for file:// project repos; in that case
+// the provider is still constructed but will fail on first authenticated
+// API call (which is acceptable: file:// repos are test/dev paths).
+func buildGitProviderProd(token, project, baseBranch string) (coregit.GitProvider, error) {
+	if project == "" {
+		return nil, fmt.Errorf(
+			"BYREIS_PROJECT is not set — pass --project or set BYREIS_PROJECT " +
+				"to construct the git provider for admin merge")
+	}
+	if token == "" {
+		return nil, fmt.Errorf(
+			"BYREIS_GITHUB_TOKEN (or GITHUB_TOKEN) is not set — " +
+				"run `byreis auth login` to authenticate for admin merge")
+	}
+	if baseBranch == "" {
+		baseBranch = "main"
+	}
+	return gitadapter.New(token, project, baseBranch, "byreis")
 }
 
 // buildAtomicWriterProd constructs the atomicwrite.Writer rooted at the project
@@ -711,15 +898,24 @@ func validateFileURL(u string) (string, error) {
 }
 
 // buildRegistryFetchTransportProd constructs the production FetchTransport for
-// the registry client. It returns (nil, nil) when the GitHub token is absent
-// AND the registry URL is not a file:// local path, so the registry client
-// falls back to the offline-only path instead of failing at construction time.
-//
-// For file:// registry URLs the transport uses only the system git subprocess
-// (no GitHub token required). For GitHub URLs (https://github.com/... etc.) the
-// GitHub token is required and an HTTP provider is used for authentication;
-// however the actual file reads now come from the git clone (not the HTTP API).
+// the registry client (read-only, nil write config).
 func buildRegistryFetchTransportProd(registryURL string) (registryadapter.FetchTransport, error) {
+	return buildRegistryFetchTransportWithWriteProd(registryURL, nil)
+}
+
+// buildRegistryFetchTransportWithWriteProd constructs the production FetchTransport.
+// writeCfg may be nil for read-only use (project-repo reader) or non-nil for the
+// registry transport that performs counter writes. The project-repo reader
+// (production.go:293) always passes nil — it has no business writing counter
+// commits.
+//
+// It returns (nil, nil) when the GitHub token is absent AND the registry URL
+// is not a file:// local path, so the registry client falls back to the
+// offline-only path instead of failing at construction time.
+func buildRegistryFetchTransportWithWriteProd(
+	registryURL string,
+	writeCfg *registryadapter.FetchTransportWriteConfig,
+) (registryadapter.FetchTransport, error) {
 	validated := registryProjectFromURLProd(registryURL)
 	if validated == "" {
 		return nil, fmt.Errorf(
@@ -729,10 +925,12 @@ func buildRegistryFetchTransportProd(registryURL string) (registryadapter.FetchT
 	}
 
 	// For file:// local repos, no token is required — the transport uses system
-	// git directly (clone + verify + cat-file), all subprocess-based.
+	// git directly (clone + verify + cat-file), all subprocess-based. The
+	// writeCfg (nil for project-repo reader, non-nil for registry transport) is
+	// passed verbatim so only the registry transport call site enables writes.
 	if strings.HasPrefix(validated, "file://") {
 		ft, err := registryadapter.NewProductionFetchTransportFromRunner(
-			registryadapter.SubprocessRunner{}, nil,
+			registryadapter.SubprocessRunner{}, writeCfg,
 		)
 		if err != nil {
 			return nil, fmt.Errorf(
@@ -748,7 +946,7 @@ func buildRegistryFetchTransportProd(registryURL string) (registryadapter.FetchT
 	}
 
 	ft, err := registryadapter.NewProductionFetchTransportFromRunner(
-		registryadapter.SubprocessRunner{}, nil,
+		registryadapter.SubprocessRunner{}, writeCfg,
 	)
 	if err != nil {
 		return nil, fmt.Errorf(
@@ -1139,11 +1337,99 @@ func (g *prodPolicyModeGate) Allow(cmd mode.Command) error {
 	return g.pol.Allow(g.m, cmd)
 }
 
+// ─── registry-write wiring ───────────────────────────────────────────────────
+
+// registryWriteTokenStore is the subset of the keychain.Store surface needed
+// by the appRegistryWriteTokenBridge. Defined here so internal/app does not
+// import internal/adapter/keychain directly at the type level (the concrete
+// *keychain.Store is passed at construction time; this interface keeps the
+// bridge testable via a fake).
+type registryWriteTokenStore interface {
+	GetRegistryWriteToken(ctx context.Context, registryURL string) (string, error)
+}
+
+// appRegistryWriteTokenBridge adapts the keychain-backed registryWriteTokenStore
+// to the registry.RegistryWriteTokenProvider port. It is a thin delegation
+// bridge; no caching, no token storage between calls.
+//
+// This mirrors the prodRegistryCounterStoreBridge shape — one private type that
+// maps field-by-field at the composition boundary.
+type appRegistryWriteTokenBridge struct {
+	store registryWriteTokenStore
+}
+
+// RegistryWriteToken delegates to the keychain store. It is called at the
+// counter-write path (WriteCounter / CommitCounter) when the admin submits a
+// merge. The store's GetRegistryWriteToken already enforces the ADMIN-mode gate
+// at the load-site before querying the OS keychain.
+func (b *appRegistryWriteTokenBridge) RegistryWriteToken(ctx context.Context, registryURL string) (string, error) {
+	return b.store.GetRegistryWriteToken(ctx, registryURL)
+}
+
+// capturedModeProvider is the bridge type that satisfies the keychain adapter's
+// ModeProvider port. It captures the mode resolved at BuildProductionDeps time
+// and returns it verbatim on every call.
+//
+// The mode is captured once at construction and is never reassigned. There is
+// no exported mutator. ModeProvider.CurrentMode returns the captured value with
+// no fallback that calls mode.Detector.Detect() again, so a race against a
+// key-perm flip cannot smuggle ADMIN through the gate after the binary started
+// as CONTRIBUTOR.
+type capturedModeProvider struct {
+	m mode.Mode
+}
+
+// CurrentMode returns the mode captured at construction time, verbatim. It
+// never calls the mode detector again.
+func (p *capturedModeProvider) CurrentMode(_ context.Context) (mode.Mode, error) {
+	return p.m, nil
+}
+
+// buildRegistryWriteWiringProd constructs the RegistryWriteSigner and
+// RegistryWriteTokenProvider for the production registry transport. Returns
+// (nil, nil, nil) when manifestSigner is nil (registry unavailable or no
+// attested signer key); in that case the caller passes a nil
+// FetchTransportWriteConfig and the transport runs in read-only mode.
+func buildRegistryWriteWiringProd(
+	currentMode mode.Mode,
+	manifestSigner usecase.ManifestSigner,
+	keychainStore *keychain.Store,
+) (registryadapter.RegistryWriteSigner, registryadapter.RegistryWriteTokenProvider, error) {
+	if manifestSigner == nil {
+		return nil, nil, nil
+	}
+
+	// The manifestsigner.TextSigner interface: the concrete *signer from
+	// manifestsigner satisfies it (SignText method added in this slice).
+	ts, ok := manifestSigner.(manifestsigneradapter.TextSigner)
+	if !ok {
+		return nil, nil, fmt.Errorf(
+			"buildRegistryWriteWiringProd: manifestSigner does not satisfy TextSigner — " +
+				"ensure the signer was constructed via manifestsigner.New")
+	}
+
+	signerAdapter, err := writesigneradapter.New(ts)
+	if err != nil {
+		return nil, nil, fmt.Errorf("buildRegistryWriteWiringProd: constructing write signer: %w", err)
+	}
+
+	// Wire the mode provider: captures the composition-time mode once, verbatim.
+	modeProvider := &capturedModeProvider{m: currentMode}
+
+	// Thread the mode provider into the keychain store via a new store instance
+	// that carries it. We need a store variant that accepts a ModeProvider.
+	writeStore := keychain.NewWithDeps(modeProvider, keychain.RealKeyring())
+
+	bridge := &appRegistryWriteTokenBridge{store: writeStore}
+	return signerAdapter, bridge, nil
+}
+
 // ─── compile-time assertions ─────────────────────────────────────────────────
 
 var (
-	_ usecase.Editor                      = (*prodNoEditorNonInteractiveRefusal)(nil)
-	_ modeprobe.AdminSetFetcher           = (*prodRegistryClientBridge)(nil)
-	_ fileofrecord.ConfiguredPathResolver = (*prodRegistryConfiguredPathResolver)(nil)
-	_ usecase.CounterStore                = (*prodRegistryCounterStoreBridge)(nil)
+	_ usecase.Editor                             = (*prodNoEditorNonInteractiveRefusal)(nil)
+	_ modeprobe.AdminSetFetcher                  = (*prodRegistryClientBridge)(nil)
+	_ fileofrecord.ConfiguredPathResolver        = (*prodRegistryConfiguredPathResolver)(nil)
+	_ usecase.CounterStore                       = (*prodRegistryCounterStoreBridge)(nil)
+	_ registryadapter.RegistryWriteTokenProvider = (*appRegistryWriteTokenBridge)(nil)
 )

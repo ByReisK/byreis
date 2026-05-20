@@ -51,6 +51,16 @@ type Deps struct {
 	// Editor is the admin Edit use-case. Narrow interface: usecase.EditUseCase.
 	// May be nil when adapters are not yet wired.
 	Editor usecase.EditUseCase
+
+	// Merger is the admin Merge use-case. Narrow interface: usecase.Merger.
+	// May be nil when the registry-write path is not yet wired; the merge
+	// command will return a "not configured" error in that case.
+	Merger usecase.Merger
+
+	// MergeExitCode maps an error from the Merger use-case to the appropriate
+	// render.ExitCode. When nil, the merge verb falls back to ExitGeneralError.
+	// This is a function-field so the CLI layer never imports internal/adapter.
+	MergeExitCode func(err error) render.ExitCode
 }
 
 // ExitCodeFromReadPathError maps a usecase.ExitClass to the corresponding

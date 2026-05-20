@@ -133,6 +133,18 @@ linters:
       # future signature; suppress until stubs are replaced with real code.
       - linters: [revive]
         text: "unused-parameter: parameter .* seems to be unused"
+      # Test files in internal/cli may import adapter packages directly to wire
+      # the MergeExitCode function (which maps adapter sentinel errors to exit codes)
+      # and to construct test fixtures using adapter-layer types. This is safe:
+      # test-only imports do not leak into production binaries.
+      - path: "internal/cli/.*_test\\.go"
+        linters: [depguard]
+        text: "adapter-wired-at-cmd"
+      # Synthetic credential strings in tests are intentional test fixtures, not
+      # real credentials. These are clearly named "synthetic" or "SYNTHETIC".
+      - path: "_test\\.go"
+        linters: [gosec]
+        text: "G101"
 
 formatters:
   enable:
