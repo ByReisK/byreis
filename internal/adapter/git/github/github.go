@@ -666,6 +666,37 @@ func (p *Provider) createPR(ctx context.Context, head, title, body string) (*ghs
 	return pr, nil
 }
 
+// FetchCommittedFile fetches the exact committed bytes of path at the given
+// ref (branch or commit SHA) with no transformation. It satisfies the
+// fileofrecord.FileFetcher port: a GitHub 404 response is wrapped as an
+// error satisfying errors.Is(err, http404Err{}) so the fileofrecord adapter
+// can recognise it as ErrFetchNotFound.
+//
+// This is the zero-normalization transport for the fileofrecord.Source adapter.
+// The returned bytes are exactly the content stored in the git object; no CRLF
+// rewriting or line-ending normalization is applied.
+func (p *Provider) FetchCommittedFile(ctx context.Context, path, ref string) ([]byte, error) {
+	raw, err := p.fetchFileContents(ctx, path, ref)
+	if err != nil {
+		var ghErr *ghsdk.ErrorResponse
+		if errors.As(err, &ghErr) && ghErr.Response != nil &&
+			ghErr.Response.StatusCode == http.StatusNotFound {
+			return nil, fmt.Errorf("file %q not found at ref %q: %w",
+				path, ref, http404Err{})
+		}
+		return nil, err
+	}
+	return raw, nil
+}
+
+// http404Err is a typed not-found error returned by FetchCommittedFile. The
+// fileofrecord adapter's isHTTP404 helper recognises it via the StatusCode()
+// method, mapping it to ErrFetchNotFound for the caller.
+type http404Err struct{}
+
+func (http404Err) Error() string   { return "HTTP 404 not found" }
+func (http404Err) StatusCode() int { return http.StatusNotFound }
+
 // fetchFileContents fetches the raw bytes of a file at a given ref.
 func (p *Provider) fetchFileContents(ctx context.Context, path, ref string) ([]byte, error) {
 	fc, _, _, err := p.client.Repositories.GetContents(ctx, p.owner, p.repo, path,

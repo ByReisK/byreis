@@ -476,7 +476,7 @@ func (s *stubCounterTransport) FetchHead(_ context.Context, _ string, _ ed25519.
 func (s *stubCounterTransport) IsAncestor(_ context.Context, _, _, _ string) (bool, error) {
 	return true, nil
 }
-func (s *stubCounterTransport) ReadCounter(_ context.Context, _, _, _ string) (uint64, *countertypes.PendingBump, error) {
+func (s *stubCounterTransport) ReadCounter(_ context.Context, _, _, _, _ string) (uint64, *countertypes.PendingBump, error) {
 	return s.lastAccepted, nil, nil
 }
 func (s *stubCounterTransport) WriteCounter(_ context.Context, _, _, _ string, _ *countertypes.PendingBump) error {
@@ -488,6 +488,10 @@ func (s *stubCounterTransport) CommitCounter(_ context.Context, _, _, _ string, 
 func (s *stubCounterTransport) ReadProjectConfig(_ context.Context, _, _, _ string) (registry.ProjectConfig, error) {
 	return registry.ProjectConfig{}, nil
 }
+func (s *stubCounterTransport) ReadAdmins(_ context.Context, _, _, _ string) (registry.ParsedAdminData, error) {
+	return registry.ParsedAdminData{}, nil
+}
+func (s *stubCounterTransport) DiscardCounterSession(_ context.Context, _ string) {}
 
 // ----- E1: ConfiguredFiles populated from SourceVerified fetch ---------------
 
@@ -504,7 +508,7 @@ func (s *stubVerifiedTransportWithConfig) FetchHead(_ context.Context, _ string,
 func (s *stubVerifiedTransportWithConfig) IsAncestor(_ context.Context, _, _, _ string) (bool, error) {
 	return true, nil
 }
-func (s *stubVerifiedTransportWithConfig) ReadCounter(_ context.Context, _, _, _ string) (uint64, *countertypes.PendingBump, error) {
+func (s *stubVerifiedTransportWithConfig) ReadCounter(_ context.Context, _, _, _, _ string) (uint64, *countertypes.PendingBump, error) {
 	return 0, nil, nil
 }
 func (s *stubVerifiedTransportWithConfig) WriteCounter(_ context.Context, _, _, _ string, _ *countertypes.PendingBump) error {
@@ -522,6 +526,21 @@ func (s *stubVerifiedTransportWithConfig) ReadProjectConfig(_ context.Context, _
 	}
 	return registry.ProjectConfig{Files: s.projectFiles}, nil
 }
+func (s *stubVerifiedTransportWithConfig) ReadAdmins(_ context.Context, _, headCommit, _ string) (registry.ParsedAdminData, error) {
+	if headCommit != "verified-head-abc" {
+		return registry.ParsedAdminData{}, errors.New("ReadAdmins called with wrong commit SHA — TOCTOU violation")
+	}
+	// Return a minimal valid ParsedAdminData so FetchAdminSet can proceed.
+	pub := make([]byte, 32)
+	pub[0] = 1
+	return registry.ParsedAdminData{
+		Recipients: []rectypes.Recipient{
+			{Label: "admin-stub", AgePubKey: "age1stubkey"},
+		},
+		SignerKeys: map[string]coreregistry.SignerKey{"admin-stub": pub},
+	}, nil
+}
+func (s *stubVerifiedTransportWithConfig) DiscardCounterSession(_ context.Context, _ string) {}
 
 // TestE1_ConfiguredFiles_PopulatedFromSourceVerifiedFetch is the E1 positive
 // test: a SourceVerified fetch with a known projects/<id>.yaml populates

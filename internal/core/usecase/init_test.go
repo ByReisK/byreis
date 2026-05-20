@@ -2,12 +2,34 @@ package usecase_test
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"os"
 	"testing"
 
 	"github.com/ByReisK/byreis/internal/core/usecase"
 )
+
+// fixedSigner builds a deterministic-shaped (random key, real fp) probed signer
+// for the existing REQ-B-005 flow tests that do not care which key it is.
+func fixedSigner(t *testing.T) (ed25519.PublicKey, string) {
+	t.Helper()
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("ed25519.GenerateKey: %v", err)
+	}
+	sum := sha256.Sum256(pub)
+	return pub, hex.EncodeToString(sum[:])
+}
+
+// keyHexFP returns the canonical hex fingerprint sha256(key) for a public key.
+func keyHexFP(key ed25519.PublicKey) string {
+	sum := sha256.Sum256(key)
+	return hex.EncodeToString(sum[:])
+}
 
 // --- fakes ---
 
@@ -37,12 +59,12 @@ func (f *fakeTrustAnchorStore) WriteAnchor(_ context.Context, a usecase.TrustAnc
 }
 
 type fakeSignerProbe struct {
-	fp  string
-	err error
+	signer usecase.ProbedSigner
+	err    error
 }
 
-func (f *fakeSignerProbe) RegistrySignerFingerprint(_ context.Context, _ string) (string, error) {
-	return f.fp, f.err
+func (f *fakeSignerProbe) RegistrySigner(_ context.Context, _ string) (usecase.ProbedSigner, error) {
+	return f.signer, f.err
 }
 
 type fakeConfirmPrompter struct {
@@ -89,8 +111,9 @@ func (f *fakeConfigWriter) FileExists(_ context.Context, path string) (bool, err
 func TestInit_FirstInit_InteractiveConfirm(t *testing.T) {
 	t.Parallel()
 
+	key, fp := fixedSigner(t)
 	ts := &fakeTrustAnchorStore{exists: false}
-	sp := &fakeSignerProbe{fp: "aabbccdd"}
+	sp := &fakeSignerProbe{signer: usecase.ProbedSigner{Key: key, Fingerprint: fp}}
 	pr := &fakeConfirmPrompter{err: nil}
 	cw := &fakeConfigWriter{}
 
@@ -115,11 +138,14 @@ func TestInit_FirstInit_InteractiveConfirm(t *testing.T) {
 	if !res.PinWritten {
 		t.Error("expected PinWritten=true on first init")
 	}
-	if res.SignerFingerprint != "aabbccdd" {
-		t.Errorf("expected fingerprint aabbccdd, got %q", res.SignerFingerprint)
+	if res.SignerFingerprint != fp {
+		t.Errorf("expected fingerprint %q, got %q", fp, res.SignerFingerprint)
 	}
-	if ts.written == nil || ts.written.SignerFingerprint != "aabbccdd" {
+	if ts.written == nil || ts.written.SignerFingerprint != fp {
 		t.Error("expected trust anchor to be written with correct fingerprint")
+	}
+	if ts.written == nil || !ts.written.SignerKey.Equal(key) {
+		t.Error("expected trust anchor to persist the full pinned key")
 	}
 }
 
@@ -128,8 +154,9 @@ func TestInit_FirstInit_InteractiveConfirm(t *testing.T) {
 func TestInit_FirstInit_AcceptSigner(t *testing.T) {
 	t.Parallel()
 
+	key, fp := fixedSigner(t)
 	ts := &fakeTrustAnchorStore{exists: false}
-	sp := &fakeSignerProbe{fp: "aabbccdd"}
+	sp := &fakeSignerProbe{signer: usecase.ProbedSigner{Key: key, Fingerprint: fp}}
 	cw := &fakeConfigWriter{}
 
 	u, err := usecase.NewInitializer(usecase.InitDeps{
@@ -145,7 +172,7 @@ func TestInit_FirstInit_AcceptSigner(t *testing.T) {
 		RegistryURL:  "https://example.com/registry",
 		ProjectID:    "myproj",
 		ConfigDir:    "/tmp/proj",
-		AcceptSigner: "aabbccdd",
+		AcceptSigner: fp,
 	})
 	if err != nil {
 		t.Fatalf("Init: %v", err)
@@ -160,8 +187,9 @@ func TestInit_FirstInit_AcceptSigner(t *testing.T) {
 func TestInit_NonInteractive_WithoutAcceptSigner_FailsClosed(t *testing.T) {
 	t.Parallel()
 
+	key, fp := fixedSigner(t)
 	ts := &fakeTrustAnchorStore{exists: false}
-	sp := &fakeSignerProbe{fp: "aabbccdd"}
+	sp := &fakeSignerProbe{signer: usecase.ProbedSigner{Key: key, Fingerprint: fp}}
 	cw := &fakeConfigWriter{}
 
 	u, err := usecase.NewInitializer(usecase.InitDeps{
@@ -197,8 +225,9 @@ func TestInit_NonInteractive_WithoutAcceptSigner_FailsClosed(t *testing.T) {
 func TestInit_AcceptSigner_Mismatch_FailsClosed(t *testing.T) {
 	t.Parallel()
 
+	key, _ := fixedSigner(t)
 	ts := &fakeTrustAnchorStore{exists: false}
-	sp := &fakeSignerProbe{fp: "aabbccdd"}
+	sp := &fakeSignerProbe{signer: usecase.ProbedSigner{Key: key, Fingerprint: keyHexFP(key)}}
 	cw := &fakeConfigWriter{}
 
 	u, err := usecase.NewInitializer(usecase.InitDeps{
@@ -229,11 +258,13 @@ func TestInit_AcceptSigner_Mismatch_FailsClosed(t *testing.T) {
 func TestInit_ErrSignerChanged(t *testing.T) {
 	t.Parallel()
 
+	k1, fp1 := fixedSigner(t)
+	k2, fp2 := fixedSigner(t)
 	ts := &fakeTrustAnchorStore{
 		exists: true,
-		anchor: usecase.TrustAnchor{SignerFingerprint: "oldpin"},
+		anchor: usecase.TrustAnchor{SignerKey: k1, SignerFingerprint: fp1},
 	}
-	sp := &fakeSignerProbe{fp: "newkey"}
+	sp := &fakeSignerProbe{signer: usecase.ProbedSigner{Key: k2, Fingerprint: fp2}}
 	cw := &fakeConfigWriter{}
 
 	u, err := usecase.NewInitializer(usecase.InitDeps{
@@ -300,8 +331,9 @@ func TestInit_NetworkRoundTrips_Bounded(t *testing.T) {
 	t.Parallel()
 
 	rounds := 0
+	key, fp := fixedSigner(t)
 	ts := &fakeTrustAnchorStore{exists: false}
-	sp := &fakeSignerProbe{fp: "abcdef"}
+	sp := &fakeSignerProbe{signer: usecase.ProbedSigner{Key: key, Fingerprint: fp}}
 	pr := &fakeConfirmPrompter{}
 	cw := &fakeConfigWriter{}
 
@@ -320,7 +352,7 @@ func TestInit_NetworkRoundTrips_Bounded(t *testing.T) {
 		RegistryURL:  "https://example.com/registry",
 		ProjectID:    "myproj",
 		ConfigDir:    "/tmp/proj",
-		AcceptSigner: "abcdef",
+		AcceptSigner: fp,
 	})
 	if err != nil {
 		t.Fatalf("Init: %v", err)
@@ -337,11 +369,12 @@ func TestInit_NetworkRoundTrips_Bounded(t *testing.T) {
 func TestInit_SubsequentInit_PinMatches(t *testing.T) {
 	t.Parallel()
 
+	k1, fp1 := fixedSigner(t)
 	ts := &fakeTrustAnchorStore{
 		exists: true,
-		anchor: usecase.TrustAnchor{SignerFingerprint: "matching-fp"},
+		anchor: usecase.TrustAnchor{SignerKey: k1, SignerFingerprint: fp1},
 	}
-	sp := &fakeSignerProbe{fp: "matching-fp"}
+	sp := &fakeSignerProbe{signer: usecase.ProbedSigner{Key: k1, Fingerprint: fp1}}
 	cw := &fakeConfigWriter{}
 
 	u, err := usecase.NewInitializer(usecase.InitDeps{

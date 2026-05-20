@@ -1,0 +1,1172 @@
+// Package registry — production FetchTransport implementation.
+//
+// productionFetchTransport satisfies the full FetchTransport interface.
+// FetchHead delegates verbatim to a held *fetchtransport.HeadVerifier (one
+// verifier — no re-verify or re-interpret). ReadAdmins and ReadProjectConfig
+// read the committed bytes from the SAME local clone that FetchHead produced,
+// using `git cat-file blob <verifiedSHA>:<path>` — never a second clone, no
+// network round-trip between verify and read (same-clone / verified-SHA
+// provenance).
+//
+// Clone lifetime: one clone per FetchAdminSet call. FetchHead creates the
+// clone and stores a session keyed by the verified SHA. ReadAdmins pops the
+// pending session for that SHA, reads from the clone, then moves the session
+// to the active queue. ReadProjectConfig (called immediately after ReadAdmins
+// in FetchAdminSet) pops the active session and triggers cleanup. On any error
+// path the session cleanup is called directly, so the temp directory is removed
+// on every exit including panic and context cancellation.
+//
+// Concurrent FetchAdminSet calls each get their own distinct clone directory
+// (the session FIFO queues are per-SHA so same-SHA concurrent calls are served
+// in FIFO order with no sharing).
+//
+// This type lives in package registry (not in the fetchtransport sub-package)
+// so that ProjectConfig, countertypes, and domain types are in scope without
+// creating a registry→fetchtransport→registry import cycle.
+package registry
+
+import (
+	"bytes"
+	"context"
+	"crypto/ed25519"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"math"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"go.yaml.in/yaml/v3"
+
+	"github.com/ByReisK/byreis/internal/adapter/registry/internal/fetchtransport"
+	coreregistry "github.com/ByReisK/byreis/internal/core/registry"
+	"github.com/ByReisK/byreis/internal/core/registry/countertypes"
+	"github.com/ByReisK/byreis/internal/core/registry/rectypes"
+)
+
+// maxAdminYAMLBytes is the pre-decode size bound for admins.yaml and
+// per-project YAML files. A payload exceeding this is rejected before decoding
+// to prevent OOM from a malicious (but signature-valid) oversized registry file.
+const maxAdminYAMLBytes = 1 << 20 // 1 MiB
+
+// maxCounterJSONBytes is the pre-decode size bound for counter store JSON files.
+// 64 KiB is more than sufficient for the two-record counter schema; a larger
+// blob is rejected before decoding as a fail-closed guard against OOM.
+const maxCounterJSONBytes = 64 * 1024 // 64 KiB
+
+// mergeBaseTimeout is the bounded execution ceiling for a git merge-base
+// --is-ancestor subprocess. Applied via withBoundedDeadline so the effective
+// deadline is min(ctx.Deadline, mergeBaseTimeout from call time).
+const mergeBaseTimeout = 30 * time.Second
+
+// cloneSession holds the state of a single FetchAdminSet-scoped clone. It is
+// created by FetchHead and consumed by the subsequent ReadAdmins +
+// ReadProjectConfig calls within the same FetchAdminSet invocation.
+//
+// cleanupOnce wraps the cleanup function so it is idempotent (safe to call
+// from ReadAdmins on error AND from ReadProjectConfig on the normal path).
+type cloneSession struct {
+	cloneDir    string
+	verifiedSHA string
+	cleanupOnce sync.Once
+	cleanupFn   func()
+}
+
+// cleanup removes the tmpDir containing the clone. Safe to call multiple times.
+func (s *cloneSession) cleanup() {
+	s.cleanupOnce.Do(s.cleanupFn)
+}
+
+// sessionQueue is a FIFO queue of clone sessions, serialised by a mutex.
+// Multiple concurrent FetchAdminSet calls for the same commit SHA each push
+// their session and pop it in FIFO order — distinct clone dirs, no sharing.
+type sessionQueue struct {
+	mu       sync.Mutex
+	sessions []*cloneSession
+}
+
+func (q *sessionQueue) push(s *cloneSession) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.sessions = append(q.sessions, s)
+}
+
+// pop removes and returns the first session, or nil if the queue is empty.
+func (q *sessionQueue) pop() *cloneSession {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if len(q.sessions) == 0 {
+		return nil
+	}
+	s := q.sessions[0]
+	q.sessions = q.sessions[1:]
+	return s
+}
+
+// productionFetchTransport is the production implementation of FetchTransport.
+// It satisfies the full interface: FetchHead creates a clone and retains it
+// for the duration of the FetchAdminSet call. ReadAdmins and ReadProjectConfig
+// read from that retained clone via git cat-file blob. The clone is removed
+// (via the session cleanup) after ReadProjectConfig completes or on any error.
+type productionFetchTransport struct {
+	verifier *fetchtransport.HeadVerifier
+
+	// pendingMu + pendingSessions: sessions created by FetchHead, awaiting
+	// ReadAdmins. Maps verified SHA → FIFO queue.
+	pendingMu       sync.Mutex
+	pendingSessions map[string]*sessionQueue
+
+	// activeMu + activeSessions: sessions moved here by ReadAdmins, awaiting
+	// ReadProjectConfig. Maps verified SHA → FIFO queue.
+	activeMu       sync.Mutex
+	activeSessions map[string]*sessionQueue
+
+	// counterMu + counterActiveSessions: sessions moved here by ReadCounter,
+	// awaiting the conditional IsAncestor call within the same
+	// CounterAuthority invocation. Maps verified HEAD SHA → FIFO queue.
+	// Mirrors the pendingSessions/activeSessions two-queue discipline for the
+	// FetchHead → ReadCounter → [IsAncestor|DiscardCounterSession] pipeline.
+	// The in-memory session state is ephemeral; it does not survive process
+	// restart.
+	counterMu             sync.Mutex
+	counterActiveSessions map[string]*sessionQueue
+}
+
+// NewProductionFetchTransport constructs a productionFetchTransport. The
+// verifier is required; returns an error if it is nil.
+func NewProductionFetchTransport(v *fetchtransport.HeadVerifier) (*productionFetchTransport, error) {
+	if v == nil {
+		return nil, errors.New(
+			"registry.NewProductionFetchTransport: HeadVerifier is required — " +
+				"inject a real or fake verifier")
+	}
+	return &productionFetchTransport{
+		verifier:              v,
+		pendingSessions:       make(map[string]*sessionQueue),
+		activeSessions:        make(map[string]*sessionQueue),
+		counterActiveSessions: make(map[string]*sessionQueue),
+	}, nil
+}
+
+// SubprocessRunner is a CommandRunner implementation that shells to the OS for
+// subprocess execution. It is the production implementation of
+// fetchtransport.CommandRunner. cmd/byreis/main.go constructs one and passes it
+// to NewProductionFetchTransportFromRunner; the internal fetchtransport sub-package
+// drives the actual subprocess invocations.
+//
+// Implements fetchtransport.CommandRunner.
+type SubprocessRunner struct{}
+
+// Run executes the named command with the given args in dir with the given env.
+// Non-zero exit codes are returned as exitCode > 0 with err == nil (matching
+// the fetchtransport.CommandRunner contract). An exec-level error (binary not
+// found, killed by signal) is returned as err != nil with exitCode 0.
+func (SubprocessRunner) Run(ctx context.Context, dir string, env []string, name string, args ...string) (stdout, stderr []byte, exitCode int, err error) {
+	cmd := exec.CommandContext(ctx, name, args...) //nolint:gosec // name+args are controlled by the caller (git subcommands)
+	cmd.Dir = dir
+	cmd.Env = env
+	var outBuf, errBuf bytes.Buffer
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &errBuf
+	runErr := cmd.Run()
+	outBytes := outBuf.Bytes()
+	errBytes := errBuf.Bytes()
+	if runErr != nil {
+		var exitErr *exec.ExitError
+		if errors.As(runErr, &exitErr) {
+			return outBytes, errBytes, exitErr.ExitCode(), nil
+		}
+		return outBytes, errBytes, 0, runErr
+	}
+	return outBytes, errBytes, 0, nil
+}
+
+// NewProductionFetchTransportFromRunner constructs a productionFetchTransport
+// using a SubprocessRunner for the HeadVerifier. This is the wiring entrypoint
+// for cmd/byreis/main.go which cannot import the internal fetchtransport
+// sub-package directly.
+func NewProductionFetchTransportFromRunner(runner SubprocessRunner) (*productionFetchTransport, error) {
+	v, err := fetchtransport.NewHeadVerifier(fetchtransport.HeadVerifierConfig{
+		Runner:    runner,
+		MkdirTemp: os.MkdirTemp,
+		RemoveAll: os.RemoveAll,
+	})
+	if err != nil {
+		return nil, fmt.Errorf(
+			"registry.NewProductionFetchTransportFromRunner: constructing head verifier: %w", err)
+	}
+	return NewProductionFetchTransport(v)
+}
+
+// FetchHead delegates VERBATIM to HeadVerifier.VerifyHeadRetainClone.
+// One verifier only — no re-verify or re-interpret. When verified==true, the
+// clone is retained and stored as a pending session keyed by the verified SHA,
+// ready for the subsequent ReadAdmins + ReadProjectConfig calls within the
+// same FetchAdminSet invocation. When verified==false or on error, the clone
+// is cleaned up immediately.
+func (t *productionFetchTransport) FetchHead(ctx context.Context, repoURL string, anchorKey ed25519.PublicKey) (string, string, bool, error) {
+	commit, signerID, verified, cloneDir, cleanupFn, err := t.verifier.VerifyHeadRetainClone(ctx, repoURL, anchorKey)
+	if err != nil {
+		// VerifyHeadRetainClone always returns a non-nil cleanupFn even on error.
+		cleanupFn()
+		return commit, signerID, verified, err
+	}
+	if !verified {
+		// Verification failed: clean up the clone (may be partial) and return.
+		cleanupFn()
+		return commit, signerID, false, nil
+	}
+
+	// verified==true and cloneDir is set. Create a session and push it to the
+	// pending queue so ReadAdmins can find it by SHA.
+	sess := &cloneSession{
+		cloneDir:    cloneDir,
+		verifiedSHA: commit,
+		cleanupFn:   cleanupFn,
+	}
+	t.pushPending(commit, sess)
+	return commit, signerID, true, nil
+}
+
+func (t *productionFetchTransport) pushPending(sha string, s *cloneSession) {
+	t.pendingMu.Lock()
+	defer t.pendingMu.Unlock()
+	if t.pendingSessions[sha] == nil {
+		t.pendingSessions[sha] = &sessionQueue{}
+	}
+	t.pendingSessions[sha].push(s)
+}
+
+func (t *productionFetchTransport) popPending(sha string) *cloneSession {
+	t.pendingMu.Lock()
+	defer t.pendingMu.Unlock()
+	q := t.pendingSessions[sha]
+	if q == nil {
+		return nil
+	}
+	return q.pop()
+}
+
+func (t *productionFetchTransport) pushActive(sha string, s *cloneSession) {
+	t.activeMu.Lock()
+	defer t.activeMu.Unlock()
+	if t.activeSessions[sha] == nil {
+		t.activeSessions[sha] = &sessionQueue{}
+	}
+	t.activeSessions[sha].push(s)
+}
+
+func (t *productionFetchTransport) popActive(sha string) *cloneSession {
+	t.activeMu.Lock()
+	defer t.activeMu.Unlock()
+	q := t.activeSessions[sha]
+	if q == nil {
+		return nil
+	}
+	return q.pop()
+}
+
+func (t *productionFetchTransport) pushCounterActive(sha string, s *cloneSession) {
+	t.counterMu.Lock()
+	defer t.counterMu.Unlock()
+	if t.counterActiveSessions[sha] == nil {
+		t.counterActiveSessions[sha] = &sessionQueue{}
+	}
+	t.counterActiveSessions[sha].push(s)
+}
+
+func (t *productionFetchTransport) popCounterActive(sha string) *cloneSession {
+	t.counterMu.Lock()
+	defer t.counterMu.Unlock()
+	q := t.counterActiveSessions[sha]
+	if q == nil {
+		return nil
+	}
+	return q.pop()
+}
+
+// ReadProjectBlob delegates to the held HeadVerifier.ReadProjectBlob for the
+// git-based file-of-record read. It satisfies the fileofrecord.ProjectBlobReader
+// interface.
+//
+// ONE clone of projectURL is performed per call. The branch is resolved to
+// S_proj exactly once inside that clone; S_proj is an intra-clone NO-SKEW
+// invariant, NOT a signed or trust-verified SHA. Project-repo trust is the
+// manifest signature (verify.VerifyOfRecord over the registry-attested set).
+//
+// A git-layer blob-not-found error is propagated as-is; the caller detects
+// it via the BlobNotFound() bool marker interface without importing this
+// package.
+func (t *productionFetchTransport) ReadProjectBlob(ctx context.Context, projectURL, branch, path string, maxBytes int64) (string, []byte, error) {
+	return t.verifier.ReadProjectBlob(ctx, projectURL, branch, path, maxBytes)
+}
+
+// IsAncestor reports whether ancestor is a (non-strict) ancestor of tip using
+// git merge-base --is-ancestor against the retained clone from ReadCounter. The
+// clone was deposited into counterActiveSessions by ReadCounter; IsAncestor
+// pops it here and owns the cleanup via defer.
+//
+// Exit-code triage (four distinct branches):
+//
+//   - exit 0 + nil err  → (true, nil)   — ancestor is ancestor of tip
+//   - exit 1 + nil err  → (false, nil)  — not an ancestor (rollback detected by caller)
+//   - exit other        → (false, err)  — git error; wraps ErrCounterStoreUnreadable
+//   - runErr != nil     → (false, err)  — exec-level failure; wraps ctx.Err() if cancelled
+//
+// Both SHA arguments are re-validated by isValidSHA before argv assembly. The
+// subprocess runs with the same hardened environment as ReadBlobAtSHA and the
+// verify leg (GIT_CONFIG_NOSYSTEM, HOME isolation, protocol allowlist, hooks
+// disabled), bounded by mergeBaseTimeout.
+func (t *productionFetchTransport) IsAncestor(ctx context.Context, _ string, ancestor, tip string) (bool, error) {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return false, fmt.Errorf(
+			"IsAncestor: context already cancelled: %w — run `byreis doctor`", ctxErr)
+	}
+
+	// Re-validate both SHA arguments before touching argv or the session queue.
+	if !fetchtransport.IsValidSHA(ancestor) {
+		return false, fmt.Errorf(
+			"%w: IsAncestor: ancestor %q is not a valid 40/64-hex commit hash — "+
+				"internal invariant violated; run `byreis doctor`",
+			coreregistry.ErrCounterStoreUnreadable, ancestor)
+	}
+	if !fetchtransport.IsValidSHA(tip) {
+		return false, fmt.Errorf(
+			"%w: IsAncestor: tip %q is not a valid 40/64-hex commit hash — "+
+				"internal invariant violated; run `byreis doctor`",
+			coreregistry.ErrCounterStoreUnreadable, tip)
+	}
+
+	// Pop the counter-active session keyed by tip (the verified HEAD SHA from
+	// FetchHead/ReadCounter). This is the same-clone provenance guarantee:
+	// the ancestry check runs against the exact clone ReadCounter used.
+	sess := t.popCounterActive(tip)
+	if sess == nil {
+		return false, fmt.Errorf(
+			"%w: IsAncestor: no counter clone session for tip SHA %q — "+
+				"internal invariant violated; run `byreis doctor`",
+			coreregistry.ErrCounterStoreUnreadable, tip)
+	}
+	// Cleanup on every exit path (success, error, ctx-cancel, panic).
+	defer sess.cleanup()
+
+	// Derive the hardened env from the retained clone directory. tmpDir is the
+	// parent of cloneDir, identical to the convention in ReadBlobAtSHA.
+	tmpDir := filepath.Dir(sess.cloneDir)
+	mergeEnv := append(fetchtransport.CleanGitEnv(),
+		"GIT_CONFIG_NOSYSTEM=1",
+		"HOME="+tmpDir,
+		"GIT_TERMINAL_PROMPT=0",
+		"GIT_ALLOW_PROTOCOL=file:https:ssh",
+		"GIT_CONFIG_COUNT=2",
+		"GIT_CONFIG_KEY_0=core.hooksPath",
+		"GIT_CONFIG_VALUE_0=/dev/null",
+		"GIT_CONFIG_KEY_1=core.fsmonitor",
+		"GIT_CONFIG_VALUE_1=",
+	)
+
+	// Bounded deadline: never exceed mergeBaseTimeout, never extend a
+	// shorter parent deadline.
+	mbCtx, mbCancel := fetchtransport.WithBoundedDeadline(ctx, mergeBaseTimeout)
+	defer mbCancel()
+
+	// argv: "merge-base --is-ancestor -- <ancestor> <tip>"
+	// The "--" end-of-options guard prevents any ref-like input from being
+	// parsed as a flag even if validation above were somehow bypassed.
+	_, stderr, exitCode, runErr := t.verifier.RunSubprocess(
+		mbCtx, sess.cloneDir, mergeEnv,
+		"git", "merge-base", "--is-ancestor", "--", ancestor, tip,
+	)
+
+	if runErr != nil {
+		if mbCtx.Err() != nil || ctx.Err() != nil {
+			return false, fmt.Errorf(
+				"IsAncestor: git merge-base cancelled: %w — run `byreis doctor`",
+				ctx.Err())
+		}
+		return false, fmt.Errorf(
+			"IsAncestor: git merge-base exec error: %w — run `byreis doctor`",
+			runErr)
+	}
+
+	// Silence stderr: counter blob paths may include PR identifiers and other
+	// workflow metadata that must not propagate into error messages.
+	_ = stderr
+
+	switch exitCode {
+	case 0:
+		return true, nil
+	case 1:
+		return false, nil
+	default:
+		return false, fmt.Errorf(
+			"%w: IsAncestor: git merge-base unexpected exit %d — run `byreis doctor`",
+			coreregistry.ErrCounterStoreUnreadable, exitCode)
+	}
+}
+
+// ReadCounter reads the last_accepted_counter and optional pending bump for the
+// given (projectID, fileName) pair from the counter store file committed in the
+// registry at the exact SHA FetchHead verified. It pops the pending session
+// created by FetchHead; on success it pushes the session to counterActiveSessions
+// for the subsequent conditional IsAncestor call. On any error path the session
+// is cleaned up synchronously — never deferred — so the clone is released before
+// this function returns on error.
+//
+// Absent counter file (BlobNotFound typed marker) returns (0, nil, nil) — a
+// counter that has never been written is treated as zero (the freshly-created
+// counter case). Every other error surface returns a non-nil error wrapping
+// ErrCounterStoreUnreadable with an actionable hint.
+func (t *productionFetchTransport) ReadCounter(ctx context.Context, _ string, headCommit, projectID, fileName string) (uint64, *countertypes.PendingBump, error) {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return 0, nil, fmt.Errorf(
+			"ReadCounter: context already cancelled: %w — run `byreis doctor`", ctxErr)
+	}
+
+	// Validate projectID and fileName BEFORE composing any path or touching the
+	// session queue. A validation failure must not consume a session.
+	if err := fetchtransport.ValidateProjectID(projectID); err != nil {
+		return 0, nil, fmt.Errorf(
+			"%w: ReadCounter: invalid projectID: %v — run `byreis doctor`",
+			coreregistry.ErrCounterStoreUnreadable, err)
+	}
+	if err := fetchtransport.ValidateFileName(fileName); err != nil {
+		return 0, nil, fmt.Errorf(
+			"%w: ReadCounter: invalid fileName: %v — run `byreis doctor`",
+			coreregistry.ErrCounterStoreUnreadable, err)
+	}
+
+	// Pop the pending clone session deposited by the preceding FetchHead call,
+	// keyed by headCommit. Using the caller-supplied headCommit as the session
+	// key ensures only the session whose verifiedSHA matches the headCommit the
+	// orchestrator passed is eligible for this ReadCounter invocation.
+	sess := t.popPending(headCommit)
+	if sess == nil {
+		return 0, nil, fmt.Errorf(
+			"%w: ReadCounter: no clone session available for headCommit %q — "+
+				"FetchHead must be called before ReadCounter; run `byreis doctor`",
+			coreregistry.ErrCounterStoreUnreadable, headCommit)
+	}
+
+	// Immediate cleanup guard: set up a cleanup flag so that on any error path
+	// below the session is cleaned synchronously. On the success path we push
+	// to counterActiveSessions instead.
+	cleanedUp := false
+	defer func() {
+		if !cleanedUp {
+			sess.cleanup()
+		}
+	}()
+
+	// SHA-equality assertion: the session's verifiedSHA must exactly match the
+	// headCommit parameter the orchestrator passed. This is the in-code structural
+	// assertion — NOT an assignment. A mismatch indicates an internal invariant
+	// violation (concurrent session interleave or a wrong headCommit from the
+	// caller) and is fail-closed.
+	if sess.verifiedSHA != headCommit {
+		sess.cleanup()
+		cleanedUp = true
+		return 0, nil, fmt.Errorf(
+			"%w: ReadCounter: session SHA %q does not match headCommit %q — "+
+				"internal invariant violated; run `byreis doctor`",
+			coreregistry.ErrCounterStoreUnreadable, sess.verifiedSHA, headCommit)
+	}
+
+	// Re-validate the headCommit (now confirmed == sess.verifiedSHA) defensively;
+	// an invalid SHA here indicates an internal invariant violation.
+	if !fetchtransport.IsValidSHA(headCommit) {
+		return 0, nil, fmt.Errorf(
+			"%w: ReadCounter: headCommit %q is not a valid SHA — "+
+				"internal invariant violated; run `byreis doctor`",
+			coreregistry.ErrCounterStoreUnreadable, headCommit)
+	}
+
+	// Compose the counter blob path via the single authorised helper.
+	blobPath := fetchtransport.CounterBlobPath(projectID, fileName)
+
+	raw, readErr := t.verifier.ReadBlobAtSHA(ctx, sess.cloneDir, headCommit, blobPath)
+	if readErr != nil {
+		if fetchtransport.IsBlobNotFound(readErr) {
+			// Absent counter file: treat as zero counter (freshly-created project).
+			// Session cleanup happens via the deferred cleanedUp guard.
+			return 0, nil, nil
+		}
+		return 0, nil, fmt.Errorf(
+			"%w: ReadCounter: reading %q at %q: %v — run `byreis doctor`",
+			coreregistry.ErrCounterStoreUnreadable, blobPath, headCommit, readErr)
+	}
+
+	// Pre-decode size cap: 64 KiB hard limit measured on raw bytes BEFORE
+	// any JSON decoding. Over-size blobs are rejected without invoking the decoder.
+	if len(raw) > maxCounterJSONBytes {
+		return 0, nil, fmt.Errorf(
+			"%w: ReadCounter: counter blob %q at %q exceeds max size %d bytes (got %d) — "+
+				"run `byreis doctor`",
+			coreregistry.ErrCounterStoreUnreadable, blobPath, headCommit,
+			maxCounterJSONBytes, len(raw))
+	}
+
+	// Empty or whitespace-only blob: not the same as absent (BlobNotFound); fail
+	// closed — a zero-byte blob is a repository integrity concern, not a fresh counter.
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return 0, nil, fmt.Errorf(
+			"%w: ReadCounter: counter blob %q at %q is empty or whitespace-only — "+
+				"run `byreis doctor`",
+			coreregistry.ErrCounterStoreUnreadable, blobPath, headCommit)
+	}
+
+	// Explicit duplicate-key detection via token-stream pre-scan. The Go stdlib
+	// json.Decoder with DisallowUnknownFields does NOT catch duplicate keys
+	// (last-write-wins). This separate pass catches duplicates at any nesting level.
+	if err := checkDuplicateJSONKeys(raw); err != nil {
+		return 0, nil, fmt.Errorf(
+			"%w: ReadCounter: %v in counter blob %q at %q — run `byreis doctor`",
+			coreregistry.ErrCounterStoreUnreadable, err, blobPath, headCommit)
+	}
+
+	// Decode into the strict typed struct mirroring ADR-0006 lines 75-88 exactly.
+	cf, decErr := decodeCounterFile(raw)
+	if decErr != nil {
+		return 0, nil, fmt.Errorf(
+			"%w: ReadCounter: decoding counter blob %q at %q: %v — run `byreis doctor`",
+			coreregistry.ErrCounterStoreUnreadable, blobPath, headCommit, decErr)
+	}
+
+	// Post-decode semantic validation: project_id, file, and SHAs must satisfy
+	// the domain invariants defined in the counter schema.
+	if err := validateCounterFileSemantics(cf, projectID, fileName); err != nil {
+		return 0, nil, fmt.Errorf(
+			"%w: ReadCounter: semantic validation of counter blob %q at %q: %v — "+
+				"run `byreis doctor`",
+			coreregistry.ErrCounterStoreUnreadable, blobPath, headCommit, err)
+	}
+
+	// Build the domain PendingBump if the pending record is present.
+	var pending *countertypes.PendingBump
+	if cf.Pending != nil {
+		pending = &countertypes.PendingBump{
+			PendingCounter:    cf.Pending.PendingCounter,
+			TargetArtifactSHA: cf.Pending.TargetArtifactSHA,
+			TargetPR:          cf.Pending.TargetPR,
+		}
+	}
+
+	// Success path: push the session to counterActiveSessions so the conditional
+	// IsAncestor call can use the same clone. Mark cleaned up so the defer does
+	// not fire.
+	cleanedUp = true
+	t.pushCounterActive(headCommit, sess)
+
+	return cf.LastAcceptedCounter, pending, nil
+}
+
+// DiscardCounterSession pops the counter-active session keyed by headCommit and
+// cleans it up synchronously. Called by CounterAuthority on the two no-ancestor
+// branches (cold-cache first-call and warm-cache identical-HEAD) so the session
+// does not leak when IsAncestor is not called. If no session is present for this
+// headCommit, the call is a no-op (safe to call unconditionally on those branches).
+func (t *productionFetchTransport) DiscardCounterSession(_ context.Context, headCommit string) {
+	if sess := t.popCounterActive(headCommit); sess != nil {
+		sess.cleanup()
+	}
+}
+
+// WriteCounter is not yet implemented in the production path.
+func (t *productionFetchTransport) WriteCounter(_ context.Context, _, _, _ string, _ *countertypes.PendingBump) error {
+	return fmt.Errorf(
+		"WriteCounter not yet implemented in production transport — " +
+			"run `byreis doctor` to diagnose registry connectivity")
+}
+
+// CommitCounter is not yet implemented in the production path.
+func (t *productionFetchTransport) CommitCounter(_ context.Context, _, _, _ string, _ uint64) error {
+	return fmt.Errorf(
+		"CommitCounter not yet implemented in production transport — " +
+			"run `byreis doctor` to diagnose registry connectivity")
+}
+
+// ReadProjectConfig reads projects/<projectID>.yaml at the exact pinned
+// headCommit SHA from the retained clone. An absent file returns zero
+// ProjectConfig with no error. Pops and cleans up the active session for this
+// SHA (the clone was moved from pending to active by ReadAdmins).
+func (t *productionFetchTransport) ReadProjectConfig(ctx context.Context, _ string, headCommit, projectID string) (ProjectConfig, error) {
+	if err := fetchtransport.ValidateProjectID(projectID); err != nil {
+		return ProjectConfig{}, fmt.Errorf(
+			"registry ReadProjectConfig: invalid projectID: %w", err)
+	}
+
+	// Pop the active session for this SHA (set by ReadAdmins).
+	// Always clean up when ReadProjectConfig returns, whether successfully or
+	// with an error. If no session exists (e.g. ReadAdmins error path already
+	// cleaned up), proceed without a clone and return empty config.
+	sess := t.popActive(headCommit)
+	if sess != nil {
+		defer sess.cleanup()
+	}
+
+	if sess == nil || sess.cloneDir == "" {
+		// No clone session available. This happens when ReadAdmins returned an
+		// error (session already cleaned up) or in test paths that bypass FetchHead.
+		return ProjectConfig{}, nil
+	}
+
+	path := "projects/" + projectID + ".yaml"
+	raw, err := t.verifier.ReadBlobAtSHA(ctx, sess.cloneDir, headCommit, path)
+	if err != nil {
+		if fetchtransport.IsBlobNotFound(err) {
+			return ProjectConfig{}, nil
+		}
+		return ProjectConfig{}, fmt.Errorf(
+			"registry ReadProjectConfig: reading %q at %q from clone: %w — "+
+				"run `byreis doctor` to diagnose", path, headCommit, err)
+	}
+
+	if int64(len(raw)) > maxAdminYAMLBytes {
+		return ProjectConfig{}, fmt.Errorf(
+			"registry ReadProjectConfig: %q at %q exceeds max size %d bytes (got %d) — "+
+				"registry file is unusually large; run `byreis doctor`",
+			path, headCommit, maxAdminYAMLBytes, len(raw))
+	}
+
+	type projectYAML struct {
+		Files map[string]string `yaml:"files"`
+	}
+	var parsed projectYAML
+	dec := yaml.NewDecoder(strings.NewReader(string(raw)))
+	dec.KnownFields(true)
+	if decErr := dec.Decode(&parsed); decErr != nil {
+		return ProjectConfig{}, fmt.Errorf(
+			"registry ReadProjectConfig: decoding %q at %q: %w — "+
+				"registry file may be malformed; run `byreis doctor`",
+			path, headCommit, decErr)
+	}
+
+	return ProjectConfig(parsed), nil
+}
+
+// ReadAdmins reads and parses admins.yaml at the exact pinned headCommit SHA
+// from the retained clone. ValidateProjectID is called before any path
+// composition. Fails closed on absent/unparseable/empty admins.yaml.
+//
+// Pops the pending session for headCommit (created by FetchHead) and moves it
+// to the active queue for ReadProjectConfig to consume. On error the session
+// is cleaned up immediately (since ReadProjectConfig will not be called on the
+// error path in FetchAdminSet).
+func (t *productionFetchTransport) ReadAdmins(ctx context.Context, _ string, headCommit, projectID string) (ParsedAdminData, error) {
+	if err := fetchtransport.ValidateProjectID(projectID); err != nil {
+		return ParsedAdminData{}, fmt.Errorf(
+			"registry ReadAdmins: invalid projectID: %w — "+
+				"run `byreis doctor` to diagnose", err)
+	}
+
+	// Pop the pending session for this SHA (created by FetchHead).
+	sess := t.popPending(headCommit)
+	if sess == nil {
+		// No session found. This is an internal invariant violation — FetchHead
+		// must have been called and returned verified=true before ReadAdmins.
+		return ParsedAdminData{}, fmt.Errorf(
+			"%w: no clone session found for commit %q — "+
+				"internal invariant violated; run `byreis doctor`",
+			coreregistry.ErrAdminSetUnreadable, headCommit)
+	}
+
+	// SHA string-equality assertion: the session's verifiedSHA must exactly
+	// match the headCommit parameter. This is the in-code SHA-identity assertion
+	// required by the same-clone / verified-SHA provenance contract.
+	if sess.verifiedSHA != headCommit {
+		sess.cleanup()
+		return ParsedAdminData{}, fmt.Errorf(
+			"%w: session SHA %q does not match headCommit %q — "+
+				"internal invariant violated; run `byreis doctor`",
+			coreregistry.ErrAdminSetUnreadable, sess.verifiedSHA, headCommit)
+	}
+
+	raw, readErr := t.verifier.ReadBlobAtSHA(ctx, sess.cloneDir, headCommit, "admins.yaml")
+	if readErr != nil {
+		sess.cleanup()
+		if fetchtransport.IsBlobNotFound(readErr) {
+			return ParsedAdminData{}, fmt.Errorf(
+				"%w: admins.yaml is absent at commit %q — "+
+					"the registry must contain admins.yaml; run `byreis doctor`",
+				coreregistry.ErrAdminSetUnreadable, headCommit)
+		}
+		return ParsedAdminData{}, fmt.Errorf(
+			"%w: reading admins.yaml at commit %q: %v — "+
+				"run `byreis doctor` to diagnose",
+			coreregistry.ErrAdminSetUnreadable, headCommit, readErr)
+	}
+
+	if int64(len(raw)) > maxAdminYAMLBytes {
+		sess.cleanup()
+		return ParsedAdminData{}, fmt.Errorf(
+			"%w: admins.yaml at commit %q exceeds max size %d bytes (got %d) — "+
+				"registry file is unusually large; run `byreis doctor`",
+			coreregistry.ErrAdminSetUnreadable, headCommit, maxAdminYAMLBytes, len(raw))
+	}
+
+	data, parseErr := parseAdminsYAML(raw, headCommit)
+	if parseErr != nil {
+		sess.cleanup()
+		return ParsedAdminData{}, parseErr
+	}
+
+	if len(data.RawRecipients) == 0 {
+		sess.cleanup()
+		return ParsedAdminData{}, fmt.Errorf(
+			"%w: admins.yaml at commit %q has an empty recipient set — "+
+				"at least one admin recipient is required; run `byreis doctor`",
+			coreregistry.ErrAdminSetUnreadable, headCommit)
+	}
+	if len(data.SignerKeys) == 0 {
+		sess.cleanup()
+		return ParsedAdminData{}, fmt.Errorf(
+			"%w: admins.yaml at commit %q has an empty signer set — "+
+				"at least one admin signing key is required; run `byreis doctor`",
+			coreregistry.ErrNoTrustedSigner, headCommit)
+	}
+
+	// Move the session to the active queue so ReadProjectConfig can use the
+	// same clone for its read.
+	t.pushActive(headCommit, sess)
+
+	return ParsedAdminData{
+		Recipients: data.RawRecipients,
+		SignerKeys: data.SignerKeys,
+	}, nil
+}
+
+// adminsYAMLEntry is the strict wire format for a single entry in admins.yaml.
+// KnownFields(true) rejects any field not listed here.
+type adminsYAMLEntry struct {
+	ID        string `yaml:"id"`
+	AgeKey    string `yaml:"age_key"`
+	SignerKey string `yaml:"signer_key"`
+}
+
+// adminsYAMLFile is the strict wire format for the top-level admins.yaml.
+type adminsYAMLFile struct {
+	Admins []adminsYAMLEntry `yaml:"admins"`
+}
+
+// parsedAdminsIntermediate holds the parsed-but-not-yet-returned values
+// before the empty-set guards in ReadAdmins fire.
+type parsedAdminsIntermediate struct {
+	RawRecipients []rectypes.Recipient
+	SignerKeys    map[string]coreregistry.SignerKey
+}
+
+// parseAdminsYAML decodes raw admins.yaml bytes into domain values.
+// Uses strict KnownFields(true) YAML decoding. Rejects duplicate admin ids,
+// non-base64 signer fields, wrong-length keys, all-zero Ed25519 keys, and
+// entries with empty id, age_key, or signer_key fields.
+func parseAdminsYAML(raw []byte, commitHint string) (parsedAdminsIntermediate, error) {
+	var file adminsYAMLFile
+	dec := yaml.NewDecoder(strings.NewReader(string(raw)))
+	dec.KnownFields(true)
+	if err := dec.Decode(&file); err != nil {
+		return parsedAdminsIntermediate{}, fmt.Errorf(
+			"%w: decoding admins.yaml at commit %q: %v — "+
+				"registry file may be malformed or contain unknown fields; run `byreis doctor`",
+			coreregistry.ErrAdminSetUnreadable, commitHint, err)
+	}
+
+	if len(file.Admins) == 0 {
+		return parsedAdminsIntermediate{}, fmt.Errorf(
+			"%w: admins.yaml at commit %q has no admin entries — "+
+				"at least one admin is required; run `byreis doctor`",
+			coreregistry.ErrAdminSetUnreadable, commitHint)
+	}
+
+	seenIDs := make(map[string]struct{}, len(file.Admins))
+	recipients := make([]rectypes.Recipient, 0, len(file.Admins))
+	signerKeys := make(map[string]coreregistry.SignerKey, len(file.Admins))
+
+	for i, entry := range file.Admins {
+		if entry.ID == "" {
+			return parsedAdminsIntermediate{}, fmt.Errorf(
+				"%w: admins.yaml entry index %d at commit %q has an empty id — "+
+					"each admin entry must have a non-empty id; run `byreis doctor`",
+				coreregistry.ErrAdminSetUnreadable, i, commitHint)
+		}
+
+		// Reject duplicate admin id — deterministic fail-closed, not last-write-wins.
+		if _, dup := seenIDs[entry.ID]; dup {
+			return parsedAdminsIntermediate{}, fmt.Errorf(
+				"%w: admins.yaml at commit %q has duplicate admin id %q — "+
+					"admin ids must be unique; run `byreis doctor`",
+				coreregistry.ErrAdminSetUnreadable, commitHint, entry.ID)
+		}
+		seenIDs[entry.ID] = struct{}{}
+
+		// Validate the age recipient key.
+		if entry.AgeKey == "" {
+			return parsedAdminsIntermediate{}, fmt.Errorf(
+				"%w: admin %q in admins.yaml at commit %q has an empty age_key — "+
+					"each admin entry must have a non-empty age_key; run `byreis doctor`",
+				coreregistry.ErrAdminSetUnreadable, entry.ID, commitHint)
+		}
+		if !strings.HasPrefix(entry.AgeKey, "age1") {
+			return parsedAdminsIntermediate{}, fmt.Errorf(
+				"%w: admin %q in admins.yaml at commit %q has an invalid age_key "+
+					"(must start with \"age1\") — run `byreis doctor`",
+				coreregistry.ErrAdminSetUnreadable, entry.ID, commitHint)
+		}
+		fp := ageKeyFingerprint(entry.AgeKey)
+		recipients = append(recipients, rectypes.Recipient{
+			Label:       entry.ID,
+			AgePubKey:   entry.AgeKey,
+			Fingerprint: fp,
+		})
+
+		// Validate and decode the Ed25519 signer key (base64-encoded raw bytes).
+		if entry.SignerKey == "" {
+			return parsedAdminsIntermediate{}, fmt.Errorf(
+				"%w: admin %q in admins.yaml at commit %q has an empty signer_key — "+
+					"each admin entry must have a non-empty signer_key; run `byreis doctor`",
+				coreregistry.ErrNoTrustedSigner, entry.ID, commitHint)
+		}
+		keyBytes, decErr := base64.StdEncoding.DecodeString(entry.SignerKey)
+		if decErr != nil {
+			return parsedAdminsIntermediate{}, fmt.Errorf(
+				"%w: admin %q signer_key in admins.yaml at commit %q is not valid base64 — "+
+					"run `byreis doctor`",
+				coreregistry.ErrNoTrustedSigner, entry.ID, commitHint)
+		}
+		if len(keyBytes) != ed25519.PublicKeySize {
+			return parsedAdminsIntermediate{}, fmt.Errorf(
+				"%w: admin %q signer_key in admins.yaml at commit %q has length %d (need %d) — "+
+					"run `byreis doctor`",
+				coreregistry.ErrNoTrustedSigner, entry.ID, commitHint,
+				len(keyBytes), ed25519.PublicKeySize)
+		}
+		if isAllZeroKey(keyBytes) {
+			return parsedAdminsIntermediate{}, fmt.Errorf(
+				"%w: admin %q signer_key in admins.yaml at commit %q is all-zero — "+
+					"a zero key is not a valid Ed25519 public key; run `byreis doctor`",
+				coreregistry.ErrNoTrustedSigner, entry.ID, commitHint)
+		}
+		signerKeys[entry.ID] = coreregistry.SignerKey(keyBytes)
+	}
+
+	return parsedAdminsIntermediate{
+		RawRecipients: recipients,
+		SignerKeys:    signerKeys,
+	}, nil
+}
+
+// ageKeyFingerprint computes the rectypes.Fingerprint (SHA-256) of an age
+// public key string. The preimage is the UTF-8 bytes of the "age1..." string,
+// consistent with the encrypt package's fingerprint convention.
+func ageKeyFingerprint(agePubKey string) rectypes.Fingerprint {
+	sum := sha256.Sum256([]byte(agePubKey))
+	return rectypes.Fingerprint(sum)
+}
+
+// isAllZeroKey returns true if all bytes in b are zero.
+func isAllZeroKey(b []byte) bool {
+	for _, v := range b {
+		if v != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// counterPendingJSON is the strict wire format for the "pending" sub-object in
+// the counter store JSON, mirroring ADR-0006 lines 82-88 byte-for-byte.
+// Field names must match exactly; DisallowUnknownFields rejects extra fields.
+// PendingCounter uses json.Number so UseNumber() mode rejects floats/scientific.
+type counterPendingJSON struct {
+	PendingCounter    json.Number `json:"pending_counter"`
+	TargetArtifactSHA string      `json:"target_artifact_sha"`
+	TargetPR          string      `json:"target_pr"`
+	IntentAt          string      `json:"intent_at"`
+}
+
+// counterFileJSON is the strict wire format for the counter store JSON file,
+// mirroring ADR-0006 lines 75-89 byte-for-byte.
+// Field names must match exactly; DisallowUnknownFields rejects extra fields.
+// json.Number mode is used for the counter fields to reject scientific notation,
+// floats, and out-of-range values.
+type counterFileJSON struct {
+	ProjectID           string              `json:"project_id"`
+	File                string              `json:"file"`
+	LastAcceptedCounter json.Number         `json:"last_accepted_counter"`
+	LastPR              string              `json:"last_pr"`
+	UpdatedAt           string              `json:"updated_at"`
+	Pending             *counterPendingJSON `json:"pending"`
+}
+
+// counterFileParsed is the fully-decoded, post-semantic-validation counter file
+// with integer counter values (not json.Number).
+type counterFileParsed struct {
+	ProjectID           string
+	File                string
+	LastAcceptedCounter uint64
+	LastPR              string
+	UpdatedAt           string
+	Pending             *counterPendingParsed
+}
+
+// counterPendingParsed mirrors counterPendingJSON but with uint64 counter.
+type counterPendingParsed struct {
+	PendingCounter    uint64
+	TargetArtifactSHA string
+	TargetPR          string
+	IntentAt          string
+}
+
+// checkDuplicateJSONKeys performs a token-stream pre-scan of raw JSON to detect
+// duplicate keys at any nesting level. The Go stdlib json.Decoder with
+// DisallowUnknownFields does NOT catch duplicate keys (last-write-wins). This
+// separate pass is required: a counter blob with duplicate keys is rejected as
+// ErrCounterStoreUnreadable-worthy.
+//
+// Returns an error describing the first duplicate key found, or nil if all keys
+// are unique.
+func checkDuplicateJSONKeys(raw []byte) error {
+	type frame struct {
+		keys map[string]struct{}
+	}
+
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	var stack []frame
+
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			// A non-EOF parse error means the JSON is malformed; surface it so
+			// the caller wraps it as ErrCounterStoreUnreadable. The duplicate-key
+			// scan itself does not need to return a parse error (the full Decode
+			// call below will catch it again with DisallowUnknownFields), but we
+			// break early to avoid infinite loops on malformed input.
+			break
+		}
+
+		switch v := tok.(type) {
+		case json.Delim:
+			switch v {
+			case '{':
+				stack = append(stack, frame{keys: make(map[string]struct{})})
+			case '}':
+				if len(stack) > 0 {
+					stack = stack[:len(stack)-1]
+				}
+			case '[':
+				// Arrays do not have keys; push a nil-keyed frame as placeholder.
+				stack = append(stack, frame{keys: nil})
+			case ']':
+				if len(stack) > 0 {
+					stack = stack[:len(stack)-1]
+				}
+			}
+		case string:
+			// A string token after a '{' delimiter (inside an object) is a key.
+			// After the key comes a value; we track keys in the current frame.
+			if len(stack) > 0 {
+				top := &stack[len(stack)-1]
+				if top.keys != nil {
+					if _, exists := top.keys[v]; exists {
+						return fmt.Errorf("duplicate key %q in counter store JSON", v)
+					}
+					top.keys[v] = struct{}{}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// decodeCounterFile decodes the raw JSON bytes into a counterFileParsed using
+// strict DisallowUnknownFields mode plus integer-only counter fields.
+// The caller must have already run checkDuplicateJSONKeys and the pre-decode
+// size check before calling this function.
+func decodeCounterFile(raw []byte) (counterFileParsed, error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	dec.UseNumber()
+
+	var wire counterFileJSON
+	if err := dec.Decode(&wire); err != nil {
+		return counterFileParsed{}, fmt.Errorf("decoding counter JSON: %w", err)
+	}
+
+	// Parse last_accepted_counter: integer-only, no scientific notation, no
+	// negative, no decimal, range [0, math.MaxUint64].
+	la, err := parseCounterNumber(wire.LastAcceptedCounter, "last_accepted_counter")
+	if err != nil {
+		return counterFileParsed{}, err
+	}
+
+	result := counterFileParsed{
+		ProjectID:           wire.ProjectID,
+		File:                wire.File,
+		LastAcceptedCounter: la,
+		LastPR:              wire.LastPR,
+		UpdatedAt:           wire.UpdatedAt,
+	}
+
+	if wire.Pending != nil {
+		pc, err := parseCounterNumber(wire.Pending.PendingCounter, "pending.pending_counter")
+		if err != nil {
+			return counterFileParsed{}, err
+		}
+		result.Pending = &counterPendingParsed{
+			PendingCounter:    pc,
+			TargetArtifactSHA: wire.Pending.TargetArtifactSHA,
+			TargetPR:          wire.Pending.TargetPR,
+			IntentAt:          wire.Pending.IntentAt,
+		}
+	}
+
+	return result, nil
+}
+
+// parseCounterNumber parses a json.Number for a counter field. Rejects:
+// scientific notation (contains 'e'/'E'), decimal point (contains '.'),
+// negative values (starts with '-'), values > math.MaxUint64, leading zeros
+// (except literal "0"), leading '+'.
+func parseCounterNumber(n json.Number, fieldName string) (uint64, error) {
+	s := n.String()
+	if s == "" {
+		return 0, fmt.Errorf("counter field %q is empty", fieldName)
+	}
+	// Reject negative.
+	if s[0] == '-' {
+		return 0, fmt.Errorf(
+			"counter field %q must not be negative (got %q)", fieldName, s)
+	}
+	// Reject leading '+'.
+	if s[0] == '+' {
+		return 0, fmt.Errorf(
+			"counter field %q must not have a leading '+' (got %q)", fieldName, s)
+	}
+	// Reject scientific notation.
+	if strings.ContainsAny(s, "eE") {
+		return 0, fmt.Errorf(
+			"counter field %q must be an integer, not scientific notation (got %q)",
+			fieldName, s)
+	}
+	// Reject decimal.
+	if strings.Contains(s, ".") {
+		return 0, fmt.Errorf(
+			"counter field %q must be an integer, not a decimal (got %q)", fieldName, s)
+	}
+	// Reject leading zeros (except literal "0").
+	if len(s) > 1 && s[0] == '0' {
+		return 0, fmt.Errorf(
+			"counter field %q must not have a leading zero (got %q)", fieldName, s)
+	}
+	// Parse as uint64.
+	v, parseErr := parseUint64(s)
+	if parseErr != nil {
+		return 0, fmt.Errorf(
+			"counter field %q is not a valid uint64 (got %q): %w", fieldName, s, parseErr)
+	}
+	return v, nil
+}
+
+// parseUint64 parses a non-negative decimal string as a uint64.
+// Returns an error on overflow or non-digit characters.
+func parseUint64(s string) (uint64, error) {
+	if s == "" {
+		return 0, fmt.Errorf("empty string")
+	}
+	var result uint64
+	const maxVal = math.MaxUint64
+	const maxValDivBy10 = maxVal / 10
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return 0, fmt.Errorf("non-digit character %q", c)
+		}
+		d := uint64(c - '0')
+		if result > maxValDivBy10 || (result == maxValDivBy10 && d > maxVal%10) {
+			return 0, fmt.Errorf("value overflows uint64")
+		}
+		result = result*10 + d
+	}
+	return result, nil
+}
+
+// isValidSHALowercase returns true if s is a valid 64-char lowercase hex string
+// (BLAKE2b-256 / SHA-256 artifact SHA as used in target_artifact_sha).
+func isValidSHALowercase64(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for _, c := range s {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// validateCounterFileSemantics applies the post-decode semantic invariants
+// for the counter file schema. All failures are returned as plain errors; the
+// caller wraps them with ErrCounterStoreUnreadable.
+func validateCounterFileSemantics(cf counterFileParsed, projectID, fileName string) error {
+	// project_id must match caller-supplied projectID byte-for-byte.
+	if cf.ProjectID != projectID {
+		return fmt.Errorf(
+			"project_id field %q does not match expected %q",
+			cf.ProjectID, projectID)
+	}
+	// file must match caller-supplied fileName byte-for-byte.
+	if cf.File != fileName {
+		return fmt.Errorf(
+			"file field %q does not match expected %q", cf.File, fileName)
+	}
+	// last_accepted_counter == 0 implies last_pr must be empty.
+	if cf.LastAcceptedCounter == 0 && cf.LastPR != "" {
+		return fmt.Errorf(
+			"last_pr must be empty when last_accepted_counter is 0 (got %q)",
+			cf.LastPR)
+	}
+	// last_accepted_counter > 0 implies last_pr must be non-empty.
+	if cf.LastAcceptedCounter > 0 && cf.LastPR == "" {
+		return fmt.Errorf(
+			"last_pr must be non-empty when last_accepted_counter is %d",
+			cf.LastAcceptedCounter)
+	}
+	// Validate pending record if present.
+	if cf.Pending != nil {
+		p := cf.Pending
+		// pending_counter must be exactly last_accepted_counter + 1.
+		if p.PendingCounter != cf.LastAcceptedCounter+1 {
+			return fmt.Errorf(
+				"pending.pending_counter %d must equal last_accepted_counter %d + 1",
+				p.PendingCounter, cf.LastAcceptedCounter)
+		}
+		// target_artifact_sha must be 64 lowercase hex chars.
+		if !isValidSHALowercase64(p.TargetArtifactSHA) {
+			return fmt.Errorf(
+				"pending.target_artifact_sha %q is not a 64-char lowercase hex string",
+				p.TargetArtifactSHA)
+		}
+		// target_pr must be non-empty when pending is present.
+		if p.TargetPR == "" {
+			return fmt.Errorf(
+				"pending.target_pr must not be empty when pending record is present")
+		}
+		// intent_at must be non-empty when pending is present.
+		if p.IntentAt == "" {
+			return fmt.Errorf(
+				"pending.intent_at must not be empty when pending record is present")
+		}
+	}
+	return nil
+}
+
+// Compile-time assertion: productionFetchTransport satisfies FetchTransport.
+var _ FetchTransport = (*productionFetchTransport)(nil)

@@ -119,6 +119,29 @@ var (
 	ErrNoTrustedSigner = errors.New(
 		"no trusted manifest signer key available — " +
 			"run `byreis doctor` to check your trust anchor, or `byreis auth login`")
+
+	// ErrAdminSetUnreadable: the registry admin set is unreadable at the
+	// signature-verified HEAD (absent, malformed, or empty admins.yaml) and
+	// admin operations are blocked. This sentinel is owned by this package so
+	// that the adapter references it here directly, keeping sentinel ownership
+	// single-canonical per layer. The adapter wraps it with %w and an actionable
+	// hint; callers inspect it via errors.Is.
+	ErrAdminSetUnreadable = errors.New(
+		"registry admin set is unreadable at the signature-verified HEAD " +
+			"(absent/malformed/empty admins.yaml) — admin operations are blocked; " +
+			"run `byreis doctor` to diagnose")
+
+	// ErrCounterStoreUnreadable: the counter store file is unreadable at the
+	// signature-verified HEAD. An absent file is not this error — absent returns
+	// (0,nil,nil) meaning the counter has never been written. This sentinel
+	// covers malformed, over-size, duplicate-key, schema-invalid, or
+	// semantic-invariant-violated counter JSON where counter authority cannot
+	// be established. The sentinel is owned here so the adapter can reference
+	// it without the reverse-dependency violation of defining it in adapter code.
+	ErrCounterStoreUnreadable = errors.New(
+		"registry counter store is unreadable at the signature-verified HEAD " +
+			"(malformed/over-size/schema-invalid counter JSON) — " +
+			"counter authority cannot be established; run `byreis doctor` to diagnose")
 )
 
 // PendingBumpInput carries the write-ahead intent recorded before a

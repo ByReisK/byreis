@@ -35,6 +35,7 @@ import (
 	"github.com/ByReisK/byreis/internal/adapter/registry/internal/capmint"
 	coreregistry "github.com/ByReisK/byreis/internal/core/registry"
 	"github.com/ByReisK/byreis/internal/core/registry/countertypes"
+	"github.com/ByReisK/byreis/internal/core/registry/rectypes"
 )
 
 // ErrSourceNotVerified is returned by CounterAuthority when the counter store
@@ -86,6 +87,19 @@ type ProjectConfig struct {
 	Files map[string]string
 }
 
+// ParsedAdminData is the parsed admin set returned by FetchTransport.ReadAdmins.
+// It carries only domain value types — no YAML, SDK, or transport types cross
+// this boundary. The adapter maps transport+YAML bytes to these domain values at
+// the edge before returning.
+type ParsedAdminData struct {
+	// Recipients is the parsed age recipient set for the project. Each entry is
+	// pre-validated (non-empty AgePubKey, non-zero Fingerprint) before return.
+	Recipients []rectypes.Recipient
+	// SignerKeys maps admin id → Ed25519 trusted manifest-signing public key.
+	// Keys are pre-validated to exactly 32 bytes inside ReadAdmins before return.
+	SignerKeys map[string]coreregistry.SignerKey
+}
+
 // FetchTransport is the port for fetching registry data. The adapter calls this
 // to fetch the HEAD commit, commit signature, counter store files, and the
 // per-project configuration tree. It is consumer-defined (inner layer defines
@@ -100,8 +114,12 @@ type FetchTransport interface {
 	IsAncestor(ctx context.Context, repoURL, ancestor, tip string) (bool, error)
 
 	// ReadCounter reads the last_accepted_counter and pending bump for the
-	// given project/file from the registry store.
-	ReadCounter(ctx context.Context, repoURL, projectID, fileName string) (lastAccepted uint64, pending *countertypes.PendingBump, err error)
+	// given project/file from the registry store at the exact headCommit SHA
+	// that FetchHead verified. The headCommit parameter is the SHA returned by
+	// the immediately preceding FetchHead call; the implementation uses it as
+	// the authoritative blob-read ref and to bind the clone session to this
+	// specific verified commit (same-clone provenance, no TOCTOU window).
+	ReadCounter(ctx context.Context, repoURL, headCommit, projectID, fileName string) (lastAccepted uint64, pending *countertypes.PendingBump, err error)
 
 	// WriteCounter writes/updates the pending bump record as a signed commit.
 	WriteCounter(ctx context.Context, repoURL, projectID, fileName string, pending *countertypes.PendingBump) error
@@ -122,6 +140,31 @@ type FetchTransport interface {
 	// ProjectConfig with no error (the project has no configured files yet).
 	// Only network/parse errors return a non-nil error.
 	ReadProjectConfig(ctx context.Context, repoURL, headCommit, projectID string) (ProjectConfig, error)
+
+	// ReadAdmins reads and parses the registry admin set (admins.yaml plus the
+	// per-project recipient binding) from the registry tree at the EXACT
+	// signature-verified headCommit SHA returned by FetchHead. It returns the
+	// age recipient set and the Ed25519 trusted-signer set as domain values
+	// (no SDK, transport, or YAML types). The implementation MUST read the tree
+	// object at the pinned commit SHA — never HEAD, never a re-resolved ref —
+	// so there is no TOCTOU window between signature verification and the
+	// admins read (same no-refetch discipline as ReadProjectConfig).
+	//
+	// An absent or unparseable admins.yaml is a non-nil error (fail closed).
+	// An empty recipient set or empty signer set is also a non-nil error.
+	// A wrong-length or non-base64 signer/recipient field is a non-nil error.
+	// A duplicate admin id is a non-nil typed error.
+	// A projectID that fails ValidateProjectID must be rejected before any path
+	// composition and FetchCommittedFile must never be called in that case.
+	ReadAdmins(ctx context.Context, repoURL, headCommit, projectID string) (ParsedAdminData, error)
+
+	// DiscardCounterSession cleans up the counter-active session keyed by
+	// headCommit without calling IsAncestor. The CounterAuthority orchestrator
+	// calls this on the two no-ancestor branches (cold-cache first-call and
+	// warm-cache identical-HEAD) so sessions do not leak when IsAncestor is
+	// skipped. Implementations that do not maintain session state (e.g. test
+	// fakes) implement this as a no-op.
+	DiscardCounterSession(ctx context.Context, headCommit string)
 }
 
 // Client is the RegistryClient implementation.
@@ -235,33 +278,61 @@ func (c *Client) FetchAdminSet(ctx context.Context, projectID string) (coreregis
 		return coreregistry.AdminSet{}, fmt.Errorf("%w", coreregistry.ErrUnsignedRegistry)
 	}
 
-	// Head is verified. Fetch the admin set data from the registry.
-	// When no real transport is configured returning structured data, we construct
-	// a placeholder that is signature-verified. A real transport would return
-	// the parsed admins.yaml / projects/*.yaml content.
+	// Head is verified. Read the admin set from the registry at the EXACT same
+	// commit SHA that FetchHead verified. Both ReadAdmins and ReadProjectConfig
+	// use this same `commit` local variable — there is no second FetchHead, no
+	// branch/tag/HEAD ref, and no RegistryURL re-resolution (no TOCTOU window).
+	//
+	// ReadAdmins failure on the verified path is FATAL: return AdminSet{} with a
+	// wrapped sentinel before any cache write (a broken verified fetch must not
+	// poison the last-known-good cache). Do NOT copy the ReadProjectConfig
+	// _ = cfgErr swallow pattern — ReadAdmins is trust-bearing.
+	adminData, adminsErr := c.cfg.FetchTransport.ReadAdmins(
+		ctx, c.cfg.RegistryURL, commit, projectID)
+	if adminsErr != nil {
+		// Return before any cache write — fatal on the verified path.
+		return coreregistry.AdminSet{}, fmt.Errorf(
+			"registry FetchAdminSet: reading admin set at verified HEAD %q: %w — "+
+				"run `byreis doctor` to diagnose", commit, adminsErr)
+	}
+
+	// Guard: parsed-but-empty recipient or signer set at verified HEAD is fatal.
+	if len(adminData.Recipients) == 0 {
+		return coreregistry.AdminSet{}, fmt.Errorf(
+			"%w: no recipients in admins.yaml at verified HEAD %q — "+
+				"run `byreis doctor` to diagnose",
+			coreregistry.ErrAdminSetUnreadable, commit)
+	}
+	if len(adminData.SignerKeys) == 0 {
+		return coreregistry.AdminSet{}, fmt.Errorf(
+			"%w: no signer keys in admins.yaml at verified HEAD %q — "+
+				"run `byreis doctor` to diagnose",
+			coreregistry.ErrNoTrustedSigner, commit)
+	}
+
 	adminSet := coreregistry.AdminSet{
 		ProjectID:      projectID,
 		SourceVerified: true,
 		Stale:          false,
 		FetchedAt:      c.cfg.Clock(),
 		HeadCommit:     commit,
+		Recipients:     adminData.Recipients,
+		SignerKeys:     adminData.SignerKeys,
 	}
 
 	// On the SourceVerified path, read the per-project config from the SAME
-	// verified registry tree. The headCommit here is the commit whose signature
-	// was just verified — reading at this exact commit avoids a TOCTOU window.
-	// An absent projects/<projectID>.yaml yields empty ConfiguredFiles (not an error).
+	// verified registry tree. The headCommit here is the same `commit` variable
+	// whose signature was just verified — reading at this exact commit avoids a
+	// TOCTOU window. An absent projects/<projectID>.yaml yields empty
+	// ConfiguredFiles (not an error — the project may not have a config yet).
 	projCfg, cfgErr := c.cfg.FetchTransport.ReadProjectConfig(
 		ctx, c.cfg.RegistryURL, commit, projectID)
 	if cfgErr != nil {
 		// A parse or network error reading the project config is not fatal for the
-		// admin set fetch as a whole — the adminSet is still SourceVerified.
-		// However, an empty/nil ConfiguredFiles means the merge cross-check cannot
-		// proceed (the wrapper gate will block it). Log via the error string in
-		// StaleReason is not appropriate here; the caller sees the error through the
-		// use-case layer. We leave ConfiguredFiles nil and surface the read error
-		// as a wrapped advisory — the adminSet is still returned as SourceVerified
-		// but the merge guard will block on missing ConfiguredFiles.
+		// admin set fetch as a whole — the adminSet is still SourceVerified with
+		// Recipients and SignerKeys populated. An empty ConfiguredFiles means the
+		// merge cross-check cannot proceed (the wrapper gate blocks it), but that
+		// is a separate, lesser concern than the recipient/signer surfacing.
 		_ = cfgErr // ConfiguredFiles stays nil; merge gate blocks if cross-check required
 	} else if len(projCfg.Files) > 0 {
 		adminSet.ConfiguredFiles = make(map[string]string, len(projCfg.Files))
@@ -270,12 +341,15 @@ func (c *Client) FetchAdminSet(ctx context.Context, projectID string) (coreregis
 		}
 	}
 
-	// Validate all signer key lengths at this boundary.
+	// Validate all signer key lengths at this boundary. ReadAdmins pre-validates
+	// key lengths, but this egress call remains on every cache path (verified,
+	// stale-cache, offline) as a defense-in-depth boundary.
 	if err := ValidateSignerKeyLengths(adminSet); err != nil {
 		return coreregistry.AdminSet{}, err
 	}
 
-	// Update the cache and head cache.
+	// Update the cache and head cache. This write happens AFTER all validation
+	// passes — a fatal verified-but-broken fetch returns before reaching here.
 	c.setCached(projectID, adminSet)
 	c.setHeadCached(projectID, commit)
 
@@ -390,9 +464,13 @@ func (c *Client) CounterAuthority(ctx context.Context, projectID, fileName strin
 			ErrSourceNotVerified, headCommit)
 	}
 
-	// Read the counter store value from the verified registry.
+	// Read the counter store value from the verified registry at the exact
+	// headCommit SHA that FetchHead returned. Passing headCommit here binds
+	// the ReadCounter call to the same clone session that FetchHead created,
+	// preventing any TOCTOU window between signature verification and the
+	// counter store read.
 	lastAccepted, pending, readErr := c.cfg.FetchTransport.ReadCounter(
-		ctx, c.cfg.RegistryURL, projectID, fileName)
+		ctx, c.cfg.RegistryURL, headCommit, projectID, fileName)
 	if readErr != nil {
 		return countertypes.CounterAuthority{}, fmt.Errorf(
 			"registry CounterAuthority: reading counter store: %w — "+
@@ -433,6 +511,8 @@ func (c *Client) CounterAuthority(ctx context.Context, projectID, fileName strin
 		// The HEAD has changed since our last observation. Verify that the new HEAD
 		// is a fast-forward descendant of the last observed HEAD. A transport error
 		// here is fail-closed: we cannot confirm ancestry, so no Valid() authority.
+		// The counter-active session is consumed by IsAncestor (it pops and defers
+		// cleanup internally); no DiscardCounterSession call is needed on this branch.
 		isAnc, ancErr := c.cfg.FetchTransport.IsAncestor(
 			ctx, c.cfg.RegistryURL, lastHead, headCommit)
 		if ancErr != nil {
@@ -447,6 +527,11 @@ func (c *Client) CounterAuthority(ctx context.Context, projectID, fileName strin
 					"possible registry rollback; run `byreis admin registry verify` to diagnose",
 				coreregistry.ErrRegistryRollback, headCommit, lastHead)
 		}
+	} else {
+		// IsAncestor was not called on this branch (either cold-cache first-call or
+		// warm-cache identical-HEAD). The counter-active session deposited by
+		// ReadCounter must be discarded here so it does not leak.
+		c.cfg.FetchTransport.DiscardCounterSession(ctx, headCommit)
 	}
 
 	// Update head cache: the freshness check passed (or there was no prior observation).
@@ -596,6 +681,16 @@ func (c *Client) setHeadCached(projectID, commit string) {
 	c.headCache[projectID] = commit
 }
 
+// SeedHeadCacheForTest injects a known HEAD commit into the headCache for the
+// given projectID. This is a test-only method that allows test code to exercise
+// the warm-cache ancestry branch without executing a real FetchHead. It is safe
+// to call from tests; production code must never call it.
+func (c *Client) SeedHeadCacheForTest(projectID, headCommit string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.headCache[projectID] = headCommit
+}
+
 // offlineFallback serves a cached admin set with Stale=true, or returns
 // ErrRegistryOffline if nothing is cached.
 //
@@ -719,7 +814,7 @@ func (f *fakeAncestryTransport) IsAncestor(_ context.Context, _, _, _ string) (b
 	return f.isAncestor, nil
 }
 
-func (f *fakeAncestryTransport) ReadCounter(_ context.Context, _, _, _ string) (uint64, *countertypes.PendingBump, error) {
+func (f *fakeAncestryTransport) ReadCounter(_ context.Context, _, _, _, _ string) (uint64, *countertypes.PendingBump, error) {
 	return 0, nil, nil
 }
 
@@ -735,6 +830,12 @@ func (f *fakeAncestryTransport) ReadProjectConfig(_ context.Context, _, _, _ str
 	return ProjectConfig{}, nil
 }
 
+func (f *fakeAncestryTransport) ReadAdmins(_ context.Context, _, _, _ string) (ParsedAdminData, error) {
+	return ParsedAdminData{}, nil
+}
+
+func (f *fakeAncestryTransport) DiscardCounterSession(_ context.Context, _ string) {}
+
 // fakeUnsignedHeadTransport simulates a registry whose HEAD is not
 // signature-verified (unsigned commit).
 type fakeUnsignedHeadTransport struct{}
@@ -747,7 +848,7 @@ func (f *fakeUnsignedHeadTransport) IsAncestor(_ context.Context, _, _, _ string
 	return true, nil
 }
 
-func (f *fakeUnsignedHeadTransport) ReadCounter(_ context.Context, _, _, _ string) (uint64, *countertypes.PendingBump, error) {
+func (f *fakeUnsignedHeadTransport) ReadCounter(_ context.Context, _, _, _, _ string) (uint64, *countertypes.PendingBump, error) {
 	return 0, nil, nil
 }
 
@@ -762,3 +863,9 @@ func (f *fakeUnsignedHeadTransport) CommitCounter(_ context.Context, _, _, _ str
 func (f *fakeUnsignedHeadTransport) ReadProjectConfig(_ context.Context, _, _, _ string) (ProjectConfig, error) {
 	return ProjectConfig{}, nil
 }
+
+func (f *fakeUnsignedHeadTransport) ReadAdmins(_ context.Context, _, _, _ string) (ParsedAdminData, error) {
+	return ParsedAdminData{}, nil
+}
+
+func (f *fakeUnsignedHeadTransport) DiscardCounterSession(_ context.Context, _ string) {}

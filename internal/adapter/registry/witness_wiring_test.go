@@ -367,7 +367,7 @@ func (u *unverifiedHeadCounterTransport) FetchHead(_ context.Context, _ string, 
 func (u *unverifiedHeadCounterTransport) IsAncestor(_ context.Context, _, _, _ string) (bool, error) {
 	return true, nil
 }
-func (u *unverifiedHeadCounterTransport) ReadCounter(_ context.Context, _, _, _ string) (uint64, *countertypes.PendingBump, error) {
+func (u *unverifiedHeadCounterTransport) ReadCounter(_ context.Context, _, _, _, _ string) (uint64, *countertypes.PendingBump, error) {
 	return u.lastAccepted, nil, nil
 }
 func (u *unverifiedHeadCounterTransport) WriteCounter(_ context.Context, _, _, _ string, _ *countertypes.PendingBump) error {
@@ -379,6 +379,10 @@ func (u *unverifiedHeadCounterTransport) CommitCounter(_ context.Context, _, _, 
 func (u *unverifiedHeadCounterTransport) ReadProjectConfig(_ context.Context, _, _, _ string) (registry.ProjectConfig, error) {
 	return registry.ProjectConfig{}, nil
 }
+func (u *unverifiedHeadCounterTransport) ReadAdmins(_ context.Context, _, _, _ string) (registry.ParsedAdminData, error) {
+	return registry.ParsedAdminData{}, nil
+}
+func (u *unverifiedHeadCounterTransport) DiscardCounterSession(_ context.Context, _ string) {}
 
 // ancestryErrorTransport simulates a transport where FetchHead returns a
 // different HEAD commit (triggering an ancestry check) but IsAncestor returns
@@ -395,7 +399,7 @@ func (a *ancestryErrorTransport) FetchHead(_ context.Context, _ string, _ ed2551
 func (a *ancestryErrorTransport) IsAncestor(_ context.Context, _, _, _ string) (bool, error) {
 	return false, errors.New("ancestry transport error: network unreachable")
 }
-func (a *ancestryErrorTransport) ReadCounter(_ context.Context, _, _, _ string) (uint64, *countertypes.PendingBump, error) {
+func (a *ancestryErrorTransport) ReadCounter(_ context.Context, _, _, _, _ string) (uint64, *countertypes.PendingBump, error) {
 	return a.lastAccepted, nil, nil
 }
 func (a *ancestryErrorTransport) WriteCounter(_ context.Context, _, _, _ string, _ *countertypes.PendingBump) error {
@@ -407,6 +411,10 @@ func (a *ancestryErrorTransport) CommitCounter(_ context.Context, _, _, _ string
 func (a *ancestryErrorTransport) ReadProjectConfig(_ context.Context, _, _, _ string) (registry.ProjectConfig, error) {
 	return registry.ProjectConfig{}, nil
 }
+func (a *ancestryErrorTransport) ReadAdmins(_ context.Context, _, _, _ string) (registry.ParsedAdminData, error) {
+	return registry.ParsedAdminData{}, nil
+}
+func (a *ancestryErrorTransport) DiscardCounterSession(_ context.Context, _ string) {}
 
 // verifiedSourceTransport simulates a fully-verified transport for the positive
 // end-to-end test: FetchHead returns verified=true, IsAncestor returns true,
@@ -422,7 +430,7 @@ func (v *verifiedSourceTransport) FetchHead(_ context.Context, _ string, _ ed255
 func (v *verifiedSourceTransport) IsAncestor(_ context.Context, _, _, _ string) (bool, error) {
 	return true, nil
 }
-func (v *verifiedSourceTransport) ReadCounter(_ context.Context, _, _, _ string) (uint64, *countertypes.PendingBump, error) {
+func (v *verifiedSourceTransport) ReadCounter(_ context.Context, _, _, _, _ string) (uint64, *countertypes.PendingBump, error) {
 	return v.lastAccepted, nil, nil
 }
 func (v *verifiedSourceTransport) WriteCounter(_ context.Context, _, _, _ string, _ *countertypes.PendingBump) error {
@@ -434,3 +442,7 @@ func (v *verifiedSourceTransport) CommitCounter(_ context.Context, _, _, _ strin
 func (v *verifiedSourceTransport) ReadProjectConfig(_ context.Context, _, _, _ string) (registry.ProjectConfig, error) {
 	return registry.ProjectConfig{}, nil
 }
+func (v *verifiedSourceTransport) ReadAdmins(_ context.Context, _, _, _ string) (registry.ParsedAdminData, error) {
+	return registry.ParsedAdminData{}, nil
+}
+func (v *verifiedSourceTransport) DiscardCounterSession(_ context.Context, _ string) {}
