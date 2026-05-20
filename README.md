@@ -69,6 +69,32 @@ implemented. Interfaces and on-disk formats may still change before `v0.1`.
 - `rotate`, `share`, `revoke`, self-service access requests
 - GitLab support, bulk submit
 
+## Admin registry requirements
+
+The admin registry repository (the one pointed to by `.byreis.yaml` in each
+project repo) **must** have the following branch-protection rules on `main`
+before any `byreis admin merge` or counter-write operation is attempted:
+
+- **Signed commits required (byreis-aware status check)** — the registry must
+  run a byreis verifier as a CI gate on `main` that validates the
+  `byreis-signer:` / `byreis-sig:` footer in each counter commit against the
+  registry's signer roster. GitHub's native "Require signed commits"
+  branch-protection rule is **not** the enforcement point and must not be
+  relied on, because byreis embeds its Ed25519 signature in the commit
+  message body (preserving the signer port abstraction) rather than in the
+  commit object's `gpgsig` header.
+- **Linear history** — no merge commits; rebase-only. Ensures counter
+  monotonicity.
+- **No force-push** — ordinary `git push --force` is rejected. byreis uses
+  `--force-with-lease` (CAS) to detect concurrent writes; if the remote accepts
+  force-pushes, the concurrent-write guard loses its effectiveness.
+- **No branch deletion** — protects the history that signed-commit verification
+  and anti-rollback checks rely on.
+
+Counter writes (`WriteCounter` / `CommitCounter`) validate these requirements at
+push time and surface `ErrRegistryWriteRejected` if the remote refuses the push.
+If you see that error, verify the branch-protection configuration above.
+
 ## Contributing
 
 byreis is in active early development and not yet ready for production use.

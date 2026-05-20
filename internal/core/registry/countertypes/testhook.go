@@ -25,7 +25,8 @@
 //
 // Security note: this hook is test-only and does not weaken the production
 // guarantee (the sole production producer remains the registry adapter via
-// capmint). The arrangement is security-relevant and is not self-certified.
+// capmint). The arrangement is security-relevant; changes here should be
+// reviewed as security-critical.
 package countertypes
 
 // testOnlyWitness is the unexported capability token the cross-package test

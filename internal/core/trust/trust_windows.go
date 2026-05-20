@@ -106,7 +106,7 @@ func isSymlinkError(err error) bool {
 }
 
 // checkOwner returns ErrTrustOwnershipUnverifiable on Windows. SID-level
-// ownership checking is deferred to a follow-up slice. The binary fails closed:
+// ownership checking is deferred to a follow-up change. The binary fails closed:
 // a Windows operator cannot use the trust anchor until ownership verification
 // is implemented. See the package-level doc comment for operator guidance.
 func checkOwner(_ fs.FileInfo, path string) error {
@@ -114,13 +114,13 @@ func checkOwner(_ fs.FileInfo, path string) error {
 }
 
 // checkDirMode is a no-op on Windows: POSIX permission bits are not applicable.
-// Windows ACL enforcement is deferred to a follow-up slice.
+// Windows ACL enforcement is deferred to a follow-up change.
 func checkDirMode(_ fs.FileInfo, _ string) error {
 	return nil
 }
 
 // checkFileMode is a no-op on Windows: POSIX permission bits are not
-// applicable. Windows ACL enforcement is deferred to a follow-up slice.
+// applicable. Windows ACL enforcement is deferred to a follow-up change.
 func checkFileMode(_ fs.FileInfo, _ string) error {
 	return nil
 }

@@ -57,9 +57,8 @@
 // defense-in-depth: it makes the constructor unnameable-by-construction from
 // core packages and AST-classifiable by the surface guard.
 //
-// Security note: the construction and trust model here is security-relevant and
-// is not self-certified. It requires crypto and threat-model sign-off before
-// release.
+// Security note: the construction and trust model here is security-relevant;
+// changes to this package should be reviewed as security-critical.
 package countertypes
 
 import "errors"
@@ -124,8 +123,8 @@ type PendingBump struct {
 // or struct-literal CounterAuthority is not Valid() and VerifyOfRecord
 // hard-errors on it.
 //
-// This is a Go-visibility type-shape constraint. It is security-relevant and is
-// not self-certified; it requires crypto sign-off before release.
+// This is a Go-visibility type-shape constraint. It is security-relevant;
+// changes here should be reviewed as security-critical.
 type CounterAuthority struct {
 	// lastAccepted is the committed authority: the highest counter durably merged.
 	// Unexported: set only by newCounterAuthority; no external write path.

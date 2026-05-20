@@ -42,11 +42,11 @@ jobs:
           go-version: "1.26.x"
           cache: true
       - name: Assert release build carries no testhook / build-influencing env
-        # Fail-closed half of the testhook control gate (ADR-0006 / DESIGN
-        # §7.2-D1) on the RELEASE path. The symbol-absence half is the Go AST
-        # test TestShippedSurface_* (run by the shipgate job below under
-        # DEFAULT tags, which gates this release via needs: [shipgate]). This
-        # step asserts the release build invocation itself is clean.
+        # Fail-closed half of the testhook control gate on the RELEASE path.
+        # The symbol-absence half is the Go AST test TestShippedSurface_*
+        # (run by the shipgate job below under DEFAULT tags, which gates this
+        # release via needs: [shipgate]). This step asserts the release build
+        # invocation itself is clean.
         run: |
           set -euo pipefail
           if [ -n "${GOFLAGS:-}" ]; then

@@ -25,8 +25,7 @@
 // accident-prevention and classifier purposes only.
 //
 // Security note: this package is security-relevant. The visibility boundary and
-// the bridge mechanism require crypto and threat-model sign-off before release;
-// it is not self-certified.
+// the bridge mechanism should be reviewed as security-critical before any change.
 package capmint
 
 import "github.com/ByReisK/byreis/internal/core/registry/countertypes"

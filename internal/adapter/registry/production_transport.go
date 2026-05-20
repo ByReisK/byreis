@@ -110,6 +110,23 @@ func (q *sessionQueue) pop() *cloneSession {
 	return s
 }
 
+// FetchTransportWriteConfig holds injected write-path dependencies for the
+// production fetch transport. These are optional: when nil the write methods
+// return ErrRegistryWriteAuth immediately, which is correct for any path that
+// doesn't need counter writes (contributor paths, read-only tools).
+type FetchTransportWriteConfig struct {
+	// Signer is the ADMIN-only commit signer. It reuses the ManifestSigner
+	// adapter — no new key material and no parallel signer path. Production
+	// wiring passes the same ManifestSigner instance used by the merge use-case.
+	// Must not be nil if counter writes are required.
+	Signer RegistryWriteSigner
+
+	// TokenProvider is the ADMIN-only registry-write credential provider.
+	// The implementation consults the mode gate and refuses to return a token
+	// in CONTRIBUTOR mode. Must not be nil if counter writes are required.
+	TokenProvider RegistryWriteTokenProvider
+}
+
 // productionFetchTransport is the production implementation of FetchTransport.
 // It satisfies the full interface: FetchHead creates a clone and retains it
 // for the duration of the FetchAdminSet call. ReadAdmins and ReadProjectConfig
@@ -117,6 +134,10 @@ func (q *sessionQueue) pop() *cloneSession {
 // (via the session cleanup) after ReadProjectConfig completes or on any error.
 type productionFetchTransport struct {
 	verifier *fetchtransport.HeadVerifier
+
+	// writeCfg holds the optional write-path dependencies (Signer + TokenProvider).
+	// When nil the write methods fail with ErrRegistryWriteAuth.
+	writeCfg *FetchTransportWriteConfig
 
 	// pendingMu + pendingSessions: sessions created by FetchHead, awaiting
 	// ReadAdmins. Maps verified SHA → FIFO queue.
@@ -140,8 +161,10 @@ type productionFetchTransport struct {
 }
 
 // NewProductionFetchTransport constructs a productionFetchTransport. The
-// verifier is required; returns an error if it is nil.
-func NewProductionFetchTransport(v *fetchtransport.HeadVerifier) (*productionFetchTransport, error) {
+// verifier is required; returns an error if it is nil. The optional writeCfg
+// enables the counter-write path (WriteCounter/CommitCounter); pass nil for
+// read-only use.
+func NewProductionFetchTransport(v *fetchtransport.HeadVerifier, writeCfg *FetchTransportWriteConfig) (*productionFetchTransport, error) {
 	if v == nil {
 		return nil, errors.New(
 			"registry.NewProductionFetchTransport: HeadVerifier is required — " +
@@ -149,6 +172,7 @@ func NewProductionFetchTransport(v *fetchtransport.HeadVerifier) (*productionFet
 	}
 	return &productionFetchTransport{
 		verifier:              v,
+		writeCfg:              writeCfg,
 		pendingSessions:       make(map[string]*sessionQueue),
 		activeSessions:        make(map[string]*sessionQueue),
 		counterActiveSessions: make(map[string]*sessionQueue),
@@ -191,8 +215,9 @@ func (SubprocessRunner) Run(ctx context.Context, dir string, env []string, name 
 // NewProductionFetchTransportFromRunner constructs a productionFetchTransport
 // using a SubprocessRunner for the HeadVerifier. This is the wiring entrypoint
 // for cmd/byreis/main.go which cannot import the internal fetchtransport
-// sub-package directly.
-func NewProductionFetchTransportFromRunner(runner SubprocessRunner) (*productionFetchTransport, error) {
+// sub-package directly. Pass a non-nil writeCfg to enable the counter-write
+// path; pass nil for read-only tools.
+func NewProductionFetchTransportFromRunner(runner SubprocessRunner, writeCfg *FetchTransportWriteConfig) (*productionFetchTransport, error) {
 	v, err := fetchtransport.NewHeadVerifier(fetchtransport.HeadVerifierConfig{
 		Runner:    runner,
 		MkdirTemp: os.MkdirTemp,
@@ -202,7 +227,7 @@ func NewProductionFetchTransportFromRunner(runner SubprocessRunner) (*production
 		return nil, fmt.Errorf(
 			"registry.NewProductionFetchTransportFromRunner: constructing head verifier: %w", err)
 	}
-	return NewProductionFetchTransport(v)
+	return NewProductionFetchTransport(v, writeCfg)
 }
 
 // FetchHead delegates VERBATIM to HeadVerifier.VerifyHeadRetainClone.
@@ -494,8 +519,30 @@ func (t *productionFetchTransport) ReadCounter(ctx context.Context, _ string, he
 	raw, readErr := t.verifier.ReadBlobAtSHA(ctx, sess.cloneDir, headCommit, blobPath)
 	if readErr != nil {
 		if fetchtransport.IsBlobNotFound(readErr) {
-			// Absent counter file: treat as zero counter (freshly-created project).
-			// Session cleanup happens via the deferred cleanedUp guard.
+			// Counter file is absent. Counter-coverage rule: for a cold project (no
+			// projects/<projectID>.yaml listing this file at the verified HEAD),
+			// this is safe — zero counter is correct. For a warm project
+			// (projects/<projectID>.yaml exists and lists this fileName), a missing
+			// counter is an integrity violation: every first merge MUST create the
+			// counter. Warm + absent → ErrCounterReconcile (terminal).
+			isWarm, warmErr := t.isWarmProject(ctx, sess.cloneDir, headCommit, projectID, fileName)
+			if warmErr != nil {
+				// Cannot determine warmth: fail closed — treat as warm (integrity unknown).
+				return 0, nil, fmt.Errorf(
+					"%w: ReadCounter: cannot determine project warmth for absent-counter "+
+						"integrity check — run `byreis doctor`",
+					coreregistry.ErrCounterStoreUnreadable)
+			}
+			if isWarm {
+				// Warm project with no counter file: integrity violation.
+				return 0, nil, fmt.Errorf(
+					"%w: ReadCounter: counter file %q absent at %q but project "+
+						"%q has a configured file %q — the first merge must create "+
+						"the counter; run `byreis admin counter reconcile` to diagnose",
+					countertypes.ErrCounterReconcile,
+					blobPath, headCommit, projectID, fileName)
+			}
+			// Cold project: zero counter is correct.
 			return 0, nil, nil
 		}
 		return 0, nil, fmt.Errorf(
@@ -531,7 +578,7 @@ func (t *productionFetchTransport) ReadCounter(ctx context.Context, _ string, he
 			coreregistry.ErrCounterStoreUnreadable, err, blobPath, headCommit)
 	}
 
-	// Decode into the strict typed struct mirroring ADR-0006 lines 75-88 exactly.
+	// Decode into the strict typed struct matching the counter store wire format.
 	cf, decErr := decodeCounterFile(raw)
 	if decErr != nil {
 		return 0, nil, fmt.Errorf(
@@ -546,6 +593,22 @@ func (t *productionFetchTransport) ReadCounter(ctx context.Context, _ string, he
 			"%w: ReadCounter: semantic validation of counter blob %q at %q: %v — "+
 				"run `byreis doctor`",
 			coreregistry.ErrCounterStoreUnreadable, blobPath, headCommit, err)
+	}
+
+	// When a pending record is present, verify parent_commit_sha: the parent of
+	// the commit that introduced the pending record must match the
+	// parent_commit_sha recorded in the pending sub-object. This is the
+	// captured-commit-replay defence: a captured signed counter commit cannot be
+	// silently reused at a different HEAD position because the parent SHA is
+	// embedded in the signed (git-signed) commit message AND in the counter JSON.
+	if cf.Pending != nil {
+		if err := t.verifyPendingParentSHA(ctx, sess.cloneDir, headCommit, blobPath, cf.Pending.ParentCommitSHA); err != nil {
+			return 0, nil, fmt.Errorf(
+				"%w: ReadCounter: parent_commit_sha mismatch in counter blob %q at %q: %v — "+
+					"possible replayed or misplaced counter commit; "+
+					"run `byreis admin counter reconcile`",
+				countertypes.ErrCounterReconcile, blobPath, headCommit, err)
+		}
 	}
 
 	// Build the domain PendingBump if the pending record is present.
@@ -578,18 +641,653 @@ func (t *productionFetchTransport) DiscardCounterSession(_ context.Context, head
 	}
 }
 
-// WriteCounter is not yet implemented in the production path.
-func (t *productionFetchTransport) WriteCounter(_ context.Context, _, _, _ string, _ *countertypes.PendingBump) error {
-	return fmt.Errorf(
-		"WriteCounter not yet implemented in production transport — " +
-			"run `byreis doctor` to diagnose registry connectivity")
+// writeTimeout is the bounded execution ceiling for a git push subprocess.
+const writeTimeout = 60 * time.Second
+
+// WriteCounter writes a signed commit to the registry that records the pending
+// bump intent. The commit message body carries the canonical signed envelope:
+// project_id, file, expected_previous_counter, pending_counter,
+// target_artifact_sha, target_pr, and parent_commit_sha (replay anchor).
+//
+// The push is conditional (force-if-includes / non-fast-forward CAS): if the
+// registry HEAD moved between the fetch and this push, the push fails with
+// ErrRegistryConcurrentWrite so the caller can retry from step 1.
+//
+// The write path requires writeCfg.Signer and writeCfg.TokenProvider to be
+// non-nil; absent either returns ErrRegistryWriteAuth.
+func (t *productionFetchTransport) WriteCounter(ctx context.Context, repoURL, projectID, fileName string, pending *countertypes.PendingBump) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return fmt.Errorf("WriteCounter: context already cancelled: %w", ctxErr)
+	}
+	if t.writeCfg == nil || t.writeCfg.Signer == nil || t.writeCfg.TokenProvider == nil {
+		return fmt.Errorf("%w: WriteCounter: no write configuration provided — "+
+			"run `byreis admin register` to add a registry-write token",
+			ErrRegistryWriteAuth)
+	}
+
+	// Retrieve the registry-write credential. The provider refuses to return the
+	// token in CONTRIBUTOR mode (contributor/admin credential separation). An
+	// absent token returns ErrRegistryWriteAuth so callers get the actionable hint.
+	token, tokenErr := t.writeCfg.TokenProvider.RegistryWriteToken(ctx, repoURL)
+	if tokenErr != nil {
+		return fmt.Errorf("%w: WriteCounter: retrieving registry-write token: %v",
+			ErrRegistryWriteAuth, tokenErr)
+	}
+
+	if err := fetchtransport.ValidateProjectID(projectID); err != nil {
+		return fmt.Errorf("WriteCounter: invalid projectID: %w", err)
+	}
+	if err := fetchtransport.ValidateFileName(fileName); err != nil {
+		return fmt.Errorf("WriteCounter: invalid fileName: %w", err)
+	}
+	if pending == nil {
+		return fmt.Errorf("WriteCounter: pending bump must not be nil")
+	}
+
+	return t.doCounterWrite(ctx, repoURL, projectID, fileName, token, pending, 0, false)
 }
 
-// CommitCounter is not yet implemented in the production path.
-func (t *productionFetchTransport) CommitCounter(_ context.Context, _, _, _ string, _ uint64) error {
-	return fmt.Errorf(
-		"CommitCounter not yet implemented in production transport — " +
-			"run `byreis doctor` to diagnose registry connectivity")
+// CommitCounter atomically advances last_accepted_counter to pendingCounter
+// and clears the pending record in a single signed registry commit. This is
+// the strict-two-phase step 5: it MUST NOT be called without a prior
+// WriteCounter for the same (project, file, pendingCounter, targetArtifactSHA).
+//
+// The push is conditional (non-fast-forward CAS): ErrRegistryConcurrentWrite
+// if the registry HEAD moved.
+func (t *productionFetchTransport) CommitCounter(ctx context.Context, repoURL, projectID, fileName string, pendingCounter uint64) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return fmt.Errorf("CommitCounter: context already cancelled: %w", ctxErr)
+	}
+	if t.writeCfg == nil || t.writeCfg.Signer == nil || t.writeCfg.TokenProvider == nil {
+		return fmt.Errorf("%w: CommitCounter: no write configuration provided — "+
+			"run `byreis admin register` to add a registry-write token",
+			ErrRegistryWriteAuth)
+	}
+
+	token, tokenErr := t.writeCfg.TokenProvider.RegistryWriteToken(ctx, repoURL)
+	if tokenErr != nil {
+		return fmt.Errorf("%w: CommitCounter: retrieving registry-write token: %v",
+			ErrRegistryWriteAuth, tokenErr)
+	}
+
+	if err := fetchtransport.ValidateProjectID(projectID); err != nil {
+		return fmt.Errorf("CommitCounter: invalid projectID: %w", err)
+	}
+	if err := fetchtransport.ValidateFileName(fileName); err != nil {
+		return fmt.Errorf("CommitCounter: invalid fileName: %w", err)
+	}
+
+	return t.doCounterWrite(ctx, repoURL, projectID, fileName, token, nil, pendingCounter, true)
+}
+
+// doCounterWrite is the shared implementation for WriteCounter and CommitCounter.
+// When commitPhase is false: writes the pending record (WriteCounter).
+// When commitPhase is true:  advances last_accepted and clears pending (CommitCounter).
+//
+// Atomicity: each call produces exactly ONE signed git commit updating the
+// counter file. CommitCounter's single commit simultaneously advances
+// last_accepted_counter AND clears pending to null — never two commits.
+//
+// CAS: push uses --force-with-lease on the expected parent SHA. A non-fast-
+// forward push returns ErrRegistryConcurrentWrite so the spine can retry.
+func (t *productionFetchTransport) doCounterWrite(
+	ctx context.Context,
+	repoURL, projectID, fileName, token string,
+	pending *countertypes.PendingBump,
+	pendingCounter uint64,
+	commitPhase bool,
+) error {
+	// Create an isolated 0700 workspace for all git operations.
+	tmpDir, mkErr := os.MkdirTemp("", "byreis-counter-write-*")
+	if mkErr != nil {
+		return fmt.Errorf("doCounterWrite: cannot create temp workspace: %w — "+
+			"check filesystem permissions: run `byreis doctor`", mkErr)
+	}
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+
+	if chErr := os.Chmod(tmpDir, 0o700); chErr != nil { //nolint:gosec // 0700 on dir is intentional: owner-only scratch workspace
+		return fmt.Errorf("doCounterWrite: cannot chmod temp workspace to 0700: %w — "+
+			"check filesystem permissions: run `byreis doctor`", chErr)
+	}
+
+	cloneDir := filepath.Join(tmpDir, "repo")
+
+	// hardenedEnv assembles the isolation environment for all git legs.
+	// extraEnv is appended for HTTP authentication (the registry-write token).
+	hardenedEnv := func(extraEnv ...string) []string {
+		base := fetchtransport.CleanGitEnv()
+		env := append(base,
+			"GIT_CONFIG_NOSYSTEM=1",
+			"HOME="+tmpDir,
+			"GIT_TERMINAL_PROMPT=0",
+			"GIT_ALLOW_PROTOCOL=file:https:ssh",
+			"GIT_CONFIG_COUNT=2",
+			"GIT_CONFIG_KEY_0=core.hooksPath",
+			"GIT_CONFIG_VALUE_0=/dev/null",
+			"GIT_CONFIG_KEY_1=core.fsmonitor",
+			"GIT_CONFIG_VALUE_1=",
+		)
+		return append(env, extraEnv...)
+	}
+
+	// authEnv carries the registry-write credential as an HTTP extra-header.
+	// This follows the same pattern as the read path extraEnv: the token is
+	// passed via GIT_CONFIG so it is process-scoped and does not persist.
+	// The token appears only in the env of git subprocess invocations, never
+	// in log output (the hardened env sanitizer never includes env values).
+	authEnv := func() []string {
+		if token == "" {
+			return nil
+		}
+		return []string{
+			"GIT_CONFIG_COUNT=3",
+			"GIT_CONFIG_KEY_0=core.hooksPath",
+			"GIT_CONFIG_VALUE_0=/dev/null",
+			"GIT_CONFIG_KEY_1=core.fsmonitor",
+			"GIT_CONFIG_VALUE_1=",
+			"GIT_CONFIG_KEY_2=http.extraHeader",
+			"GIT_CONFIG_VALUE_2=Authorization: Bearer " + token,
+		}
+	}
+
+	// Step 1: clone the registry (shallow, full checkout for file writes).
+	cloneCtx, cloneCancel := fetchtransport.WithBoundedDeadline(ctx, writeTimeout)
+	defer cloneCancel()
+
+	_, cloneStderr, cloneExit, cloneErr := t.verifier.RunSubprocess(
+		cloneCtx, tmpDir,
+		append(hardenedEnv(), authEnv()...),
+		"git", "clone", "--depth=1", "--no-local", "--", repoURL, cloneDir,
+	)
+	if cloneErr != nil {
+		return fmt.Errorf("doCounterWrite: git clone exec error: %w — "+
+			"ensure git is installed and the registry URL is reachable: run `byreis doctor`",
+			cloneErr)
+	}
+	if cloneExit != 0 {
+		return fmt.Errorf("%w: doCounterWrite: git clone exited %d: %s",
+			ErrRegistryWriteAuth, cloneExit, fetchtransport.SanitizeOutput(cloneStderr))
+	}
+
+	// Step 2: capture the registry HEAD (parent SHA for CAS + replay anchor).
+	revCtx, revCancel := fetchtransport.WithBoundedDeadline(ctx, 10*time.Second)
+	defer revCancel()
+
+	revStdout, _, revExit, revErr := t.verifier.RunSubprocess(
+		revCtx, cloneDir, hardenedEnv(),
+		"git", "rev-parse", "HEAD",
+	)
+	if revErr != nil {
+		return fmt.Errorf("doCounterWrite: git rev-parse HEAD exec error: %w — run `byreis doctor`", revErr)
+	}
+	if revExit != 0 {
+		return fmt.Errorf("doCounterWrite: git rev-parse HEAD exited %d — run `byreis doctor`", revExit)
+	}
+	parentSHA := strings.TrimSpace(string(revStdout))
+	if !fetchtransport.IsValidSHA(parentSHA) {
+		return fmt.Errorf("doCounterWrite: git rev-parse returned non-SHA output %q — run `byreis doctor`", parentSHA)
+	}
+
+	// Step 3: read the current counter file to build the updated content.
+	blobPath := fetchtransport.CounterBlobPath(projectID, fileName)
+	counterFilePath := filepath.Join(cloneDir, filepath.FromSlash(blobPath))
+
+	currentRaw, readFileErr := os.ReadFile(counterFilePath) //nolint:gosec // path is under the tmpDir clone, composed from validated projectID/fileName
+	var existing counterFileParsed
+	fileExists := true
+	if readFileErr != nil {
+		if os.IsNotExist(readFileErr) {
+			fileExists = false
+		} else {
+			return fmt.Errorf("doCounterWrite: reading current counter file: %w — run `byreis doctor`", readFileErr)
+		}
+	}
+	if fileExists {
+		if len(currentRaw) > maxCounterJSONBytes {
+			return fmt.Errorf("doCounterWrite: current counter file exceeds max size — run `byreis doctor`")
+		}
+		if len(bytes.TrimSpace(currentRaw)) > 0 {
+			if dupErr := checkDuplicateJSONKeys(currentRaw); dupErr != nil {
+				return fmt.Errorf("%w: doCounterWrite: duplicate key in counter file: %v",
+					coreregistry.ErrCounterStoreUnreadable, dupErr)
+			}
+			var decErr error
+			existing, decErr = decodeCounterFile(currentRaw)
+			if decErr != nil {
+				return fmt.Errorf("%w: doCounterWrite: decoding current counter file: %v",
+					coreregistry.ErrCounterStoreUnreadable, decErr)
+			}
+		}
+	}
+
+	// Step 4: build updated counter JSON and the signed commit message body.
+	var newJSON []byte
+	var commitMsgBody string
+	var jsonErr error
+
+	if !commitPhase {
+		// WriteCounter: set pending, preserve last_accepted_counter.
+		newJSON, commitMsgBody, jsonErr = t.buildWritePendingJSON(
+			ctx, existing, projectID, fileName, parentSHA, pending)
+	} else {
+		// CommitCounter: advance last_accepted to pendingCounter, clear pending.
+		// This MUST be a single atomic commit.
+		if existing.Pending == nil {
+			return fmt.Errorf("%w: CommitCounter: no pending record in counter file "+
+				"for (%s,%s) — CommitCounter must follow a successful WriteCounter; "+
+				"run `byreis admin counter reconcile`",
+				countertypes.ErrCounterReconcile, projectID, fileName)
+		}
+		if existing.Pending.PendingCounter != pendingCounter {
+			return fmt.Errorf("%w: CommitCounter: pending counter is %d, requested %d "+
+				"for (%s,%s) — run `byreis admin counter reconcile`",
+				countertypes.ErrCounterReconcile,
+				existing.Pending.PendingCounter, pendingCounter, projectID, fileName)
+		}
+		newJSON, commitMsgBody, jsonErr = t.buildCommitPendingJSON(
+			ctx, existing, projectID, fileName, parentSHA, pendingCounter)
+	}
+	if jsonErr != nil {
+		return fmt.Errorf("doCounterWrite: building counter JSON: %w", jsonErr)
+	}
+
+	// Step 5: write the updated counter file to the clone.
+	counterDir := filepath.Dir(counterFilePath)
+	if mkdirErr := os.MkdirAll(counterDir, 0o700); mkdirErr != nil {
+		return fmt.Errorf("doCounterWrite: creating counter directory: %w — "+
+			"check filesystem permissions: run `byreis doctor`", mkdirErr)
+	}
+	if writeErr := os.WriteFile(counterFilePath, newJSON, 0o600); writeErr != nil { //nolint:gosec // 0600 for counter file: owner-only
+		return fmt.Errorf("doCounterWrite: writing counter file: %w — "+
+			"check filesystem permissions: run `byreis doctor`", writeErr)
+	}
+
+	// Step 6: stage the counter file.
+	addCtx, addCancel := fetchtransport.WithBoundedDeadline(ctx, 10*time.Second)
+	defer addCancel()
+
+	_, addStderr, addExit, addErr := t.verifier.RunSubprocess(
+		addCtx, cloneDir, hardenedEnv(),
+		"git", "add", "--", blobPath,
+	)
+	if addErr != nil {
+		return fmt.Errorf("doCounterWrite: git add exec error: %w — run `byreis doctor`", addErr)
+	}
+	if addExit != 0 {
+		return fmt.Errorf("doCounterWrite: git add exited %d: %s — run `byreis doctor`",
+			addExit, fetchtransport.SanitizeOutput(addStderr))
+	}
+
+	// Step 7: configure git identity for the commit.
+	configCtx, configCancel := fetchtransport.WithBoundedDeadline(ctx, 10*time.Second)
+	defer configCancel()
+
+	_, _, configExit, configErr := t.verifier.RunSubprocess(
+		configCtx, cloneDir, hardenedEnv(),
+		"git", "config", "user.name", "byreis-admin",
+	)
+	if configErr != nil || configExit != 0 {
+		return fmt.Errorf("doCounterWrite: git config user.name failed — run `byreis doctor`")
+	}
+	_, _, emailExit, emailErr := t.verifier.RunSubprocess(
+		configCtx, cloneDir, hardenedEnv(),
+		"git", "config", "user.email", "byreis-admin@localhost",
+	)
+	if emailErr != nil || emailExit != 0 {
+		return fmt.Errorf("doCounterWrite: git config user.email failed — run `byreis doctor`")
+	}
+
+	// Step 8: produce the SSH signing key for this commit. The admin identity
+	// key is loaded via the REUSED ManifestSigner adapter — no new key path,
+	// no os.ReadFile, no BYREIS_KEY* env read here. We obtain the signature over
+	// the commit message body and write a signing key file to the workspace.
+	// The signing key is the admin's Ed25519 key, obtained indirectly by having
+	// the ManifestSigner sign the message body; the git SSH commit signing
+	// infrastructure then verifies it.
+	//
+	// Because git SSH commit signing requires the private key on disk or via
+	// ssh-agent, we implement a two-phase approach:
+	//   Phase A: create the commit WITHOUT a signature to capture the exact
+	//            commit message body text.
+	//   Phase B: sign the message body via ManifestSigner.SignText, write a
+	//            detached .sig file, and amend the commit to add the signature.
+	//
+	// The commit IS the atomic unit; the signature is embedded in the final commit.
+	// IMPORTANT: SignText is called AFTER commit message is known so the
+	// signature covers the exact commit message body (no pre-commit guessing).
+	//
+	// Git SSH signing flow: write a gpg-format signature to a temp file and use
+	// `git commit --gpg-sign` with a custom key. Because go-git's signed-commit
+	// support is incomplete for SSH keys, we use `git commit -m <msg>` directly
+	// and embed the signature in the commit body as a `gpgsig` trailer using
+	// `git hash-object + git commit-tree + git update-ref` — the git plumbing approach.
+	//
+	// Simplified path: use `git commit --allow-empty-message -m <body>` then
+	// produce the Ed25519 signature over the commit message body via SignText,
+	// and amend. For this change, we sign the commit message body via SignText
+	// and record the signerID+hex-sig as a structured footer in the commit
+	// message body itself (following the pattern of signed manifests). This
+	// is an explicit deviation from SSH commit signing: justified below.
+	//
+	// Justification for signed-footer-in-message vs. git SSH commit signing:
+	// git SSH commit signing requires the admin's private key on disk (via a
+	// key file or ssh-agent). Our ManifestSigner abstraction intentionally
+	// hides the key material behind a port — we cannot extract the raw private
+	// key. Embedding the signature as a structured footer in the commit message
+	// body preserves the invariant that ManifestSigner is the only path to the
+	// admin's private key, satisfies the "signed payload" requirement, and is
+	// verifiable by a reader who knows the signerID's public key. The git-level
+	// CAS (conditional push) is the availability guarantee; the signed footer
+	// is the integrity guarantee. Both are required; neither replaces the other.
+	//
+	// The registry MUST have branch-protection requiring signed commits; this
+	// enforcement is at the git host level, not here.
+	signerID, sig, signErr := t.writeCfg.Signer.SignText(ctx, []byte(commitMsgBody))
+	if signErr != nil {
+		return fmt.Errorf("doCounterWrite: signing commit message body: %w — "+
+			"check admin identity configuration: run `byreis doctor`", signErr)
+	}
+
+	// Build the full commit message: body + sig footer.
+	fullMessage := commitMsgBody + "\n\nbyreis-signer: " + signerID + "\nbyreis-sig: " + fmt.Sprintf("%x", sig) + "\n"
+
+	// Step 9: create the signed commit.
+	commitCtx, commitCancel := fetchtransport.WithBoundedDeadline(ctx, 30*time.Second)
+	defer commitCancel()
+
+	_, commitStderr, commitExit, commitErr := t.verifier.RunSubprocess(
+		commitCtx, cloneDir, hardenedEnv(),
+		"git", "commit", "-m", fullMessage,
+	)
+	if commitErr != nil {
+		return fmt.Errorf("doCounterWrite: git commit exec error: %w — run `byreis doctor`", commitErr)
+	}
+	if commitExit != 0 {
+		return fmt.Errorf("doCounterWrite: git commit exited %d: %s — run `byreis doctor`",
+			commitExit, fetchtransport.SanitizeOutput(commitStderr))
+	}
+
+	// Step 10: conditional push — CAS via --force-with-lease=refs/heads/main:<parentSHA>.
+	// If the registry HEAD moved since fetch, the push fails (non-fast-forward)
+	// and we return ErrRegistryConcurrentWrite so the caller retries from step 1.
+	pushCtx, pushCancel := fetchtransport.WithBoundedDeadline(ctx, writeTimeout)
+	defer pushCancel()
+
+	leaseRef := "refs/heads/main:" + parentSHA
+	_, pushStderr, pushExit, pushErr := t.verifier.RunSubprocess(
+		pushCtx, cloneDir,
+		append(hardenedEnv(), authEnv()...),
+		"git", "push", "--force-with-lease="+leaseRef, "origin", "main",
+	)
+	if pushErr != nil {
+		return fmt.Errorf("doCounterWrite: git push exec error: %w — "+
+			"check network connectivity: run `byreis doctor`", pushErr)
+	}
+	switch pushExit {
+	case 0:
+		// Success.
+		return nil
+	case 1:
+		// Exit 1 from git push typically means non-fast-forward / lease mismatch.
+		stderrStr := fetchtransport.SanitizeOutput(pushStderr)
+		if strings.Contains(stderrStr, "rejected") || strings.Contains(stderrStr, "non-fast-forward") || strings.Contains(stderrStr, "stale info") {
+			return fmt.Errorf("%w: doCounterWrite: push rejected (non-fast-forward / "+
+				"concurrent write detected): %s",
+				ErrRegistryConcurrentWrite, stderrStr)
+		}
+		// Other exit-1 causes: branch-protection rules.
+		return fmt.Errorf("%w: doCounterWrite: push rejected by remote: %s",
+			ErrRegistryWriteRejected, stderrStr)
+	default:
+		stderrStr := fetchtransport.SanitizeOutput(pushStderr)
+		if strings.Contains(stderrStr, "403") || strings.Contains(stderrStr, "401") || strings.Contains(stderrStr, "Authentication") {
+			return fmt.Errorf("%w: doCounterWrite: push authentication failure: %s",
+				ErrRegistryWriteAuth, stderrStr)
+		}
+		return fmt.Errorf("%w: doCounterWrite: git push exited %d: %s",
+			ErrRegistryWriteRejected, pushExit, stderrStr)
+	}
+}
+
+// buildWritePendingJSON constructs the updated counter JSON and the signed commit
+// message body for a WriteCounter (pending-phase) operation.
+func (t *productionFetchTransport) buildWritePendingJSON(
+	ctx context.Context,
+	existing counterFileParsed,
+	projectID, fileName, parentSHA string,
+	pending *countertypes.PendingBump,
+) ([]byte, string, error) {
+	now := time.Now().UTC().Format(time.RFC3339)
+
+	pendingJSON := &counterPendingJSON{
+		PendingCounter:    json.Number(fmt.Sprintf("%d", pending.PendingCounter)),
+		TargetArtifactSHA: pending.TargetArtifactSHA,
+		TargetPR:          pending.TargetPR,
+		IntentAt:          now,
+		ParentCommitSHA:   parentSHA,
+	}
+
+	wire := counterFileJSON{
+		ProjectID:           projectID,
+		File:                fileName,
+		LastAcceptedCounter: json.Number(fmt.Sprintf("%d", existing.LastAcceptedCounter)),
+		LastPR:              existing.LastPR,
+		UpdatedAt:           now,
+		Pending:             pendingJSON,
+	}
+
+	raw, err := json.MarshalIndent(wire, "", "  ")
+	if err != nil {
+		return nil, "", fmt.Errorf("buildWritePendingJSON: marshalling: %w", err)
+	}
+	raw = append(raw, '\n')
+
+	body := buildCounterCommitMessageBody(
+		projectID, fileName,
+		existing.LastAcceptedCounter,
+		pending.PendingCounter,
+		pending.TargetArtifactSHA,
+		pending.TargetPR,
+		parentSHA,
+	)
+
+	_ = ctx // reserved for future async expansion
+	return raw, body, nil
+}
+
+// buildCommitPendingJSON constructs the updated counter JSON and the signed commit
+// message body for a CommitCounter (advance+clear) operation. This produces the
+// single atomic commit that simultaneously advances last_accepted_counter AND
+// clears pending to null.
+func (t *productionFetchTransport) buildCommitPendingJSON(
+	ctx context.Context,
+	existing counterFileParsed,
+	projectID, fileName, parentSHA string,
+	pendingCounter uint64,
+) ([]byte, string, error) {
+	now := time.Now().UTC().Format(time.RFC3339)
+
+	wire := counterFileJSON{
+		ProjectID:           projectID,
+		File:                fileName,
+		LastAcceptedCounter: json.Number(fmt.Sprintf("%d", pendingCounter)),
+		LastPR:              existing.Pending.TargetPR,
+		UpdatedAt:           now,
+		Pending:             nil, // atomically cleared in this single commit
+	}
+
+	raw, err := json.MarshalIndent(wire, "", "  ")
+	if err != nil {
+		return nil, "", fmt.Errorf("buildCommitPendingJSON: marshalling: %w", err)
+	}
+	raw = append(raw, '\n')
+
+	body := buildCounterCommitMessageBody(
+		projectID, fileName,
+		existing.LastAcceptedCounter,
+		pendingCounter,
+		existing.Pending.TargetArtifactSHA,
+		existing.Pending.TargetPR,
+		parentSHA,
+	)
+
+	_ = ctx // reserved for future async expansion
+	return raw, body, nil
+}
+
+// buildCounterCommitMessageBody returns the canonical signed-payload envelope
+// for a counter commit message body. The fields are:
+//   - project_id
+//   - file
+//   - expected_previous_counter (= last_accepted_counter at fetch time)
+//   - pending_counter           (the value being claimed)
+//   - target_artifact_sha       (= verify.ContentSHA(signed artifact))
+//   - target_pr                 (project-repo PR identifier)
+//   - parent_commit_sha         (registry HEAD at fetch time — replay defence)
+//
+// The body is used as the git commit message body AND signed by the admin's
+// ManifestSigner (Ed25519) via SignText. The signature is embedded as a
+// structured footer so the message body + signature together form the tamper-
+// evident record of intent.
+func buildCounterCommitMessageBody(
+	projectID, fileName string,
+	expectedPreviousCounter, pendingCounter uint64,
+	targetArtifactSHA, targetPR, parentCommitSHA string,
+) string {
+	return fmt.Sprintf(
+		"byreis: counter write-ahead\n\n"+
+			"project_id: %s\n"+
+			"file: %s\n"+
+			"expected_previous_counter: %d\n"+
+			"pending_counter: %d\n"+
+			"target_artifact_sha: %s\n"+
+			"target_pr: %s\n"+
+			"parent_commit_sha: %s\n",
+		projectID, fileName,
+		expectedPreviousCounter,
+		pendingCounter,
+		targetArtifactSHA,
+		targetPR,
+		parentCommitSHA,
+	)
+}
+
+// isWarmProject reports whether the given (projectID, fileName) pair is
+// "warm" — i.e., projects/<projectID>.yaml exists in the registry clone at
+// headCommit AND lists fileName as a configured file.
+//
+// A warm project with an absent counter file is a counter-coverage integrity
+// violation: the first merge must have created the counter. A cold project (not
+// yet registered in projects/ or not yet listing this file) is safe to return 0.
+//
+// Returns (false, nil) on any read-failure so the caller can apply the
+// fail-closed policy (treat as warm = fail with ErrCounterStoreUnreadable).
+func (t *productionFetchTransport) isWarmProject(ctx context.Context, cloneDir, headCommit, projectID, fileName string) (bool, error) {
+	projectsPath := "projects/" + projectID + ".yaml"
+	raw, readErr := t.verifier.ReadBlobAtSHA(ctx, cloneDir, headCommit, projectsPath)
+	if readErr != nil {
+		if fetchtransport.IsBlobNotFound(readErr) {
+			// No projects/<projectID>.yaml → cold project.
+			return false, nil
+		}
+		// Read error → propagate so caller treats as warm (fail closed).
+		return false, readErr
+	}
+
+	// Minimal YAML parse: look for the fileName key in the files: map.
+	// Use a simple grep-style scan to avoid importing the full yaml decoder
+	// here (production_transport.go already imports go.yaml.in/yaml/v3).
+	type projectYAML struct {
+		Files map[string]string `yaml:"files"`
+	}
+	var parsed projectYAML
+	dec := yaml.NewDecoder(strings.NewReader(string(raw)))
+	dec.KnownFields(false) // lenient: we only care about 'files'
+	if decErr := dec.Decode(&parsed); decErr != nil {
+		// Parse error → cannot determine warmth; caller treats as warm (fail closed).
+		return false, decErr
+	}
+
+	_, listed := parsed.Files[fileName]
+	return listed, nil
+}
+
+// verifyPendingParentSHA verifies that the parent_commit_sha recorded in the
+// pending sub-object matches the actual parent of the commit that wrote the
+// pending record. This is the captured-commit-replay defence: a captured
+// signed counter commit cannot be silently reused at a different HEAD position
+// because the parent SHA is embedded in both the signed commit message body
+// and the counter JSON pending record.
+//
+// Implementation: use `git log -n 1 --pretty=format:%P -- <blobPath>` against
+// the retained clone to find the parent(s) of the most recent commit that
+// touched the counter file. The recorded parentCommitSHA must match.
+//
+// Returns nil when the check passes or when the recorded parentCommitSHA is
+// empty (counter files written by earlier byreis versions without the field —
+// treated permissively to avoid breaking existing counters until they are
+// rewritten by WriteCounter).
+func (t *productionFetchTransport) verifyPendingParentSHA(ctx context.Context, cloneDir, headCommit, blobPath, parentCommitSHA string) error {
+	if parentCommitSHA == "" {
+		// Legacy counter file without parent_commit_sha: permissive pass until
+		// the pending record is rewritten by a WriteCounter call.
+		return nil
+	}
+
+	// Find the most recent commit that touched the counter file.
+	logCtx, logCancel := fetchtransport.WithBoundedDeadline(ctx, 15*time.Second)
+	defer logCancel()
+
+	tmpDir := filepath.Dir(cloneDir)
+	logEnv := append(fetchtransport.CleanGitEnv(),
+		"GIT_CONFIG_NOSYSTEM=1",
+		"HOME="+tmpDir,
+		"GIT_TERMINAL_PROMPT=0",
+		"GIT_ALLOW_PROTOCOL=file:https:ssh",
+		"GIT_CONFIG_COUNT=2",
+		"GIT_CONFIG_KEY_0=core.hooksPath",
+		"GIT_CONFIG_VALUE_0=/dev/null",
+		"GIT_CONFIG_KEY_1=core.fsmonitor",
+		"GIT_CONFIG_VALUE_1=",
+	)
+
+	// git log -n 1 --pretty=format:%P <headCommit> -- <blobPath>
+	// %P = space-separated list of parent SHAs of the matching commit.
+	stdout, _, logExit, logErr := t.verifier.RunSubprocess(
+		logCtx, cloneDir, logEnv,
+		"git", "log", "-n", "1", "--pretty=format:%P", headCommit, "--", blobPath,
+	)
+	if logErr != nil || logExit != 0 {
+		// Cannot determine the parent commit. Treat as verification failure (fail closed).
+		return fmt.Errorf("verifyPendingParentSHA: git log failed (exit %d): %w",
+			logExit, logErr)
+	}
+
+	// Parse the parent SHA(s) — only the first parent is relevant.
+	parentLine := strings.TrimSpace(string(stdout))
+	if parentLine == "" {
+		// The commit is a root commit (no parent). This is unusual; fail closed.
+		return fmt.Errorf("verifyPendingParentSHA: counter commit has no parent — "+
+			"unexpected root commit for %q at %q", blobPath, headCommit)
+	}
+
+	// The first parent is the one the admin fetched from (fast-forward registry).
+	parts := strings.Fields(parentLine)
+	actualParent := parts[0]
+
+	if !fetchtransport.IsValidSHA(actualParent) {
+		return fmt.Errorf("verifyPendingParentSHA: git log returned invalid parent SHA %q", actualParent)
+	}
+
+	if actualParent != parentCommitSHA {
+		return fmt.Errorf(
+			"parent_commit_sha mismatch: recorded %q, actual %q — "+
+				"the pending record was written against a different registry HEAD; "+
+				"possible replayed or misplaced commit",
+			parentCommitSHA, actualParent)
+	}
+
+	return nil
 }
 
 // ReadProjectConfig reads projects/<projectID>.yaml at the exact pinned
@@ -880,7 +1578,8 @@ func isAllZeroKey(b []byte) bool {
 }
 
 // counterPendingJSON is the strict wire format for the "pending" sub-object in
-// the counter store JSON, mirroring ADR-0006 lines 82-88 byte-for-byte.
+// the counter store JSON, matching the documented counter store wire format,
+// plus the parent_commit_sha replay-defence anchor.
 // Field names must match exactly; DisallowUnknownFields rejects extra fields.
 // PendingCounter uses json.Number so UseNumber() mode rejects floats/scientific.
 type counterPendingJSON struct {
@@ -888,10 +1587,15 @@ type counterPendingJSON struct {
 	TargetArtifactSHA string      `json:"target_artifact_sha"`
 	TargetPR          string      `json:"target_pr"`
 	IntentAt          string      `json:"intent_at"`
+	// ParentCommitSHA is the registry HEAD SHA at the time the pending record
+	// was written. It is included here so ReadCounter can verify the pending
+	// record is anchored to the correct parent (replay-defence anchor). It is
+	// also embedded in the signed commit message body for git-level coverage.
+	ParentCommitSHA string `json:"parent_commit_sha"`
 }
 
 // counterFileJSON is the strict wire format for the counter store JSON file,
-// mirroring ADR-0006 lines 75-89 byte-for-byte.
+// matching the documented counter store wire format.
 // Field names must match exactly; DisallowUnknownFields rejects extra fields.
 // json.Number mode is used for the counter fields to reject scientific notation,
 // floats, and out-of-range values.
@@ -921,6 +1625,7 @@ type counterPendingParsed struct {
 	TargetArtifactSHA string
 	TargetPR          string
 	IntentAt          string
+	ParentCommitSHA   string
 }
 
 // checkDuplicateJSONKeys performs a token-stream pre-scan of raw JSON to detect
@@ -1026,6 +1731,7 @@ func decodeCounterFile(raw []byte) (counterFileParsed, error) {
 			TargetArtifactSHA: wire.Pending.TargetArtifactSHA,
 			TargetPR:          wire.Pending.TargetPR,
 			IntentAt:          wire.Pending.IntentAt,
+			ParentCommitSHA:   wire.Pending.ParentCommitSHA,
 		}
 	}
 
@@ -1163,6 +1869,16 @@ func validateCounterFileSemantics(cf counterFileParsed, projectID, fileName stri
 		if p.IntentAt == "" {
 			return fmt.Errorf(
 				"pending.intent_at must not be empty when pending record is present")
+		}
+		// parent_commit_sha must be a valid SHA when pending is present.
+		if p.ParentCommitSHA == "" {
+			return fmt.Errorf(
+				"pending.parent_commit_sha must not be empty when pending record is present")
+		}
+		if !fetchtransport.IsValidSHA(p.ParentCommitSHA) {
+			return fmt.Errorf(
+				"pending.parent_commit_sha %q is not a valid 40/64-hex SHA",
+				p.ParentCommitSHA)
 		}
 	}
 	return nil

@@ -143,7 +143,7 @@ func newTestVerifier(t *testing.T, runner fetchtransport.CommandRunner) *fetchtr
 // newTestTransport builds a production FetchTransport from a HeadVerifier.
 func newTestTransport(t *testing.T, v *fetchtransport.HeadVerifier) registry.FetchTransport {
 	t.Helper()
-	pt, err := registry.NewProductionFetchTransport(v)
+	pt, err := registry.NewProductionFetchTransport(v, nil)
 	if err != nil {
 		t.Fatalf("NewProductionFetchTransport: %v", err)
 	}

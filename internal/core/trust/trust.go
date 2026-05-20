@@ -17,7 +17,7 @@
 //     FILE_FLAG_OPEN_REPARSE_POINT + GetFileInformationByHandle (any non-zero
 //     reparse tag is rejected). Ownership verification is not yet implemented;
 //     CheckTrustDirTOCTOU and CheckTrustFileTOCTOU will return
-//     ErrTrustOwnershipUnverifiable on Windows until a follow-up slice adds
+//     ErrTrustOwnershipUnverifiable on Windows until a follow-up change adds
 //     SID-level ownership checking. Windows operators should ensure the config
 //     directory and trust anchor file are placed in a location not writable by
 //     other local users.
@@ -127,7 +127,7 @@ func CheckTrustDirTOCTOU(dirPath string) (*os.File, error) {
 	}
 
 	// Enforce mode: no bits in 0077 (no group/world access). [Unix enforced by
-	// the platform; Windows ACL enforcement is deferred to a follow-up slice.]
+	// the platform; Windows ACL enforcement is deferred to a follow-up change.]
 	if err := checkDirMode(info, dirPath); err != nil {
 		_ = f.Close()
 		return nil, err

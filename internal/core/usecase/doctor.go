@@ -107,9 +107,9 @@ type RegistryStatus struct {
 	// StaleReason is a human-readable explanation of the stale state.
 	StaleReason string
 	// BranchProtected is true when the secrets repository has branch
-	// protection enabled on the default branch (T6 check).
+	// protection enabled on the default branch.
 	BranchProtected bool
-	// BranchProtectionDetail carries the check result for the T6 hint.
+	// BranchProtectionDetail carries the branch-protection hint message.
 	BranchProtectionDetail string
 }
 
@@ -335,7 +335,7 @@ func (doc *doctorUseCase) checkRegistry(ctx context.Context) ([]DoctorFinding, t
 		})
 	}
 
-	// Branch protection check (T6).
+	// Branch protection check: confirm the default branch has push restrictions.
 	if status.BranchProtected {
 		findings = append(findings, DoctorFinding{
 			Check:    "branch-protection",

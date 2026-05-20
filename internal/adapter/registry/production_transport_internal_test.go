@@ -49,5 +49,5 @@ func InjectCorruptedPendingSessionForTest(ft FetchTransport, queueKey, corruptSH
 //
 // This is test-only. It must never be used in production code.
 func NewProductionFetchTransportForTest(v *fetchtransport.HeadVerifier) (FetchTransport, error) {
-	return NewProductionFetchTransport(v)
+	return NewProductionFetchTransport(v, nil)
 }

@@ -50,6 +50,65 @@ var ErrSourceNotVerified = errors.New(
 		"a counter authority can be produced — " +
 		"ensure network connectivity and re-fetch: run `byreis doctor` to diagnose")
 
+// ErrRegistryWriteRejected is returned when the registry remote refuses the
+// counter-write push, typically because branch-protection rules are enforced
+// (signed commits required, linear history, no force-push, no delete).
+// To resolve: verify branch-protection settings on the registry repository —
+// signed commits required, linear history, no force-push allowed.
+var ErrRegistryWriteRejected = errors.New(
+	"registry rejected the counter write (branch-protection refused the push) — " +
+		"registry requires admin merge; verify branch-protection: " +
+		"signed commits required, linear history, no force-push")
+
+// ErrRegistryWriteAuth is returned when the registry-write credential is absent
+// or lacks the necessary scope to push to the registry repository.
+// To resolve: run `byreis admin register` to add a registry-write token.
+var ErrRegistryWriteAuth = errors.New(
+	"registry-write credential is missing or has insufficient scope — " +
+		"run `byreis admin register` to add a registry-write token")
+
+// ErrRegistryConcurrentWrite is returned by WriteCounter when the push is
+// rejected because the registry HEAD moved between fetch and push (non-fast-
+// forward), indicating a concurrent admin write. The caller must retry by
+// re-entering the merge flow from step 1 to re-fetch the new registry HEAD.
+// To diagnose: run `byreis admin counter status`.
+var ErrRegistryConcurrentWrite = errors.New(
+	"registry counter write rejected: another admin write landed concurrently " +
+		"(non-fast-forward push) — " +
+		"run `byreis admin counter status` and retry the merge")
+
+// RegistryWriteSigner is the port for signing registry counter commits.
+// It is the same contract as the usecase.ManifestSigner port but scoped here
+// so that the adapter package does not import usecase. The production
+// implementation reuses the existing ManifestSigner adapter — no parallel key
+// path and no new key material.
+//
+// Sign returns the admin signer identity label and the raw Ed25519 signature
+// over the canonical encoding of the commit message body. The signer MUST use
+// the admin's registry-attested Ed25519 identity key; no new key is created.
+//
+// Implementations must be safe for concurrent use. The adapter MUST never
+// store the returned sig beyond the current call.
+type RegistryWriteSigner interface {
+	// SignText returns the signer identity label and the raw Ed25519 signature
+	// over text. text is the canonical commit message body produced by the
+	// counter-write path.
+	SignText(ctx context.Context, text []byte) (signerID string, sig []byte, err error)
+}
+
+// RegistryWriteTokenProvider is the port for retrieving the registry-write
+// OAuth / PAT credential. It is ADMIN-only: the production implementation
+// consults the mode gate and refuses to return a token when the calling
+// process is in CONTRIBUTOR mode. This is the contributor/admin credential
+// separation boundary.
+type RegistryWriteTokenProvider interface {
+	// RegistryWriteToken returns the registry-write credential for the given
+	// registry URL. Returns ErrRegistryWriteAuth (wrapped) if absent or
+	// insufficient scope. Must fail closed when the calling mode is not ADMIN
+	// or SUPER — a contributor must never receive this token.
+	RegistryWriteToken(ctx context.Context, registryURL string) (string, error)
+}
+
 // ClientConfig holds all injected dependencies for the Client. All fields are
 // required unless otherwise noted. Real network/clock/fs must never appear in
 // unit tests — inject fakes.
@@ -76,6 +135,12 @@ type ClientConfig struct {
 	// When nil the client falls back to in-memory simulation (used by tests).
 	// The real go-git transport is wired here in production.
 	FetchTransport FetchTransport
+
+	// WriteTokenProvider is the ADMIN-only port for the registry-write
+	// credential. When nil, WriteCounter and CommitCounter return
+	// ErrRegistryWriteAuth. The implementation must refuse to return the token
+	// in CONTRIBUTOR mode (contributor/admin credential separation).
+	WriteTokenProvider RegistryWriteTokenProvider
 }
 
 // ProjectConfig holds the per-project configuration parsed from the registry

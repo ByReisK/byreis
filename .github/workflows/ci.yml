@@ -17,12 +17,12 @@ jobs:
           go-version: "1.26.x"
           cache: true
       - name: Assert shipped build carries no testhook / build-influencing env
-        # Fail-closed half of the testhook control gate (ADR-0006 / DESIGN
-        # §7.2-D1). The symbol-absence half is the Go AST test
-        # TestShippedSurface_* in internal/core/registry/countertypes (run by
-        # the 'test' and 'shipgate' jobs under DEFAULT tags). This step asserts
-        # the BUILD invocation itself is clean: no -tags testhook, and no
-        # GOFLAGS/GOEXPERIMENT that could smuggle a tag or alter codegen.
+        # Fail-closed half of the testhook control gate. The symbol-absence
+        # half is the Go AST test TestShippedSurface_* in
+        # internal/core/registry/countertypes (run by the 'test' and 'shipgate'
+        # jobs under DEFAULT tags). This step asserts the BUILD invocation
+        # itself is clean: no -tags testhook, and no GOFLAGS/GOEXPERIMENT that
+        # could smuggle a tag or alter codegen.
         run: |
           set -euo pipefail
           if [ -n "${GOFLAGS:-}" ]; then

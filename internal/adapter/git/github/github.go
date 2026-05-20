@@ -7,7 +7,7 @@
 //   - The contributor-side move-detection SHA (returned by OpenSubmissionPR /
 //     GetSubmission and checked by MergeSubmission) is sha256(raw artifact
 //     bytes as pushed/fetched), with zero normalisation. This is the
-//     repo-side pin for the T2 TOCTOU guard.
+//     repo-side pin for the on-PR move-detection TOCTOU guard.
 //   - The of-record SHA recorded in MergeResult.LiveFileSHA is
 //     verify.ContentSHA(parsedSignedArtifact) — the canonical-domain preimage
 //     (sha256(manifest.Encode(m) || 0x1f || rawSig)). The registry adapter
@@ -16,7 +16,7 @@
 //
 // The recorder==verifier test (TestMergeSubmission_LiveFileSHA_EqualsContentSHA)
 // proves that LiveFileSHA == verify.ContentSHA(parsed), one function, one
-// preimage. This satisfies the binding pre-B3 obligation.
+// preimage.
 //
 // This package honors context cancellation/deadlines on every API call.
 // Auth errors produce an actionable hint. No token or secret appears in errors
@@ -127,7 +127,7 @@ var _ coregit.GitProvider = (*Provider)(nil)
 // OpenSubmissionPR creates a branch + commit of the unsigned artifact and
 // opens a PR. It returns the PR and the contributor-side ArtifactSHA
 // (sha256 over the raw artifact bytes pushed, zero normalisation). This is
-// the T2 move-detection pin; it is distinct from verify.ContentSHA.
+// the move-detection pin used by the on-PR artifact-SHA TOCTOU guard; it is distinct from verify.ContentSHA.
 //
 // The PR body is structured: it contains the caller-supplied justification text
 // PLUS a single fenced byreis-submission JSON block encoding the SubmissionMeta
@@ -164,8 +164,8 @@ func (p *Provider) OpenSubmissionPR(ctx context.Context, in coregit.OpenPRInput)
 	}
 
 	// 4. Compute the contributor-side ArtifactSHA over the raw pushed bytes,
-	// zero normalisation. This is the T2 move-detection pin; it is NOT the
-	// counter-authority target_artifact_sha.
+	// zero normalisation. This is the move-detection pin used by the on-PR
+	// artifact-SHA TOCTOU guard; it is NOT the counter-authority target_artifact_sha.
 	artifactSHA := rawBytesSHA(in.ArtifactBytes)
 
 	// 5. Build the PR body: free-text justification + machine-parseable block.
@@ -256,7 +256,7 @@ func (p *Provider) GetSubmission(ctx context.Context, ref coregit.PRRef) (coregi
 }
 
 // MergeSubmission merges the reviewed submission. It first verifies the
-// on-PR artifact SHA still equals ExpectSHA (T2 TOCTOU guard — fails closed
+// on-PR artifact SHA still equals ExpectSHA (move-detection TOCTOU guard — fails closed
 // with ErrArtifactMoved). On success it commits SignedBytes to the protected
 // secrets path (from MergeInput.SecretsPath) and merges the PR.
 //
@@ -288,14 +288,14 @@ func (p *Provider) MergeSubmission(ctx context.Context, in coregit.MergeInput) (
 	branchName := pr.GetHead().GetRef()
 	filePath := p.submissionFilePath(branchName)
 
-	// 2. Fetch the current on-PR artifact to verify the content pin (T2).
+	// 2. Fetch the current on-PR artifact to verify the move-detection content pin.
 	currentBytes, err := p.fetchFileContents(ctx, filePath, branchName)
 	if err != nil {
 		return coregit.MergeResult{}, fmt.Errorf("MergeSubmission: fetching current artifact: %w", err)
 	}
 	currentSHA := rawBytesSHA(currentBytes)
 	if currentSHA != in.ExpectSHA {
-		// T2: artifact moved since review. The admin must re-run review.
+		// Move-detection invariant violated: artifact SHA changed since review. The admin must re-run review.
 		return coregit.MergeResult{}, fmt.Errorf(
 			"%w: current SHA %q ≠ expected %q",
 			coregit.ErrArtifactMoved, currentSHA, in.ExpectSHA)

@@ -5,8 +5,8 @@
 // single shallow clone per call with a hardened isolated environment. The
 // project-branch SHA (S_proj) is an intra-clone NO-SKEW mechanism only — it
 // is NOT a signed or verified SHA. Project-repo trust is the manifest
-// signature (verify.VerifyOfRecord over the registry-attested set per
-// ADR-0008/0009); the project leg is structurally weaker than the registry leg.
+// signature (verify.VerifyOfRecord over the registry-attested set);
+// the project leg is structurally weaker than the registry leg.
 //
 // Placement: OUTER adapter layer (internal/adapter/git/fileofrecord). Core
 // packages never import this adapter; it is injected at the composition root.
@@ -72,7 +72,7 @@ func isBlobNotFound(err error) bool {
 // structurally weaker than the registry verifiedSHA because there is no
 // signed-commit verifier on the project repo. Trust derives from
 // verify.VerifyOfRecord over the registry-attested recipient/signer set
-// and counter authority (readpath.go; ADR-0008/0009; DESIGN §3.5).
+// and counter authority (see readpath.go).
 type GitSource struct {
 	// projectURL is the operator-pinned project secrets-repo clone URL.
 	// Sourced from BYREIS_PROJECT_REPO env or the operator-trusted .byreis.yaml.

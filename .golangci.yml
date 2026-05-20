@@ -124,8 +124,8 @@ linters:
       - linters: [gosec]
         text: "G304|G204"
       # Contract-locked type names that stutter by package prefix (e.g. encrypt.EncryptInput,
-      # submit.SubmitInput). Renaming requires a coordinated contract amendment with
-      # reis-principal-go; suppress until that is scheduled.
+      # submit.SubmitInput). Renaming requires a coordinated contract amendment;
+      # suppress until that is scheduled.
       - linters: [revive]
         text: "type name will be used as .* by other packages, and that stutters"
       # Stub implementations intentionally declare all interface parameters even when

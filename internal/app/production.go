@@ -64,7 +64,7 @@ func BuildProductionDeps(ctx context.Context) (*cli.Deps, error) {
 	// When the registry client is unavailable the source is nil.
 	forSource, forErr := buildFileOfRecordSourceProd(regClient)
 
-	// Build the ForSourceBridge that wires the M6 cryptographic-reality anchor.
+	// Build the ForSourceBridge that wires the cryptographic-reality anchor.
 	// When regClient or forSource is nil the bridge is nil (fail-closed):
 	// NewKeyProbe accepts a nil fetcher and CanDecryptAny returns (false, nil).
 	var probeBridge modeprobe.ArtifactFetcher
@@ -288,9 +288,9 @@ func buildFileOfRecordSourceProd(regClient coreregistry.RegistryClient) (usecase
 
 	// Construct the git-based reader using the existing SubprocessRunner (no
 	// new dependency or import edge). The token is NOT required for file://
-	// project URLs.
+	// project URLs. Pass nil writeCfg: this path is read-only.
 	ft, err := registryadapter.NewProductionFetchTransportFromRunner(
-		registryadapter.SubprocessRunner{},
+		registryadapter.SubprocessRunner{}, nil,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("constructing project-repo git reader: %w", err)
@@ -732,7 +732,7 @@ func buildRegistryFetchTransportProd(registryURL string) (registryadapter.FetchT
 	// git directly (clone + verify + cat-file), all subprocess-based.
 	if strings.HasPrefix(validated, "file://") {
 		ft, err := registryadapter.NewProductionFetchTransportFromRunner(
-			registryadapter.SubprocessRunner{},
+			registryadapter.SubprocessRunner{}, nil,
 		)
 		if err != nil {
 			return nil, fmt.Errorf(
@@ -748,7 +748,7 @@ func buildRegistryFetchTransportProd(registryURL string) (registryadapter.FetchT
 	}
 
 	ft, err := registryadapter.NewProductionFetchTransportFromRunner(
-		registryadapter.SubprocessRunner{},
+		registryadapter.SubprocessRunner{}, nil,
 	)
 	if err != nil {
 		return nil, fmt.Errorf(

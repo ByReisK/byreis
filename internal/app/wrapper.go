@@ -159,13 +159,13 @@ func adminSetToVerifiedRecipients(set coreregistry.AdminSet) usecase.VerifiedRec
 type ArtifactEncoder interface {
 	// EncodeUnsigned serializes the artifact.Unsigned carried in the submit input
 	// to the exact bytes that will be committed to git. The caller must not
-	// normalize these bytes before hashing (they are the T2 move-detection pin).
+	// normalize these bytes before hashing (they are the move-detection pin used by the on-PR artifact-SHA TOCTOU guard).
 	EncodeUnsigned(in submit.OpenPRInput) ([]byte, error)
 }
 
 // SubmitGitPort implements submit.GitPort by wrapping the core git.GitProvider
 // and mapping the submit-specific types to the domain types. It also maps
-// github.ErrBranchConflict → submit.ErrBranchTaken (checklist item v).
+// github.ErrBranchConflict → submit.ErrBranchTaken.
 type SubmitGitPort struct {
 	provider coregit.GitProvider
 	encoder  ArtifactEncoder
@@ -211,7 +211,7 @@ func (s *SubmitGitPort) OpenSubmissionPR(ctx context.Context, in submit.OpenPRIn
 		TitleTemplate: fmt.Sprintf("[byreis] %s: %s", in.Action.String(), in.Key),
 	})
 	if err != nil {
-		// Checklist item (v): map ErrBranchConflict → submit.ErrBranchTaken.
+		// Map ErrBranchConflict → submit.ErrBranchTaken so the submit use-case's concurrency guard triggers.
 		if errors.Is(err, githubadapter.ErrBranchConflict) {
 			return submit.OpenedPR{}, fmt.Errorf("%w: %v", submit.ErrBranchTaken, err)
 		}

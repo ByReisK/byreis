@@ -247,6 +247,9 @@ func TestCounterBlobPath_ComposedOnce(t *testing.T) {
 
 // ---- AC-4: schema + duplicate-key + invariants + size -----------------------
 
+// b66ValidParentSHA is a valid 40-char parent SHA used in test pending records.
+const b66ValidParentSHA = "1234567890abcdef1234567890abcdef12345678"
+
 // b66CounterJSON returns valid ADR-0006 counter store JSON.
 func b66CounterJSON(projectID, fileName string, la uint64, lastPR string, pending *struct {
 	PendingCounter    uint64
@@ -266,8 +269,9 @@ func b66CounterJSON(projectID, fileName string, la uint64, lastPR string, pendin
     "pending_counter": %d,
     "target_artifact_sha": %q,
     "target_pr": %q,
-    "intent_at": %q
-  }`, pending.PendingCounter, pending.TargetArtifactSHA, pending.TargetPR, pending.IntentAt)
+    "intent_at": %q,
+    "parent_commit_sha": %q
+  }`, pending.PendingCounter, pending.TargetArtifactSHA, pending.TargetPR, pending.IntentAt, b66ValidParentSHA)
 	}
 	return []byte(fmt.Sprintf(`{
   "project_id": %q,
@@ -295,7 +299,7 @@ func TestReadCounter_SchemaPin_ADR0006_ByteForByte(t *testing.T) {
 		},
 	}
 	v := b66NewVerifier(t, runner)
-	pt, err := registry.NewProductionFetchTransport(v)
+	pt, err := registry.NewProductionFetchTransport(v, nil)
 	if err != nil {
 		t.Fatalf("NewProductionFetchTransport: %v", err)
 	}
@@ -320,7 +324,18 @@ func TestReadCounter_SchemaPin_ADR0006_ByteForByte(t *testing.T) {
 	pt.DiscardCounterSession(context.Background(), commit)
 }
 
+// b66GitLogParentOK returns a runner step for git log --pretty=format:%P
+// returning b66ValidParentSHA as the parent commit of the counter commit.
+// This step is consumed by verifyPendingParentSHA when a valid pending record
+// is present with parent_commit_sha == b66ValidParentSHA.
+func b66GitLogParentOK() recordStep {
+	return recordStep{stdout: []byte(b66ValidParentSHA + "\n"), exitCode: 0}
+}
+
 // TestReadCounter_WithPending_SchemaPin verifies a counter with pending record.
+// The parent_commit_sha in the pending record is verified against the actual
+// parent of the counter-bearing commit (verifyPendingParentSHA). The runner
+// provides a git log step that returns b66ValidParentSHA as the parent.
 func TestReadCounter_WithPending_SchemaPin(t *testing.T) {
 	t.Parallel()
 
@@ -342,10 +357,11 @@ func TestReadCounter_WithPending_SchemaPin(t *testing.T) {
 			b66RevParseOK(),
 			b66VerifyOK(),
 			b66CatFileOK(fixture),
+			b66GitLogParentOK(), // verifyPendingParentSHA: parent matches b66ValidParentSHA
 		},
 	}
 	v := b66NewVerifier(t, runner)
-	pt, err := registry.NewProductionFetchTransport(v)
+	pt, err := registry.NewProductionFetchTransport(v, nil)
 	if err != nil {
 		t.Fatalf("NewProductionFetchTransport: %v", err)
 	}
@@ -399,7 +415,7 @@ func TestReadCounter_ExtraField_Reject(t *testing.T) {
 		},
 	}
 	v := b66NewVerifier(t, runner)
-	pt, err := registry.NewProductionFetchTransport(v)
+	pt, err := registry.NewProductionFetchTransport(v, nil)
 	if err != nil {
 		t.Fatalf("NewProductionFetchTransport: %v", err)
 	}
@@ -479,7 +495,7 @@ func TestReadCounter_DuplicateKey_RejectedExplicitly_TableDriven(t *testing.T) {
 				},
 			}
 			v := b66NewVerifier(t, runner)
-			pt, err := registry.NewProductionFetchTransport(v)
+			pt, err := registry.NewProductionFetchTransport(v, nil)
 			if err != nil {
 				t.Fatalf("NewProductionFetchTransport: %v", err)
 			}
@@ -510,7 +526,7 @@ func TestReadCounter_OversizeRejected_PreDecode(t *testing.T) {
 		},
 	}
 	v := b66NewVerifier(t, runner)
-	pt, err := registry.NewProductionFetchTransport(v)
+	pt, err := registry.NewProductionFetchTransport(v, nil)
 	if err != nil {
 		t.Fatalf("NewProductionFetchTransport: %v", err)
 	}
@@ -558,7 +574,7 @@ func TestReadCounter_IntegerOnly_RejectsScientificAndDecimal(t *testing.T) {
 				},
 			}
 			v := b66NewVerifier(t, runner)
-			pt, err := registry.NewProductionFetchTransport(v)
+			pt, err := registry.NewProductionFetchTransport(v, nil)
 			if err != nil {
 				t.Fatalf("NewProductionFetchTransport: %v", err)
 			}
@@ -708,7 +724,7 @@ func TestReadCounter_SemanticValidation_TableDriven(t *testing.T) {
 				},
 			}
 			v := b66NewVerifier(t, runner)
-			pt, err := registry.NewProductionFetchTransport(v)
+			pt, err := registry.NewProductionFetchTransport(v, nil)
 			if err != nil {
 				t.Fatalf("NewProductionFetchTransport: %v", err)
 			}
@@ -727,20 +743,23 @@ func TestReadCounter_SemanticValidation_TableDriven(t *testing.T) {
 // ---- AC-5: BlobNotFound typed marker ----------------------------------------
 
 // TestReadCounter_BlobNotFound_ReturnsZeroNilNil_OnlyForBlobNotFound verifies
-// that an absent counter file returns (0, nil, nil) and that this path uses the
-// typed BlobNotFound marker, not substring matching.
+// that an absent counter file for a COLD project (no projects/*.yaml listing
+// the file) returns (0, nil, nil). The CC-1 warm-absent check is exercised by
+// a second cat-file call for the projects/ config file, which also returns 404.
 func TestReadCounter_BlobNotFound_ReturnsZeroNilNil_OnlyForBlobNotFound(t *testing.T) {
 	t.Parallel()
 
-	// cat-file returns exit 128 which ReadBlobAtSHA maps to blobNotFoundError.
+	// Two cat-file calls: first for the counter file (404 → absent), second for
+	// projects/proj1.yaml (404 → cold project). Cold + absent → (0, nil, nil).
 	runner := &recordingRunner{
 		steps: []recordStep{
 			b66CloneOK(), b66RevParseOK(), b66VerifyOK(),
-			b66CatFile404(),
+			b66CatFile404(), // counter file absent
+			b66CatFile404(), // projects/proj1.yaml absent → cold project
 		},
 	}
 	v := b66NewVerifier(t, runner)
-	pt, err := registry.NewProductionFetchTransport(v)
+	pt, err := registry.NewProductionFetchTransport(v, nil)
 	if err != nil {
 		t.Fatalf("NewProductionFetchTransport: %v", err)
 	}
@@ -752,13 +771,13 @@ func TestReadCounter_BlobNotFound_ReturnsZeroNilNil_OnlyForBlobNotFound(t *testi
 
 	la, pending, readErr := pt.ReadCounter(context.Background(), "https://example.com/reg.git", commit, "proj1", "secrets")
 	if readErr != nil {
-		t.Fatalf("ReadCounter: expected (0, nil, nil) for BlobNotFound, got err: %v", readErr)
+		t.Fatalf("ReadCounter: expected (0, nil, nil) for cold-absent, got err: %v", readErr)
 	}
 	if la != 0 {
-		t.Errorf("ReadCounter BlobNotFound: la=%d, want 0", la)
+		t.Errorf("ReadCounter cold-absent: la=%d, want 0", la)
 	}
 	if pending != nil {
-		t.Errorf("ReadCounter BlobNotFound: pending=%v, want nil", pending)
+		t.Errorf("ReadCounter cold-absent: pending=%v, want nil", pending)
 	}
 
 	// Session was cleaned up by ReadCounter on BlobNotFound path.
@@ -859,7 +878,7 @@ func TestReadCounter_RejectsBadProjectID_TableDriven(t *testing.T) {
 			// Runner with NO steps — any invocation would fail.
 			runner := &recordingRunner{}
 			v := b66NewVerifier(t, runner)
-			pt, err := registry.NewProductionFetchTransport(v)
+			pt, err := registry.NewProductionFetchTransport(v, nil)
 			if err != nil {
 				t.Fatalf("NewProductionFetchTransport: %v", err)
 			}
@@ -902,7 +921,7 @@ func TestReadCounter_RejectsBadFileName_TableDriven(t *testing.T) {
 			t.Parallel()
 			runner := &recordingRunner{}
 			v := b66NewVerifier(t, runner)
-			pt, err := registry.NewProductionFetchTransport(v)
+			pt, err := registry.NewProductionFetchTransport(v, nil)
 			if err != nil {
 				t.Fatalf("NewProductionFetchTransport: %v", err)
 			}
@@ -938,7 +957,7 @@ func TestIsAncestor_RejectsBadSHA_TableDriven(t *testing.T) {
 			t.Parallel()
 			runner := &recordingRunner{}
 			v := b66NewVerifier(t, runner)
-			pt, err := registry.NewProductionFetchTransport(v)
+			pt, err := registry.NewProductionFetchTransport(v, nil)
 			if err != nil {
 				t.Fatalf("NewProductionFetchTransport: %v", err)
 			}
@@ -1018,7 +1037,7 @@ func TestIsAncestor_ExitCodeTriage_FourRows_TableDriven(t *testing.T) {
 				},
 			}
 			v := b66NewVerifier(t, runner)
-			pt, err := registry.NewProductionFetchTransport(v)
+			pt, err := registry.NewProductionFetchTransport(v, nil)
 			if err != nil {
 				t.Fatalf("NewProductionFetchTransport: %v", err)
 			}
@@ -1072,7 +1091,7 @@ func TestIsAncestor_ArgvShape_DashDashGuard_CallCapture(t *testing.T) {
 		},
 	}
 	v := b66NewVerifier(t, runner)
-	pt, err := registry.NewProductionFetchTransport(v)
+	pt, err := registry.NewProductionFetchTransport(v, nil)
 	if err != nil {
 		t.Fatalf("NewProductionFetchTransport: %v", err)
 	}
@@ -1120,7 +1139,7 @@ func TestIsAncestor_CtxCancelDistinctFromExit1(t *testing.T) {
 		},
 	}
 	v := b66NewVerifier(t, runner)
-	pt, err := registry.NewProductionFetchTransport(v)
+	pt, err := registry.NewProductionFetchTransport(v, nil)
 	if err != nil {
 		t.Fatalf("NewProductionFetchTransport: %v", err)
 	}
@@ -1163,7 +1182,7 @@ func TestIsAncestor_EnvByteEqual_RecordingRunner(t *testing.T) {
 		},
 	}
 	v := b66NewVerifier(t, runner)
-	pt, err := registry.NewProductionFetchTransport(v)
+	pt, err := registry.NewProductionFetchTransport(v, nil)
 	if err != nil {
 		t.Fatalf("NewProductionFetchTransport: %v", err)
 	}
@@ -1211,12 +1230,13 @@ func TestIsAncestor_NoSecretLeak_NeedleTest(t *testing.T) {
 		steps: []recordStep{
 			b66CloneOK(), b66RevParseOK(), b66VerifyOK(),
 			b66CatFileOK(fixture),
+			b66GitLogParentOK(), // verifyPendingParentSHA: parent matches b66ValidParentSHA
 			// merge-base exits 128 with stderr containing the needle.
 			{exitCode: 128, stderr: []byte("error: " + needle)},
 		},
 	}
 	v := b66NewVerifier(t, runner)
-	pt, err := registry.NewProductionFetchTransport(v)
+	pt, err := registry.NewProductionFetchTransport(v, nil)
 	if err != nil {
 		t.Fatalf("NewProductionFetchTransport: %v", err)
 	}
@@ -1250,7 +1270,7 @@ func TestDiscardCounterSession_NoOpWhenAbsent(t *testing.T) {
 
 	runner := &recordingRunner{}
 	v := b66NewVerifier(t, runner)
-	pt, err := registry.NewProductionFetchTransport(v)
+	pt, err := registry.NewProductionFetchTransport(v, nil)
 	if err != nil {
 		t.Fatalf("NewProductionFetchTransport: %v", err)
 	}
@@ -1301,7 +1321,7 @@ func TestDiscardCounterSession_CleansSessionWhenPresent(t *testing.T) {
 		t.Fatalf("NewHeadVerifier: %v", err2)
 	}
 
-	pt, err := registry.NewProductionFetchTransport(v2)
+	pt, err := registry.NewProductionFetchTransport(v2, nil)
 	if err != nil {
 		t.Fatalf("NewProductionFetchTransport: %v", err)
 	}
@@ -1343,12 +1363,14 @@ func TestCounterParser_ADR0006_FieldSet_Reflect_Drift(t *testing.T) {
 		"updated_at",
 		"pending",
 	}
-	// The pending sub-object has 4 fields.
+	// The pending sub-object has 5 fields (parent_commit_sha added for replay
+	// defence per the counter-write-residual slice).
 	wantPending := []string{
 		"pending_counter",
 		"target_artifact_sha",
 		"target_pr",
 		"intent_at",
+		"parent_commit_sha",
 	}
 
 	// Verify via a fully-populated JSON roundtrip that all fields are
@@ -1365,7 +1387,8 @@ func TestCounterParser_ADR0006_FieldSet_Reflect_Drift(t *testing.T) {
     "pending_counter": 4,
     "target_artifact_sha": "` + validArtifactSHA + `",
     "target_pr": "pr-43",
-    "intent_at": "2024-01-02T00:00:00Z"
+    "intent_at": "2024-01-02T00:00:00Z",
+    "parent_commit_sha": "` + b66ValidParentSHA + `"
   }
 }`)
 
@@ -1423,10 +1446,11 @@ func TestCounterParser_GoldenBytes_RoundTripIdentity(t *testing.T) {
 		steps: []recordStep{
 			b66CloneOK(), b66RevParseOK(), b66VerifyOK(),
 			b66CatFileOK(fixture),
+			b66GitLogParentOK(), // verifyPendingParentSHA: parent matches b66ValidParentSHA
 		},
 	}
 	v := b66NewVerifier(t, runner)
-	pt, err := registry.NewProductionFetchTransport(v)
+	pt, err := registry.NewProductionFetchTransport(v, nil)
 	if err != nil {
 		t.Fatalf("NewProductionFetchTransport: %v", err)
 	}

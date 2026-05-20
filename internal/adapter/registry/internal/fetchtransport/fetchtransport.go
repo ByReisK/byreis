@@ -605,7 +605,7 @@ func withBoundedDeadline(parent context.Context, bound time.Duration) (context.C
 // signed or cryptographically verified SHA analogous to the registry
 // verifiedSHA. The project repo has no signed-commit verifier; project-repo
 // trust is the manifest signature (verify.VerifyOfRecord over the
-// registry-attested recipient/signer set and counter authority per ADR-0008/0009).
+// registry-attested recipient/signer set and the counter authority).
 // The project leg is structurally weaker than the registry leg because trust
 // derives from the manifest signature, not from the project commit.
 //
@@ -798,7 +798,7 @@ func (v *HeadVerifier) ReadProjectBlob(ctx context.Context, projectURL, branch, 
 // and registry-admins read paths use ReadProjectBlob (reads at the exact SHA that
 // HeadVerifier.VerifyHead signature-verified, from the same clone, with no second
 // network round-trip). This function has zero non-test production callers and is
-// scheduled for deletion at the B5/B6 aggregate-gate cleanup pass. Do not wire
+// scheduled for deletion at the next dead-code sweep. Do not wire
 // into any new production path.
 func (v *HeadVerifier) ReadBlobAtRef(ctx context.Context, repoURL, ref, path string) ([]byte, error) {
 	if ctxErr := ctx.Err(); ctxErr != nil {
