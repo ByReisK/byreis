@@ -11,8 +11,6 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"runtime"
-	"strings"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -20,11 +18,6 @@ import (
 	"github.com/ByReisK/byreis/internal/adapter/fs/atomicwrite"
 	"github.com/ByReisK/byreis/internal/core/usecase"
 )
-
-// isLinux reports whether the test is running on Linux. Used to skip tests
-// that exercise Linux-specific syscall semantics (e.g. O_CREAT|O_EXCL|O_NOFOLLOW
-// returning ELOOP on a symlink path, which on macOS returns EEXIST instead).
-func isLinux() bool { return runtime.GOOS == "linux" }
 
 // ---------------------------------------------------------------------------
 // Item 17: O_CREAT|O_EXCL|O_NOFOLLOW temp-create tests
@@ -71,21 +64,37 @@ func TestWriteFile_TempCreate_EEXIST_Retries(t *testing.T) {
 	}
 }
 
-// TestWriteFile_TempCreate_ELOOP_FailClosed verifies that when ELOOP is returned
-// by O_NOFOLLOW on the temp-file path, WriteFile fails closed immediately with
-// an error mentioning "symlink injection at temp-file path", makes ZERO retries,
-// and leaves the live file unchanged.
+// TestWriteFile_TempCreate_SymlinkInjection_RetriesAndSucceeds asserts the
+// actual security property of the O_CREAT|O_EXCL|O_WRONLY|O_NOFOLLOW temp-create
+// path under symlink injection at the first attempted suffix.
 //
-// On macOS, O_CREAT|O_EXCL takes precedence over O_NOFOLLOW when a symlink
-// exists at the path: the OS returns EEXIST (not ELOOP), so the fail-closed
-// ELOOP path in openExclTempFile is not exercised. The ELOOP check is exercised
-// on Linux. This test is skipped on darwin.
-func TestWriteFile_TempCreate_ELOOP_FailClosed(t *testing.T) {
+// Platform behaviour (verified on both linux and darwin):
+//   - With O_CREAT|O_EXCL set, the kernel's path-exists check fires FIRST and
+//     returns EEXIST regardless of whether the existing path is a regular file
+//     or a symlink. O_NOFOLLOW's ELOOP branch never executes because O_EXCL has
+//     already aborted on the exists-check.
+//   - Linux and darwin behave identically here: symlink at temp path -> EEXIST.
+//
+// The defense against symlink injection at the temp path is therefore NOT the
+// ELOOP fail-closed branch; it is the layered combination of:
+//  1. O_EXCL — fails closed (EEXIST) on any existing path.
+//  2. crypto/rand 64-bit suffix — attacker cannot guess the next suffix to
+//     pre-stage another symlink there.
+//  3. Bounded retry (8) — under crypto/rand-unguessable suffixes, EEXIST
+//     collision probability is negligible.
+//  4. O_NOFOLLOW — retained as defense-in-depth in case a future kernel returns
+//     ELOOP-then-EEXIST, or someone modifies the helper to drop O_EXCL.
+//
+// What this test proves:
+//   - The first attempt collides (pre-staged symlink at the chosen suffix).
+//   - WriteFile retries with a fresh crypto/rand-derived suffix on attempt 2.
+//   - The retry succeeds; the live file is updated to the new content.
+//   - The attacker's symlink target file is unchanged — the write did NOT
+//     follow the symlink, because O_EXCL refused to open at the symlink path
+//     before O_NOFOLLOW would have been consulted.
+func TestWriteFile_TempCreate_SymlinkInjection_RetriesAndSucceeds(t *testing.T) {
 	if os.Getuid() == 0 {
 		t.Skip("skip as root: O_NOFOLLOW not enforced for root")
-	}
-	if !isLinux() {
-		t.Skip("ELOOP from O_CREAT|O_EXCL|O_NOFOLLOW on a symlink path only fires on Linux; skipping on this platform")
 	}
 	dir := t.TempDir()
 	livePath := filepath.Join(dir, "live.yaml")
@@ -94,43 +103,63 @@ func TestWriteFile_TempCreate_ELOOP_FailClosed(t *testing.T) {
 		t.Fatalf("WriteFile original: %v", err)
 	}
 
-	// Track how many times the suffix hook fires (proxy for retry count).
+	// Pre-stage an attacker-controlled target file. If the helper were to follow
+	// the symlink, the new content would end up here and this file would change.
+	attackerTarget := filepath.Join(dir, "attacker-target")
+	attackerOriginal := []byte("attacker-target-original")
+	if err := os.WriteFile(attackerTarget, attackerOriginal, 0o600); err != nil {
+		t.Fatalf("WriteFile attacker target: %v", err)
+	}
+
+	// On the first hook fire, plant a symlink (pointing at attackerTarget) at the
+	// suffix the helper just chose. The open will fail with EEXIST (O_EXCL fires
+	// first); the helper must retry with a fresh suffix.
 	var hookCalls atomic.Int32
 	atomicwrite.SetNextTempSuffixHook(func(suffix string) {
 		n := hookCalls.Add(1)
 		if n == 1 {
-			// On the first attempt, place a symlink at the temp path.
-			symlinkTarget := filepath.Join(dir, "attacker-target")
-			_ = os.WriteFile(symlinkTarget, []byte("target"), 0o600)
 			symlinkPath := filepath.Join(dir, suffix)
-			_ = os.Symlink(symlinkTarget, symlinkPath)
+			if err := os.Symlink(attackerTarget, symlinkPath); err != nil {
+				t.Errorf("pre-stage symlink failed: %v", err)
+			}
 		}
 	})
 	t.Cleanup(func() { atomicwrite.SetNextTempSuffixHook(nil) })
 
-	err := atomicwrite.WriteFile(context.Background(), livePath, []byte("injected"), 0o600)
-	if err == nil {
-		t.Fatal("expected ELOOP-class error from O_NOFOLLOW on temp symlink, got nil")
+	newContent := []byte("new content")
+	if err := atomicwrite.WriteFile(context.Background(), livePath, newContent, 0o600); err != nil {
+		t.Fatalf("WriteFile: expected success on retry after EEXIST-from-symlink, got: %v", err)
 	}
 
-	// The error must mention "symlink injection at temp-file path".
-	if !strings.Contains(err.Error(), "symlink injection at temp-file path") {
-		t.Errorf("error must mention 'symlink injection at temp-file path'; got: %v", err)
+	// The hook must have been called at least twice: once for the collided
+	// attempt, once for the retry. We assert >= 2 (the retry path may make
+	// additional attempts under crypto/rand collision, though probability is
+	// negligible; pinning to exactly 2 is acceptable here because the second
+	// suffix is unguessable and will not collide).
+	if n := hookCalls.Load(); n < 2 {
+		t.Errorf("expected >= 2 hook invocations (collision then retry); got %d", n)
 	}
 
-	// ZERO retries: the hook must have been called exactly once (fail-closed
-	// immediately, no further attempt).
-	if n := hookCalls.Load(); n != 1 {
-		t.Errorf("ELOOP must trigger ZERO retries; hook called %d time(s), want 1", n)
+	// The live file must contain the new content (write succeeded via the
+	// retried, non-colliding suffix).
+	got, err := os.ReadFile(livePath)
+	if err != nil {
+		t.Fatalf("ReadFile live: %v", err)
+	}
+	if string(got) != string(newContent) {
+		t.Errorf("live file content mismatch: got %q want %q", got, newContent)
 	}
 
-	// Live file must be unchanged.
-	got, readErr := os.ReadFile(livePath)
-	if readErr != nil {
-		t.Fatalf("ReadFile: %v", readErr)
+	// The attacker's target file must be unchanged. If O_EXCL/O_NOFOLLOW had
+	// failed and the helper had followed the symlink, this file would now hold
+	// newContent. EEXIST aborted the open before any write reached the target.
+	gotAttacker, err := os.ReadFile(attackerTarget)
+	if err != nil {
+		t.Fatalf("ReadFile attacker target: %v", err)
 	}
-	if string(got) != string(original) {
-		t.Errorf("live file was modified: got %q want %q", got, original)
+	if string(gotAttacker) != string(attackerOriginal) {
+		t.Errorf("attacker target was modified — symlink was followed: got %q want %q",
+			gotAttacker, attackerOriginal)
 	}
 }
 

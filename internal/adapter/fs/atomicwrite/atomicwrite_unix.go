@@ -113,13 +113,17 @@ func openExclTempFile(dir, prefix string) (*os.File, error) {
 			nextTempSuffixHook(filepath.Base(name))
 		}
 
-		// O_NOFOLLOW rejects a symlink at the final component (ELOOP on darwin/linux).
+		// O_NOFOLLOW is retained as defense-in-depth; under the current O_EXCL
+		// flag, EEXIST fires first on a symlink at the temp path (the kernel's
+		// path-exists check precedes link-resolution on both linux and darwin).
+		// The ELOOP branch below remains for the case where O_EXCL is dropped
+		// or a future libc/kernel variant surfaces ELOOP in this combination.
 		f, err := os.OpenFile(name, flags|syscall.O_NOFOLLOW, 0o600)
 		if err == nil {
 			return f, nil
 		}
 
-		// ELOOP: symlink at the temp path — fail closed, NO retry.
+		// ELOOP: defense-in-depth fail-closed branch (see comment above).
 		if errors.Is(err, syscall.ELOOP) {
 			return nil, fmt.Errorf(
 				"symlink injection at temp-file path: %s: %w",
