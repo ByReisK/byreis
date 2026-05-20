@@ -98,7 +98,7 @@ func CheckTrustDirTOCTOU(dirPath string) (*os.File, error) {
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil, fmt.Errorf("config directory %q does not exist — "+
-				"create it with: mkdir -m 700 %s", dirPath, dirPath)
+				"create it with: mkdir -m 700 %s: %w", dirPath, dirPath, err)
 		}
 		if isSymlinkError(err) {
 			return nil, fmt.Errorf("%w: %s", ErrTrustDirSymlink, dirPath)
@@ -152,7 +152,7 @@ func CheckTrustFileTOCTOU(filePath string) (*os.File, error) {
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil, fmt.Errorf("trust anchor file %q does not exist — "+
-				"run `byreis init` to initialise the project", filePath)
+				"run `byreis init` to initialise the project: %w", filePath, err)
 		}
 		if isSymlinkError(err) {
 			return nil, fmt.Errorf(

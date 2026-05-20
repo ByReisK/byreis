@@ -2,6 +2,7 @@ package trust_test
 
 import (
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -262,6 +263,95 @@ func TestCheckTrustFileTOCTOU_ELOOP_Mapped(t *testing.T) {
 			t.Skip("O_NOFOLLOW not supported on this platform")
 		}
 		t.Errorf("expected ErrTrustAnchorSymlink, got: %v", err)
+	}
+}
+
+// TestCheckTrustDirTOCTOU_AbsentDir_ErrorsIsFsErrNotExist asserts that when the
+// target directory does not exist, errors.Is(err, fs.ErrNotExist) returns true.
+// REQ: ENOENT-CHAINING fix — the %w chain must survive the fmt.Errorf wrap.
+func TestCheckTrustDirTOCTOU_AbsentDir_ErrorsIsFsErrNotExist(t *testing.T) {
+	t.Parallel()
+
+	tmp := t.TempDir()
+	absent := filepath.Join(tmp, "nonexistent-byreis-dir")
+
+	_, err := trust.CheckTrustDirTOCTOU(absent)
+	if err == nil {
+		t.Fatal("expected error for absent directory, got nil")
+	}
+	if !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("errors.Is(err, fs.ErrNotExist) must be true for absent path; got err: %v", err)
+	}
+}
+
+// TestCheckTrustFileTOCTOU_AbsentFile_ErrorsIsFsErrNotExist asserts that when
+// the trust anchor file does not exist, errors.Is(err, fs.ErrNotExist) returns
+// true.
+// REQ: ENOENT-CHAINING fix — the %w chain must survive the fmt.Errorf wrap.
+func TestCheckTrustFileTOCTOU_AbsentFile_ErrorsIsFsErrNotExist(t *testing.T) {
+	t.Parallel()
+
+	tmp := t.TempDir()
+	absent := filepath.Join(tmp, "trust.yaml")
+
+	_, err := trust.CheckTrustFileTOCTOU(absent)
+	if err == nil {
+		t.Fatal("expected error for absent file, got nil")
+	}
+	if !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("errors.Is(err, fs.ErrNotExist) must be true for absent path; got err: %v", err)
+	}
+}
+
+// TestCheckTrustDirTOCTOU_OtherErrors_PreservedNoFalsePositive asserts that a
+// non-ENOENT error (symlink at the final component) does NOT satisfy
+// errors.Is(err, fs.ErrNotExist). Guards against over-eager wrapping.
+func TestCheckTrustDirTOCTOU_OtherErrors_PreservedNoFalsePositive(t *testing.T) {
+	t.Parallel()
+
+	tmp := t.TempDir()
+	realDir := filepath.Join(tmp, "real")
+	symlinkDir := filepath.Join(tmp, "byreis")
+
+	if err := os.Mkdir(realDir, 0o700); err != nil {
+		t.Fatalf("Mkdir: %v", err)
+	}
+	if err := os.Symlink(realDir, symlinkDir); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+
+	_, err := trust.CheckTrustDirTOCTOU(symlinkDir)
+	if err == nil {
+		t.Fatal("expected error for symlink dir, got nil")
+	}
+	if errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("errors.Is(err, fs.ErrNotExist) must be false for symlink error; got err: %v", err)
+	}
+}
+
+// TestCheckTrustFileTOCTOU_OtherErrors_PreservedNoFalsePositive asserts that a
+// non-ENOENT error (symlink at the final component) does NOT satisfy
+// errors.Is(err, fs.ErrNotExist). Guards against over-eager wrapping.
+func TestCheckTrustFileTOCTOU_OtherErrors_PreservedNoFalsePositive(t *testing.T) {
+	t.Parallel()
+
+	tmp := t.TempDir()
+	realFile := filepath.Join(tmp, "real.yaml")
+	symlinkPath := filepath.Join(tmp, "trust.yaml")
+
+	if err := os.WriteFile(realFile, []byte("signer_fingerprint: abc"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if err := os.Symlink(realFile, symlinkPath); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+
+	_, err := trust.CheckTrustFileTOCTOU(symlinkPath)
+	if err == nil {
+		t.Fatal("expected error for symlink file, got nil")
+	}
+	if errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("errors.Is(err, fs.ErrNotExist) must be false for symlink error; got err: %v", err)
 	}
 }
 
