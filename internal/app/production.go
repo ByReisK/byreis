@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -801,12 +802,105 @@ func configDirFromEnvProd() string {
 	return home + "/.config/byreis"
 }
 
-// baseBranchFromEnvProd returns the base branch name (default: "main").
-func baseBranchFromEnvProd() string {
-	if v := os.Getenv("BYREIS_BASE_BRANCH"); v != "" {
-		return v
+// baseBranchAllowRE is the positive whitelist for BYREIS_BASE_BRANCH values.
+//
+// Allowed characters: ASCII letters, digits, dot, underscore, hyphen, forward
+// slash. This covers every valid git branch name an operator realistically uses
+// (e.g. "main", "release/1.0", "feature/foo-bar", "v1.2.3") without permitting
+// any character that can be mistaken for a git option flag or a path escape.
+//
+// Additional structural rules enforced AFTER the character check (see
+// validateBaseBranch): no leading dash, no "..", no "@{", no trailing ".",
+// no ".lock" suffix, no leading/trailing "/", no "//" run, no leading ".",
+// no leading/trailing whitespace, no NUL or control bytes, max 200 bytes.
+//
+// 200 bytes: git's internal refname limit is much higher, but no legitimate
+// branch name in practice exceeds ~80 characters. 200 is a safe, generous cap
+// that keeps git argv construction well within OS limits.
+var baseBranchAllowRE = regexp.MustCompile(`^[A-Za-z0-9._/\-]+$`)
+
+// validateBaseBranch applies the positive-whitelist check to a candidate
+// BYREIS_BASE_BRANCH value. Returns (value, true) when accepted; ("main",
+// false) when rejected. This helper lives in the composition layer (internal/app)
+// and must not be promoted to internal/core — no business logic here, only
+// argv-safety hygiene for the env-reader.
+func validateBaseBranch(v string) (string, bool) {
+	const maxLen = 200
+	const fallback = "main"
+
+	// Length cap — protects against unreasonably long argv tokens.
+	if len(v) > maxLen {
+		return fallback, false
 	}
-	return "main"
+
+	// Positive character whitelist: [A-Za-z0-9._/-] only.
+	if !baseBranchAllowRE.MatchString(v) {
+		return fallback, false
+	}
+
+	// Leading dash: the primary exploit shape (option injection into git argv).
+	if v[0] == '-' {
+		return fallback, false
+	}
+
+	// Leading dot: hidden-name convention; also blocked by git check-ref-format.
+	if v[0] == '.' {
+		return fallback, false
+	}
+
+	// Leading slash: absolute path; never a valid branch name segment.
+	if v[0] == '/' {
+		return fallback, false
+	}
+
+	// Trailing slash: invalid per git check-ref-format.
+	if v[len(v)-1] == '/' {
+		return fallback, false
+	}
+
+	// Trailing dot: invalid per git check-ref-format.
+	if v[len(v)-1] == '.' {
+		return fallback, false
+	}
+
+	// ".lock" suffix: git refuses refs ending in .lock.
+	if strings.HasSuffix(v, ".lock") {
+		return fallback, false
+	}
+
+	// ".." anywhere: path traversal / ambiguous range syntax.
+	if strings.Contains(v, "..") {
+		return fallback, false
+	}
+
+	// "@{" anywhere: git reflog syntax that can confuse rev-parse.
+	if strings.Contains(v, "@{") {
+		return fallback, false
+	}
+
+	// "//" run: invalid per git check-ref-format.
+	if strings.Contains(v, "//") {
+		return fallback, false
+	}
+
+	return v, true
+}
+
+// baseBranchFromEnvProd returns the base branch name (default: "main").
+// If BYREIS_BASE_BRANCH is set but fails the positive-whitelist check, the
+// function falls back to "main" and emits a warning to stderr so operators
+// can diagnose misconfiguration without crashing.
+func baseBranchFromEnvProd() string {
+	v := os.Getenv("BYREIS_BASE_BRANCH")
+	if v == "" {
+		return "main"
+	}
+	validated, ok := validateBaseBranch(v)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "byreis: WARN BYREIS_BASE_BRANCH value rejected by allowlist, falling back to \"main\"\n")
+		return "main"
+	}
+	return validated
 }
 
 // githubTokenProd reads the GitHub token from BYREIS_GITHUB_TOKEN or falls
