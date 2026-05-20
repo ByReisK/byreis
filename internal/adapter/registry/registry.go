@@ -551,8 +551,8 @@ func (c *Client) CounterAuthority(ctx context.Context, projectID, fileName strin
 	if hasCachedCounter && lastAccepted < cachedCounter {
 		return countertypes.CounterAuthority{}, fmt.Errorf(
 			"%w: fetched last_accepted_counter %d for (%s,%s) is less than cached value %d — "+
-				"possible rollback or cache tamper; delete the cache and re-fetch: "+
-				"rm -rf ~/.cache/byreis/registry",
+				"possible rollback or cache tamper; restart the byreis process to clear "+
+				"the in-memory counter cache, then re-run the command",
 			coreregistry.ErrCacheTampered, lastAccepted, projectID, fileName, cachedCounter)
 	}
 
@@ -838,8 +838,8 @@ func (c *Client) SimulateCacheCounterRegression(ctx context.Context, projectID, 
 	if has && fetchedCounter < existing {
 		return fmt.Errorf(
 			"%w: fetched last_accepted_counter %d for (%s,%s) is less than cached value %d — "+
-				"possible rollback or cache tamper; delete the cache and re-fetch: "+
-				"rm -rf ~/.cache/byreis/registry",
+				"possible rollback or cache tamper; restart the byreis process to clear "+
+				"the in-memory counter cache, then re-run the command",
 			coreregistry.ErrCacheTampered, fetchedCounter, projectID, fileName, existing)
 	}
 	return nil

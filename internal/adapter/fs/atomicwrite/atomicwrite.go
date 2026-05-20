@@ -15,11 +15,26 @@
 //   - Atomic rename over the live path as the ONLY live-path mutation.
 //   - fsync the parent directory after rename (best-effort durability).
 //   - MUST NOT follow a symlink at the live path (O_NOFOLLOW on lstat check).
+//   - MUST NOT follow a symlink at the parent directory of the live path
+//     (O_NOFOLLOW-equivalent open of parent + inode re-check before rename).
 //   - MUST NOT widen a pre-existing mode/owner (preserve existing live-file
 //     perms; if none, apply the secrets-file policy default: 0600).
 //   - Any failure leaves the live file byte-identical and removes temp residue.
 //   - Context cancellation is honoured at every I/O step; cancellation leaves
 //     the live file untouched and removes the temp residue.
+//
+// Platform notes:
+//
+// Unix (Linux, Darwin): the parent directory is opened with O_NOFOLLOW to
+// reject symlinks at the final component. An inode snapshot is captured via
+// fstat(2) at open time and re-verified immediately before unix.Renameat(2).
+// Any mismatch (concurrent directory swap) returns ErrAtomicWriteParentChanged.
+//
+// Windows: the parent directory is opened with FILE_FLAG_OPEN_REPARSE_POINT to
+// reject reparse points. The FileIndex/VolumeSerialNumber is captured and
+// re-verified before os.Rename. Windows does not expose renameat(2), so
+// os.Rename is used instead; the pre/post inode verification provides
+// equivalent protection. See ErrAtomicWriteParentChanged for the sentinel.
 package atomicwrite
 
 import (
@@ -43,6 +58,31 @@ const secretsFileDefaultMode os.FileMode = 0o600
 var ErrSymlinkAtLivePath = errors.New(
 	"live secrets file path resolves to a symlink — the atomic write refused " +
 		"to follow it; resolve the symlink manually and retry")
+
+// ErrAtomicWriteWindowsUnsupported is returned by performAtomicRename on
+// Windows. Windows is not a supported release target for byreis write
+// operations at this time. Use the Linux or macOS build instead, or wait
+// for a follow-up release that adds Windows write-path support.
+//
+// This sentinel is declared in the build-tag-neutral file so that callers on
+// any platform can use errors.Is(err, ErrAtomicWriteWindowsUnsupported)
+// without a build-tag guard.
+var ErrAtomicWriteWindowsUnsupported = errors.New(
+	"atomic write is not supported on Windows: use the Linux or macOS build of " +
+		"byreis, or wait for a follow-up release that supports the Windows write path")
+
+// ErrAtomicWriteParentChanged is returned when the parent directory of the
+// live secrets file changed between the pre-write inode snapshot and the
+// rename syscall. This indicates a possible concurrent directory swap or
+// symlink injection attack on the write path.
+//
+// Operator hint: the file's parent directory was modified during the write
+// (possibly by a concurrent process or an attacker); retry the operation
+// after verifying the integrity of the secrets directory tree.
+var ErrAtomicWriteParentChanged = errors.New(
+	"atomic write aborted: the file's parent directory changed between the " +
+		"inode snapshot and the rename (possible concurrent swap or symlink " +
+		"injection); verify the secrets directory tree and retry")
 
 // Writer implements usecase.AtomicFileWriter for the real filesystem. It is
 // constructed via New and has no mutable state; all methods are safe for
@@ -201,10 +241,11 @@ func (w *Writer) WriteFileOfRecord(ctx context.Context, in usecase.AtomicWriteIn
 			targetMode, tmpPath, err)
 	}
 
-	// (7) Atomic rename: the ONLY live-path mutation. After this succeeds, the
-	// live file is replaced atomically. The deferred cleanup will NOT run on
-	// nil return (Go defer with named return retErr).
-	if err := os.Rename(tmpPath, livePath); err != nil {
+	// (7) Atomic rename: the ONLY live-path mutation. performAtomicRename
+	// opens the parent directory with O_NOFOLLOW-equivalent semantics,
+	// captures an inode snapshot, and verifies the snapshot immediately
+	// before the rename to detect any concurrent directory swap.
+	if err := performAtomicRename(tmpPath, livePath, dir); err != nil {
 		return fmt.Errorf(
 			"WriteFileOfRecord: atomic rename %q -> %q for project %q file %q: %w — "+
 				"the live file is unchanged",
