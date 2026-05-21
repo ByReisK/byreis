@@ -19,6 +19,7 @@ linters:
     - gosec          # security issues (informational; non-blocking on skeleton)
     - revive         # idiomatic Go
     - exhaustive     # exhaustive switch checks
+    - forbidigo      # bans specific identifiers (forward-secrecy warning boundary)
 
   settings:
     depguard:
@@ -87,6 +88,23 @@ linters:
           deny:
             - pkg: "github.com/ByReisK/byreis/internal/adapter"
               desc: "pkg/byreis and internal/cli must not import adapters directly. Adapters are wired in cmd/byreis/main.go via constructor injection."
+
+    forbidigo:
+      # Defend the forward-secrecy doc-gate fixture's "independent []byte
+      # literal" boundary. A future refactor that would replace the verbatim
+      # fixture with `[]byte(rotate.ForwardSecrecyWarning)` (a "DRY refactor")
+      # collapses the three-way equality (constant ⇄ fixture ⇄ ADR verbatim
+      # block) into a single-source equality and silently green-lights any
+      # regression in the production constant. The rule bans the token
+      # globally; the ONLY legitimate references are the byte-equality
+      # assertion sites in rotate_test.go (default-tag self-test) and
+      # forward_secrecy_doc_gate_test.go (doc-gate fixture). Both carry a
+      # //nolint:forbidigo // boundary: equality assertion only mark on the
+      # single allowed line.
+      forbid:
+        - pattern: 'rotate\.ForwardSecrecyWarning'
+          msg: "rotate.ForwardSecrecyWarning may only be referenced at byte-equality assertion sites against an independent verbatim fixture; any other reference defeats the forward-secrecy three-way equality check. If this is a legitimate boundary assertion, mark the line with //nolint:forbidigo // boundary: equality assertion only."
+      analyze-types: false
 
     govet:
       enable-all: true

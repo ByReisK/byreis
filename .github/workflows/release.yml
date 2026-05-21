@@ -25,12 +25,34 @@ jobs:
         # of any other green results.
         run: go test -v -race -tags shipgate -timeout=120s ./internal/core/usecase/
 
+  # The docgate job is the second non-bypassable gating leg, paired with shipgate.
+  # It runs the forward-secrecy warning verbatim cross-check and the
+  # release-workflow wiring assertion (which itself verifies this job remains in
+  # the release job's needs: array). A red docgate result blocks release via
+  # needs: [shipgate, docgate] on the release job; there is no manual-override
+  # path.
+  docgate:
+    name: Doc Gate (BLOCKS RELEASE)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+          cache: true
+      - name: Run docgate suite (forward-secrecy warning + release-wiring)
+        # Non-skippable. A red result means the build does not ship.
+        run: go test -v -race -tags docgate -timeout=120s ./internal/core/usecase/rotate/
+
   release:
     name: Release
     runs-on: ubuntu-latest
-    # The release job has needs: [shipgate] with no manual-override path. A red
-    # shipgate job prevents this job from running.
-    needs: [shipgate]
+    # The release job has needs: [shipgate, docgate] with no manual-override
+    # path. A red result on either gate prevents this job from running. The
+    # docgate suite itself contains a structural test
+    # (TestReleaseWorkflow_DocgateGateWiringIntact) that asserts BOTH entries
+    # remain in this array; dropping either would surface inside docgate.
+    needs: [shipgate, docgate]
     permissions:
       contents: write
     steps:
@@ -41,16 +63,17 @@ jobs:
         with:
           go-version: "1.26.x"
           cache: true
-      - name: Assert release build carries no testhook / build-influencing env
+      - name: Assert release build carries no testhook / docgate / build-influencing env
         # Fail-closed half of the testhook control gate on the RELEASE path.
         # The symbol-absence half is the Go AST test TestShippedSurface_*
-        # (run by the shipgate job below under DEFAULT tags, which gates this
-        # release via needs: [shipgate]). This step asserts the release build
-        # invocation itself is clean.
+        # (run by the shipgate job above under DEFAULT tags, which gates this
+        # release via needs: [shipgate, docgate]). This step asserts the
+        # release build invocation itself is clean — no -tags testhook, no
+        # -tags docgate, and no GOFLAGS/GOEXPERIMENT that could smuggle a tag.
         run: |
           set -euo pipefail
           if [ -n "${GOFLAGS:-}" ]; then
-            echo "::error::GOFLAGS is set ('${GOFLAGS}') for the release build. It must be unset: it can inject -tags testhook out of band."
+            echo "::error::GOFLAGS is set ('${GOFLAGS}') for the release build. It must be unset: it can inject -tags testhook or -tags docgate out of band."
             exit 1
           fi
           if [ -n "${GOEXPERIMENT:-}" ]; then
@@ -64,7 +87,13 @@ jobs:
               exit 1
               ;;
           esac
-          echo "release build invocation is clean: no -tags testhook, GOFLAGS/GOEXPERIMENT unset."
+          case "$RELEASE_CMDS" in
+            *docgate*)
+              echo "::error::release build invocation contains 'docgate' — the docgate tag must never be compiled into a released binary."
+              exit 1
+              ;;
+          esac
+          echo "release build invocation is clean: no -tags testhook, no -tags docgate, GOFLAGS/GOEXPERIMENT unset."
       - name: Build release binary
         run: |
           VERSION="${GITHUB_REF_NAME}"

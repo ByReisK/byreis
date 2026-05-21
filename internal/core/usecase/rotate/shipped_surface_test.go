@@ -47,12 +47,17 @@ const rotateOwnPkgGuard = "github.com/ByReisK/byreis/internal/core/usecase/rotat
 // release build could compile this package under. The default (no-tag) set
 // is the real shipped configuration. testhook is included precisely because
 // the gap was that a tagged exported producer/modifier could go unseen.
+// docgate is included per V4 BO-V4-T2: the docgate tag must NOT widen the
+// shipped Rotator surface AND must NOT transitively pull testhook.go into
+// the compilation unit (parity-asserted both by the AST guard below and
+// by the CI list-files check in .github/workflows/ci.yml).
 var rotateShippedCandidateTagSets = []struct {
 	name string
 	tags string
 }{
 	{name: "default (real shipped build)", tags: ""},
 	{name: "testhook (must stay test-only and witness-gated)", tags: "testhook"},
+	{name: "docgate (must stay test-only and disjoint from testhook)", tags: "docgate"},
 }
 
 // TestShippedSurface_Rotate_NoUnwitnessedRotatorModifier is the mechanical
@@ -137,6 +142,52 @@ func TestShippedSurface_Rotate_NoUnwitnessedRotatorModifier(t *testing.T) {
 				if deltaCount == 0 {
 					t.Logf("note: testhook delta is empty (the rotation hook may have been " +
 						"removed; if not, this guard is no longer observing the testhook surface)")
+				}
+			}
+
+			// Rule 4 (V4 BO-V4-T2): under docgate, the exported Rotator
+			// surface MUST be IDENTICAL to the default tag set (no delta
+			// producers/modifiers). docgate is a test-only sibling lane
+			// that compiles only docgate-tagged TEST files; it must not
+			// introduce ANY shipped-binary-visible Rotator-surface change.
+			// A non-empty delta means either (a) the docgate tag pulled
+			// testhook.go in transitively (parity-broken), or (b) some
+			// new docgate-tagged file under rotate/ widened the surface
+			// — either is a release-blocking regression.
+			if ts.tags == "docgate" {
+				defaultSurface := exportedRotatorSurface(t, "")
+				defaultNames := map[string]bool{}
+				for _, p := range defaultSurface {
+					defaultNames[p.name] = true
+				}
+				docgateNames := map[string]bool{}
+				for _, p := range producers {
+					docgateNames[p.name] = true
+				}
+				var added, removed []string
+				for n := range docgateNames {
+					if !defaultNames[n] {
+						added = append(added, n)
+					}
+				}
+				for n := range defaultNames {
+					if !docgateNames[n] {
+						removed = append(removed, n)
+					}
+				}
+				if len(added) > 0 || len(removed) > 0 {
+					t.Errorf("FAIL: under -tags docgate the exported Rotator surface "+
+						"differs from the default tag set.\n"+
+						"  added (docgate ⊃ default): %v\n"+
+						"  removed (default ⊃ docgate): %v\n"+
+						"  docgate is a test-only sibling lane; it must NOT widen "+
+						"  or modify the shipped Rotator surface. A non-empty delta "+
+						"  typically means the docgate tag transitively pulled "+
+						"  testhook.go (BO-V4-T2 parity break) or a new docgate-"+
+						"  tagged shipped file under rotate/ leaked surface.",
+						added, removed)
+				} else {
+					t.Logf("OK: -tags docgate Rotator surface is identical to default.")
 				}
 			}
 		})
@@ -256,6 +307,44 @@ func GatedWrap(w *rotationTestHookWitness, r Rotator) Rotator {
 		}
 		t.Log("control: witness-gated Rotator-modifier classifies safely.")
 	})
+}
+
+// TestShippedSurface_Rotate_DocgateTagDoesNotPullTesthook is the V4 BO-V4-T2
+// AST-side parity check: under -tags docgate, testhook.go MUST NOT appear
+// in GoFiles (i.e. its `//go:build testhook` constraint stays unsatisfied).
+// The CI half of this gate is the docgate-tag-isolation job in
+// .github/workflows/ci.yml; this Go test is the authoritative half — a CI
+// step that cannot run must fail loudly, and the gate is duplicated here
+// so a local `make test-docgate`-adjacent run surfaces a regression
+// without waiting on CI.
+//
+// A docgate tag that transitively pulled testhook.go would silently
+// compile the rotation crash-injection hook into the docgate compilation
+// unit, defeating BO-V4-T2's tag-isolation guarantee.
+func TestShippedSurface_Rotate_DocgateTagDoesNotPullTesthook(t *testing.T) {
+	t.Parallel()
+
+	cmd := exec.CommandContext(t.Context(), "go", "list", "-tags", "docgate",
+		"-f", "{{range .GoFiles}}{{.}}\n{{end}}", rotateOwnPkgGuard)
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("TAG-ISOLATION GATE FAIL: `go list -tags docgate -f ... %s` failed: %v\n"+
+			"A gate that cannot run is a failure, never a silent pass.",
+			rotateOwnPkgGuard, err)
+	}
+	files := strings.Fields(strings.TrimSpace(string(out)))
+	for _, f := range files {
+		if f == "testhook.go" {
+			t.Fatalf("TAG-ISOLATION GATE FAIL: testhook.go is in GoFiles under "+
+				"-tags docgate.\n"+
+				"  GoFiles: %v\n\n"+
+				"This means the docgate tag is transitively pulling the testhook "+
+				"compilation unit — a BO-V4-T2 parity break. Either testhook.go "+
+				"had its //go:build constraint relaxed, or a new file under rotate/ "+
+				"has both docgate AND testhook in its constraint.", files)
+		}
+	}
+	t.Logf("OK: under -tags docgate, GoFiles=%v does not include testhook.go.", files)
 }
 
 // rotateSurfaceEntry describes one exported package-level func that touches

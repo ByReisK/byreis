@@ -13,7 +13,7 @@ LDFLAGS      := -X $(MODULE)/pkg/byreis.Version=$(VERSION)
 GOLANGCI     := golangci-lint
 GO_TEST_FLAGS := -race -timeout=120s
 
-.PHONY: build test test-testhook test-shipgate lint install clean check-allowlist check-publish-boundary ci-parity ci-parity-windows-build
+.PHONY: build test test-testhook test-shipgate test-docgate lint install clean check-allowlist check-publish-boundary ci-parity ci-parity-windows-build
 
 ## build: compile the byreis binary to ./bin/byreis
 build:
@@ -32,6 +32,12 @@ test-testhook:
 ## test-shipgate: run the non-skippable asymmetric-access ship-gate suite
 test-shipgate:
 	go test $(GO_TEST_FLAGS) -tags shipgate -run TestAsymmetryShipGate ./internal/core/usecase/
+
+## test-docgate: run the docgate suite (forward-secrecy warning verbatim + release-wiring assertion)
+## The docgate tag is a non-default sibling lane to shipgate; it is never compiled into a shipped
+## binary (asserted structurally by shipped_surface_test.go and by the CI release-build-clean check).
+test-docgate:
+	go test $(GO_TEST_FLAGS) -tags docgate -run 'TestForwardSecrecyWarning_VerbatimMatch|TestForwardSecrecyWarning_RunbookPathReferenceIntact|TestReleaseWorkflow_DocgateGateWiringIntact' ./internal/core/usecase/rotate/
 
 ## lint: run golangci-lint (enforces Clean Architecture dependency rules)
 lint:

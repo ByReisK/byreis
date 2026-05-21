@@ -16,17 +16,20 @@ jobs:
         with:
           go-version: "1.26.x"
           cache: true
-      - name: Assert shipped build carries no testhook / build-influencing env
+      - name: Assert shipped build carries no testhook / docgate / build-influencing env
         # Fail-closed half of the testhook control gate. The symbol-absence
         # half is the Go AST test TestShippedSurface_* in
         # internal/core/registry/countertypes (run by the 'test' and 'shipgate'
         # jobs under DEFAULT tags). This step asserts the BUILD invocation
-        # itself is clean: no -tags testhook, and no GOFLAGS/GOEXPERIMENT that
-        # could smuggle a tag or alter codegen.
+        # itself is clean: no -tags testhook, no -tags docgate, and no
+        # GOFLAGS/GOEXPERIMENT that could smuggle a tag or alter codegen.
+        # The docgate-clean check mirrors the testhook-clean precedent: the
+        # docgate tag is a non-default sibling lane that compiles only test
+        # files and must never appear in a shipped/release build invocation.
         run: |
           set -euo pipefail
           if [ -n "${GOFLAGS:-}" ]; then
-            echo "::error::GOFLAGS is set ('${GOFLAGS}') for the shipped build step. It must be unset: it can inject -tags testhook out of band."
+            echo "::error::GOFLAGS is set ('${GOFLAGS}') for the shipped build step. It must be unset: it can inject -tags testhook or -tags docgate out of band."
             exit 1
           fi
           if [ -n "${GOEXPERIMENT:-}" ]; then
@@ -40,7 +43,13 @@ jobs:
               exit 1
               ;;
           esac
-          echo "shipped build invocation is clean: no -tags testhook, GOFLAGS/GOEXPERIMENT unset."
+          case "$BUILD_CMD" in
+            *docgate*)
+              echo "::error::shipped build invocation contains 'docgate' — the docgate tag must never be compiled into a shipped binary."
+              exit 1
+              ;;
+          esac
+          echo "shipped build invocation is clean: no -tags testhook, no -tags docgate, GOFLAGS/GOEXPERIMENT unset."
       - name: Build
         run: go build ./cmd/byreis
 
@@ -144,3 +153,48 @@ jobs:
         # package where the suite lives — the Submit sub-package import allowlist
         # is covered by the allowlist job above.
         run: go test -v -race -tags shipgate -timeout=120s ./internal/core/usecase/
+
+  docgate:
+    name: Doc Gate (forward-secrecy warning + release-wiring)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+          cache: true
+      - name: Run docgate suite (verbatim ADR-0016 §D9 warning + release.yml needs: integrity)
+        # This job is non-skippable on CI; the matching release-pipeline job in
+        # release.yml is the release-blocking half (needs: [shipgate, docgate]).
+        # Verifies (a) the production rotate.ForwardSecrecyWarning constant
+        # matches the verbatim ADR-0016 §D9 block byte-for-byte, and (b) the
+        # release workflow's needs: array still carries BOTH shipgate AND
+        # docgate so the docgate gate cannot be silently dropped.
+        run: go test -v -race -tags docgate -timeout=120s ./internal/core/usecase/rotate/
+
+  docgate-tag-isolation:
+    name: Doc Gate tag isolation (docgate does not pull testhook)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+          cache: true
+      - name: Assert -tags docgate does not compile testhook.go (tag isolation CI half)
+        # The shipped_surface_test.go default-tag AST guard asserts the
+        # symbol-absence half. This step is the CI parity check: under
+        # -tags docgate, testhook.go must remain in IgnoredGoFiles (i.e. its
+        # `//go:build testhook` constraint is unsatisfied). A docgate tag that
+        # transitively pulled testhook would silently compile crash-injection
+        # hooks into the docgate compilation unit; this step makes that a CI
+        # red.
+        run: |
+          set -euo pipefail
+          OUT="$(go list -tags docgate -f '{{range .GoFiles}}GO:{{.}}{{"\n"}}{{end}}{{range .IgnoredGoFiles}}IG:{{.}}{{"\n"}}{{end}}' ./internal/core/usecase/rotate/)"
+          echo "$OUT"
+          if echo "$OUT" | grep -q '^GO:testhook.go$'; then
+            echo "::error::testhook.go is in GoFiles under -tags docgate — the docgate tag is transitively pulling the testhook lane."
+            exit 1
+          fi
+          echo "docgate tag isolation OK: testhook.go is not compiled under -tags docgate."

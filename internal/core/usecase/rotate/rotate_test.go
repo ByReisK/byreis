@@ -726,7 +726,7 @@ func TestForwardSecrecyWarning_VerbatimMatchesADR0016(t *testing.T) {
 		"This is a property of the `age` cryptographic primitive (Model B) and\n" +
 		"of git's append-only history, not a byreis bug. See docs/forward-\n" +
 		"secrecy.md for the runbook.")
-	got := []byte(rotate.ForwardSecrecyWarning)
+	got := []byte(rotate.ForwardSecrecyWarning) //nolint:forbidigo // boundary: equality assertion only
 	if len(got) != len(want) {
 		t.Fatalf("ForwardSecrecyWarning length mismatch: got %d, want %d "+
 			"(divergence from ADR-0016 D9 verbatim block)",
