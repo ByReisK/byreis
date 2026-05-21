@@ -163,13 +163,14 @@ jobs:
         with:
           go-version: "1.26.x"
           cache: true
-      - name: Run docgate suite (verbatim ADR-0016 §D9 warning + release.yml needs: integrity)
+      - name: Run docgate suite (verbatim forward-secrecy warning + release-wiring integrity)
         # This job is non-skippable on CI; the matching release-pipeline job in
-        # release.yml is the release-blocking half (needs: [shipgate, docgate]).
-        # Verifies (a) the production rotate.ForwardSecrecyWarning constant
-        # matches the verbatim ADR-0016 §D9 block byte-for-byte, and (b) the
-        # release workflow's needs: array still carries BOTH shipgate AND
-        # docgate so the docgate gate cannot be silently dropped.
+        # release.yml is the release-blocking half (needs both shipgate and
+        # docgate). Verifies (a) the production rotate.ForwardSecrecyWarning
+        # constant matches the canonical verbatim warning block byte-for-byte,
+        # and (b) the release workflow's needs list still carries BOTH the
+        # shipgate AND docgate legs so the docgate gate cannot be silently
+        # dropped.
         run: go test -v -race -tags docgate -timeout=120s ./internal/core/usecase/rotate/
 
   docgate-tag-isolation:
