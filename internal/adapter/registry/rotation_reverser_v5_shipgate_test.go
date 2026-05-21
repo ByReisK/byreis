@@ -119,36 +119,35 @@ func TestV5Reverser_AuditAtomicitySingleCommit(t *testing.T) {
 		t.Fatalf("call[5] expected 'git commit', got name=%q args=%v", commitCall.name, commitCall.args)
 	}
 
-	// Extract the -m value.
-	var msg string
+	// The commit must use -F <msgFile> (not -m) so byreis-sig: never appears in argv.
+	var msgFile string
 	for i, arg := range commitCall.args {
-		if arg == "-m" && i+1 < len(commitCall.args) {
-			msg = commitCall.args[i+1]
+		if arg == "-F" && i+1 < len(commitCall.args) {
+			msgFile = commitCall.args[i+1]
 			break
 		}
 	}
-	if msg == "" {
-		t.Fatal("commit message is empty or -m flag not found")
+	if msgFile == "" {
+		t.Fatalf("commit call missing -F flag — byreis-sig: must not appear in argv; args = %v", commitCall.args)
+	}
+	if !strings.Contains(msgFile, "commitmsg-reversal") {
+		t.Errorf("commit -F path %q does not contain 'commitmsg-reversal'", msgFile)
 	}
 
-	// Shipgate assertions on the signed commit body:
-	shipgateAssert := []struct {
-		needle string
-		label  string
-	}{
-		{"byreis: rotation reversal", "header"},
-		{"project_id: sg-proj", "project_id field"},
-		{"pending_cleared: db-enc", "pending_cleared field"},
-		{"audit_entry_sha:", "audit_entry_sha field (atomicity proof)"},
-		{"registry_parent_sha:", "registry_parent_sha (CAS anchor)"},
-		{"byreis-signer:", "signer envelope"},
-		{"byreis-sig:", "signature envelope"},
-	}
-	for _, sa := range shipgateAssert {
-		if !strings.Contains(msg, sa.needle) {
-			t.Errorf("commit body missing %s (%q): full body = %q", sa.label, sa.needle, msg)
+	// No -m flag must appear (no byreis-sig: in argv).
+	for _, arg := range commitCall.args {
+		if arg == "-m" {
+			t.Errorf("commit args contain -m flag — byreis-sig: would be in argv; args = %v", commitCall.args)
+			break
 		}
 	}
+
+	// The -F path suffices as structural argv proof. The message body itself is
+	// written to the file by the adapter and removed by a deferred os.Remove
+	// after ClearPendings returns. The content-body assertions are covered by
+	// the unit-level TestReverser_ClearPendings_HappyPath_SingleCommitAtomicity
+	// row (which uses a content-capturing mock runner to read the file before
+	// the defer fires); this row focuses on the argv-safety invariant.
 
 	// Push call (index 6) must carry --force-with-lease.
 	pushCall := runner.callAt(6)

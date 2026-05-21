@@ -162,4 +162,22 @@ var (
 		"refusing to rotate: the typed fingerprint does not match the displayed " +
 			"recipient — re-run and type the full 64-char SHA-256 fingerprint exactly " +
 			"as displayed; rotation never proceeds on a partial-match")
+
+	// ErrCommitBumpRejectedRotationInFlight is returned by the Submit/Merge
+	// CommitBump use-case wrapper when the RotationStateProbe observes a
+	// rotation-tagged pending for the (projectID, fileName) pair. Advancing a
+	// single-file CommitBump while a rotation is in flight would corrupt the
+	// rotation's N-file atomic commit (the rotation's RecordPendingBump would
+	// then conflict with a now-stale last_accepted_counter). The contributor is
+	// asked to retry once the rotation has completed.
+	//
+	// Defense-in-depth: the registry adapter's CAS lease is the ground-truth
+	// rejection (ErrRegistryConcurrentWrite / countertypes.ErrCounterReconcile).
+	// This sentinel provides a clean, actionable error class at the use-case
+	// boundary so CLI callers can surface a specific "rotation in flight" message
+	// rather than a generic "CAS rejected" hint.
+	ErrCommitBumpRejectedRotationInFlight = errors.New(
+		"refusing to commit counter bump: a rotation is in flight for this " +
+			"(project, file) pair — retry after the rotation has completed or " +
+			"run `byreis admin rotation reconcile` if the rotation appears stale")
 )

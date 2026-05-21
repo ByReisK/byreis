@@ -254,6 +254,10 @@ type RotationStateProbe interface {
 	// raw observation the reconciler classifies. SourceVerified MUST be true
 	// in the observation; a stale or unverified fetch is itself dangerous
 	// for reconcile and the probe surfaces ErrRotationRequiresFreshRegistry.
+	//
+	// Probe reuses RegistryWriteToken for read access at V5b; FL-V6-CRYPTO-3
+	// introduces a distinct RegistryReadTokenProvider at V6; the WriteToken's
+	// load-site CONTRIBUTOR-refusal is honored throughout the V5b call chain.
 	FetchPartialState(ctx context.Context, projectID string) (PartialStateObservation, error)
 }
 
@@ -285,6 +289,9 @@ type PartialStateObservation struct {
 // PendingObservation is one per-file pending row from the SourceVerified
 // counter store, as observed by the probe.
 type PendingObservation struct {
+	// LogicalName is a single path component (no path separator). Registry
+	// adapter enforces via fetchtransport.ValidateFileName at the I/O boundary.
+	// Path-separated logical names are a v0.3+ extension; v0.2 has none.
 	LogicalName       string
 	PendingCounter    uint64
 	TargetArtifactSHA string

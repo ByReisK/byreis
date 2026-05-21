@@ -991,15 +991,23 @@ func (t *productionFetchTransport) doCounterWrite(
 	}
 
 	// Build the full commit message: body + sig footer.
+	// byreis-sig: bytes are written to a temp file; they NEVER appear in argv.
 	fullMessage := commitMsgBody + "\n\nbyreis-signer: " + signerID + "\nbyreis-sig: " + fmt.Sprintf("%x", sig) + "\n"
 
-	// Step 9: create the signed commit.
+	// Step 9: write commit message to a temp file so the byreis-sig: footer
+	// never appears in the git subprocess argv (BO-V5b-4).
+	msgFile := filepath.Join(tmpDir, "commitmsg-counter.txt")
+	if wErr := os.WriteFile(msgFile, []byte(fullMessage), 0o600); wErr != nil { //nolint:gosec
+		return fmt.Errorf("doCounterWrite: writing commit message file: %w", wErr)
+	}
+	defer func() { _ = os.Remove(msgFile) }()
+
 	commitCtx, commitCancel := fetchtransport.WithBoundedDeadline(ctx, 30*time.Second)
 	defer commitCancel()
 
 	_, commitStderr, commitExit, commitErr := t.verifier.RunSubprocess(
 		commitCtx, cloneDir, hardenedEnv(),
-		"git", "commit", "-m", fullMessage,
+		"git", "commit", "-F", msgFile,
 	)
 	if commitErr != nil {
 		return fmt.Errorf("doCounterWrite: git commit exec error: %w — run `byreis doctor`", commitErr)
@@ -1463,8 +1471,17 @@ func (t *productionFetchTransport) doCommitRotation(
 			"check admin identity configuration: run `byreis doctor`", signErr)
 	}
 
+	// byreis-sig: bytes are written to a temp file; they NEVER appear in argv (BO-V5b-4).
 	fullMessage := commitMsgBody + "\n\nbyreis-signer: " + signerID +
 		"\nbyreis-sig: " + fmt.Sprintf("%x", sig) + "\n"
+
+	// Write commit message to a temp file so the byreis-sig: footer
+	// never appears in the git subprocess argv (BO-V5b-4).
+	rotMsgFile := filepath.Join(tmpDir, "commitmsg-rotation.txt")
+	if wErr := os.WriteFile(rotMsgFile, []byte(fullMessage), 0o600); wErr != nil { //nolint:gosec
+		return fmt.Errorf("doCommitRotation: writing commit message file: %w", wErr)
+	}
+	defer func() { _ = os.Remove(rotMsgFile) }()
 
 	// Create the signed commit — exactly ONE commit per rotation call.
 	commitCtx, commitCancel := fetchtransport.WithBoundedDeadline(ctx, 30*time.Second)
@@ -1472,7 +1489,7 @@ func (t *productionFetchTransport) doCommitRotation(
 
 	_, commitStderr, commitExit, commitErr := t.verifier.RunSubprocess(
 		commitCtx, cloneDir, hardenedEnv(),
-		"git", "commit", "-m", fullMessage,
+		"git", "commit", "-F", rotMsgFile,
 	)
 	if commitErr != nil {
 		return fmt.Errorf("doCommitRotation: git commit exec error: %w — run `byreis doctor`", commitErr)

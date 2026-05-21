@@ -27,6 +27,7 @@ package registry_test
 import (
 	"context"
 	"errors"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -101,6 +102,49 @@ type reverserTokenProvider struct{ token string }
 
 func (p *reverserTokenProvider) RegistryWriteToken(_ context.Context, _ string) (string, error) {
 	return p.token, nil
+}
+
+// reverserContentCapturingRunner wraps reverserRunner and captures the content
+// of the -F temp file on the commit call (call index 5 in ClearPendings). The
+// file is read during the Run() call, before the adapter's deferred os.Remove
+// fires. Used to verify the commit message body without exposing it in argv.
+type reverserContentCapturingRunner struct {
+	*reverserRunner
+	mu              sync.Mutex
+	capturedContent string
+	captureIndex    int // which call index to capture the -F file content from
+}
+
+func (r *reverserContentCapturingRunner) Run(
+	ctx context.Context, dir string, env []string, name string, args ...string,
+) ([]byte, []byte, int, error) {
+	r.mu.Lock()
+	callIdx := len(r.calls) // before the call is recorded
+	r.mu.Unlock()
+
+	stdout, stderr, exit, err := r.reverserRunner.Run(ctx, dir, env, name, args...)
+
+	// If this is the capture index and it's a commit call, read the -F file.
+	if callIdx == r.captureIndex && name == "git" && len(args) > 0 && args[0] == "commit" {
+		for i, arg := range args {
+			if arg == "-F" && i+1 < len(args) {
+				content, readErr := os.ReadFile(args[i+1])
+				if readErr == nil {
+					r.mu.Lock()
+					r.capturedContent = string(content)
+					r.mu.Unlock()
+				}
+				break
+			}
+		}
+	}
+	return stdout, stderr, exit, err
+}
+
+func (r *reverserContentCapturingRunner) content() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.capturedContent
 }
 
 // ---- tmp directory helpers ---------------------------------------------------
@@ -281,22 +325,27 @@ func TestReverser_ClearPendings_HappyPath_SingleCommitAtomicity(t *testing.T) {
 	if len(commitCall.args) < 1 || commitCall.args[0] != "commit" {
 		t.Errorf("call[5].args[0] = %q, want 'commit'", commitCall.args[0])
 	}
-	// The commit message must include the signer envelope prefix.
-	var commitMsg string
+	// Commit must use -F <msgFile> (not -m) so byreis-sig: never appears in argv.
+	var commitMsgFile string
 	for i, arg := range commitCall.args {
-		if arg == "-m" && i+1 < len(commitCall.args) {
-			commitMsg = commitCall.args[i+1]
+		if arg == "-F" && i+1 < len(commitCall.args) {
+			commitMsgFile = commitCall.args[i+1]
 			break
 		}
 	}
-	if !strings.Contains(commitMsg, "byreis: rotation reversal") {
-		t.Errorf("commit message missing 'byreis: rotation reversal': %q", commitMsg)
+	if commitMsgFile == "" {
+		t.Errorf("git commit call missing -F flag; args = %v", commitCall.args)
 	}
-	if !strings.Contains(commitMsg, "byreis-signer:") {
-		t.Errorf("commit message missing 'byreis-signer:' envelope: %q", commitMsg)
+	// The -F path must be a non-empty temp-file path (not the message body itself).
+	if !strings.Contains(commitMsgFile, "commitmsg-reversal") {
+		t.Errorf("git commit -F value %q does not contain expected 'commitmsg-reversal' prefix", commitMsgFile)
 	}
-	if !strings.Contains(commitMsg, "byreis-sig:") {
-		t.Errorf("commit message missing 'byreis-sig:' envelope: %q", commitMsg)
+	// No -m flag must appear in the commit args (byreis-sig: must not be in argv).
+	for _, arg := range commitCall.args {
+		if arg == "-m" {
+			t.Errorf("git commit args contain -m flag — byreis-sig: would be exposed in argv: %v", commitCall.args)
+			break
+		}
 	}
 
 	// Verify CAS push (call index 6).
@@ -318,6 +367,85 @@ func TestReverser_ClearPendings_HappyPath_SingleCommitAtomicity(t *testing.T) {
 	// Temp dir cleanup: defer on MkdirTemp was called with RemoveAll.
 	if mkdirCalls < 1 {
 		t.Error("MkdirTemp was not called")
+	}
+}
+
+// ---- commit message body content check via file capture ---------------------
+
+// TestReverser_ClearPendings_CommitMessageBody_ContainsRequiredFields verifies
+// that the reversal commit message body (written to the -F temp file) contains
+// all required canonical fields. The content-capturing runner reads the file
+// during the Run() call, before the adapter's deferred os.Remove fires.
+func TestReverser_ClearPendings_CommitMessageBody_ContainsRequiredFields(t *testing.T) {
+	t.Parallel()
+
+	baseRunner := &reverserRunner{
+		steps: []reverserStep{
+			rrCloneOK(),
+			rrRevParseOK(),
+			rrGitAddOK(),
+			rrGitCfgOK(),
+			rrGitCfgOK(),
+			rrGitCommitOK(), // index 5 — captured
+			rrGitPushOK(),
+		},
+	}
+	capturer := &reverserContentCapturingRunner{
+		reverserRunner: baseRunner,
+		captureIndex:   5, // commit is at index 5
+	}
+
+	fakeMkdir := func(_, _ string) (string, error) {
+		return t.TempDir(), nil
+	}
+
+	adapter, err := registry.NewRotationReverserAdapter(registry.RotationReverserDeps{
+		RegistryURL:    "https://github.com/myorg/reg.git",
+		ProjectRepoURL: "https://github.com/myorg/proj.git",
+		Signer:         &reverserNopSigner{},
+		TokenProvider:  &reverserTokenProvider{token: "tok-body"},
+		Runner:         capturer,
+		MkdirTemp:      fakeMkdir,
+		RemoveAll:      noopRemoveAll,
+	})
+	if err != nil {
+		t.Fatalf("NewRotationReverserAdapter: %v", err)
+	}
+
+	pendings := []rotate.PendingObservation{
+		{
+			LogicalName:       "db-enc",
+			PendingCounter:    7,
+			TargetArtifactSHA: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+			TargetPR:          coregit.PRRef{Project: "myorg/proj/byreis/rotate-db-body", Number: 0},
+		},
+	}
+
+	if err := adapter.ClearPendings(context.Background(), "proj-body", pendings, reverserValidAuditEvent("proj-body")); err != nil {
+		t.Fatalf("ClearPendings: unexpected error: %v", err)
+	}
+
+	msg := capturer.content()
+	if msg == "" {
+		t.Fatal("commit message body not captured — the content-capturing runner did not fire")
+	}
+
+	required := []struct {
+		needle string
+		label  string
+	}{
+		{"byreis: rotation reversal", "header"},
+		{"project_id: proj-body", "project_id field"},
+		{"pending_cleared: db-enc", "pending_cleared field"},
+		{"audit_entry_sha:", "audit_entry_sha field (atomicity proof)"},
+		{"registry_parent_sha:", "registry_parent_sha (CAS anchor)"},
+		{"byreis-signer:", "signer envelope"},
+		{"byreis-sig:", "signature envelope"},
+	}
+	for _, r := range required {
+		if !strings.Contains(msg, r.needle) {
+			t.Errorf("commit body missing %s (%q); full body = %q", r.label, r.needle, msg)
+		}
 	}
 }
 
@@ -585,6 +713,189 @@ func TestReverser_ConstructorGuards(t *testing.T) {
 				t.Errorf("%s: expected construction error, got nil", tc.name)
 			}
 		})
+	}
+}
+
+// ---- CR-1 regression: exactly one GIT_CONFIG_COUNT entry -------------------
+
+// TestReverser_EnvBuilder_ExactlyOneGITConfigCount proves that the env slice
+// produced for an authenticated git call contains EXACTLY ONE entry that
+// starts with "GIT_CONFIG_COUNT=". A duplicate COUNT entry causes glibc's
+// getenv to return the first (lower) value, silently dropping the auth header
+// and causing production HTTPS push to fail with 401/403.
+//
+// This regression test verifies the fix: the env slice from a ClearPendings
+// clone call (which uses a token) has exactly one GIT_CONFIG_COUNT entry,
+// and that entry has the value "3" (two base entries + one auth entry).
+//
+// Mutation proof: on the OLD code, hardenedEnv(authEnv()...) produced two
+// GIT_CONFIG_COUNT entries; this test would fail on the old code with
+// "GIT_CONFIG_COUNT appears 2 times in env, want 1".
+func TestReverser_EnvBuilder_ExactlyOneGITConfigCount(t *testing.T) {
+	t.Parallel()
+
+	// Happy-path runner: ClearPendings calls clone (uses auth env), rev-parse,
+	// add, config×2, commit, push.
+	runner := &reverserRunner{
+		steps: []reverserStep{
+			rrCloneOK(),
+			rrRevParseOK(),
+			rrGitAddOK(),
+			rrGitCfgOK(),
+			rrGitCfgOK(),
+			rrGitCommitOK(),
+			rrGitPushOK(),
+		},
+	}
+
+	fakeMkdir := func(_, _ string) (string, error) {
+		return t.TempDir(), nil
+	}
+
+	adapter, err := registry.NewRotationReverserAdapter(registry.RotationReverserDeps{
+		RegistryURL:    "https://github.com/myorg/registry.git",
+		ProjectRepoURL: "https://github.com/myorg/project.git",
+		Signer:         &reverserNopSigner{},
+		TokenProvider:  &reverserTokenProvider{token: "tok-env-test"},
+		Runner:         runner,
+		MkdirTemp:      fakeMkdir,
+		RemoveAll:      noopRemoveAll,
+	})
+	if err != nil {
+		t.Fatalf("NewRotationReverserAdapter: %v", err)
+	}
+
+	pendings := []rotate.PendingObservation{
+		{
+			LogicalName:       "db-enc",
+			PendingCounter:    1,
+			TargetArtifactSHA: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+			TargetPR:          coregit.PRRef{Project: "myorg/project/byreis/rotate-db-env", Number: 0},
+		},
+	}
+
+	if err := adapter.ClearPendings(context.Background(), "proj-env", pendings, reverserValidAuditEvent("proj-env")); err != nil {
+		t.Fatalf("ClearPendings: unexpected error: %v", err)
+	}
+
+	// Inspect the env on the clone call (index 0) — this call uses auth env
+	// and is the one that previously emitted two GIT_CONFIG_COUNT entries.
+	cloneCall := runner.callAt(0)
+
+	countEntries := 0
+	countValue := ""
+	for _, entry := range cloneCall.env {
+		if strings.HasPrefix(entry, "GIT_CONFIG_COUNT=") {
+			countEntries++
+			countValue = entry
+		}
+	}
+
+	if countEntries != 1 {
+		t.Errorf("GIT_CONFIG_COUNT appears %d times in env, want exactly 1; "+
+			"duplicate entries cause glibc getenv to return the first (wrong) value "+
+			"and silently drop the Authorization header; env = %v",
+			countEntries, cloneCall.env)
+	} else if countValue != "GIT_CONFIG_COUNT=3" {
+		// With a token, the count must be 3 (2 base + 1 auth).
+		t.Errorf("GIT_CONFIG_COUNT = %q, want 'GIT_CONFIG_COUNT=3' "+
+			"(2 base entries + 1 auth entry)", countValue)
+	}
+
+	// Also verify the no-auth path: config calls (index 3, 4) must have COUNT=2.
+	for _, idx := range []int{3, 4} {
+		call := runner.callAt(idx)
+		nCount := 0
+		noAuthCount := ""
+		for _, entry := range call.env {
+			if strings.HasPrefix(entry, "GIT_CONFIG_COUNT=") {
+				nCount++
+				noAuthCount = entry
+			}
+		}
+		if nCount != 1 {
+			t.Errorf("call[%d] (no-auth): GIT_CONFIG_COUNT appears %d times, want 1; env = %v",
+				idx, nCount, call.env)
+		} else if noAuthCount != "GIT_CONFIG_COUNT=2" {
+			t.Errorf("call[%d] (no-auth): GIT_CONFIG_COUNT = %q, want 'GIT_CONFIG_COUNT=2'",
+				idx, noAuthCount)
+		}
+	}
+}
+
+// ---- CR-2 regression: reversal commit argv must not contain byreis-sig: ----
+
+// TestReverser_ClearPendings_CommitArgv_NoByreisSignatureInArgv proves that the
+// reversal commit subprocess does NOT receive the signed message as an -m
+// argument. The byreis-sig: footer must travel via a temp file (-F flag), never
+// via argv where it is visible in /proc/<pid>/cmdline and ps output.
+func TestReverser_ClearPendings_CommitArgv_NoByreisSignatureInArgv(t *testing.T) {
+	t.Parallel()
+
+	runner := &reverserRunner{
+		steps: []reverserStep{
+			rrCloneOK(),
+			rrRevParseOK(),
+			rrGitAddOK(),
+			rrGitCfgOK(),
+			rrGitCfgOK(),
+			rrGitCommitOK(),
+			rrGitPushOK(),
+		},
+	}
+
+	adapter := newReverserAdapter(t, runner)
+
+	pendings := []rotate.PendingObservation{
+		{
+			LogicalName:       "vault-enc",
+			PendingCounter:    2,
+			TargetArtifactSHA: "b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3",
+			TargetPR:          coregit.PRRef{Project: "myorg/project/byreis/rotate-vault-111", Number: 0},
+		},
+	}
+
+	if err := adapter.ClearPendings(context.Background(), "proj-argv", pendings, reverserValidAuditEvent("proj-argv")); err != nil {
+		t.Fatalf("ClearPendings: unexpected error: %v", err)
+	}
+
+	// Locate the commit call (index 5).
+	commitCall := runner.callAt(5)
+	if len(commitCall.args) == 0 || commitCall.args[0] != "commit" {
+		t.Fatalf("call[5] is not 'git commit'; args = %v", commitCall.args)
+	}
+
+	// No -m flag in argv.
+	for _, arg := range commitCall.args {
+		if arg == "-m" {
+			t.Errorf("commit args contain -m flag — message body (byreis-sig:) exposed in argv: %v",
+				commitCall.args)
+			break
+		}
+	}
+
+	// No byreis-sig: sequence in any argv element.
+	for _, arg := range commitCall.args {
+		if strings.Contains(arg, "byreis-sig:") {
+			t.Errorf("commit argv element %q contains 'byreis-sig:' — "+
+				"signature exposed in process argv; args = %v", arg, commitCall.args)
+		}
+	}
+
+	// -F flag must be present with a tmp-file path.
+	var hasDashF bool
+	for i, arg := range commitCall.args {
+		if arg == "-F" && i+1 < len(commitCall.args) {
+			hasDashF = true
+			if !strings.Contains(commitCall.args[i+1], "commitmsg-reversal") {
+				t.Errorf("commit -F path %q does not contain 'commitmsg-reversal'",
+					commitCall.args[i+1])
+			}
+			break
+		}
+	}
+	if !hasDashF {
+		t.Errorf("commit args missing -F flag; args = %v", commitCall.args)
 	}
 }
 

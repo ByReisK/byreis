@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -98,15 +99,6 @@ later slice; use --add directly with the recipient key the PR proposes.`,
 				return &exitError{code: render.ExitGeneralError, cause: err}
 			}
 
-			if deps.Rotator == nil {
-				err := fmt.Errorf(
-					"rotate not available: the rotation use-case is not wired — " +
-						"run `byreis doctor` or check your installation")
-				r.PrintErrorClass("general-error", err.Error(),
-					"run `byreis doctor` or check your installation")
-				return &exitError{code: render.ExitGeneralError, cause: err}
-			}
-
 			// Parse --add pubkeys into domain types.
 			var addRecips []rectypes.Recipient
 			for _, pk := range addPubkeys {
@@ -192,25 +184,20 @@ later slice; use --add directly with the recipient key the PR proposes.`,
 				}
 			}
 
-			// Build the RotationInput. Mode is ALWAYS from cryptographic reality;
-			// it is sourced from deps.CurrentMode and never from a flag, env, or
-			// config file.
-			in := rotate.RotationInput{
-				ProjectID:      project,
-				Mode:           deps.CurrentMode,
-				AddPubkeys:     addRecips,
-				RemovePubkeys:  removeRecips,
-				ReplacePairs:   pairs,
-				DryRun:         dryRun,
-				Yes:            yes,
-				NonInteractive: nonInteractiveMode,
-				// SourceVerified and AdminCanDecryptAll are enforced by the spine
-				// against its own SourceVerified registry fetch at Rotate() entry.
-				// Setting both true here defers the authoritative check to the
-				// spine; the spine gates (2) and (5) in rotate.go enforce the real
-				// values — the CLI does not construct or trust these fields.
-				SourceVerified:     true,
-				AdminCanDecryptAll: true,
+			// Build the RotationInput via real pre-flight checks when
+			// RotatePreFlight is wired. When nil (integration-test setups
+			// without a live registry), fall back to the prior stubs.
+			in, preflightErr := buildRotationInput(
+				cmd.Context(), deps, project,
+				addRecips, removeRecips, pairs,
+				dryRun, yes, nonInteractiveMode,
+			)
+			if preflightErr != nil {
+				code := rotateMappedExitCode(deps, preflightErr)
+				hint := rotateHintFor(code, preflightErr)
+				class := rotateExitClass(code)
+				r.PrintErrorClass(class, preflightErr.Error(), hint)
+				return &exitError{code: code, cause: preflightErr}
 			}
 
 			result, err := deps.Rotator.Rotate(cmd.Context(), in)
@@ -252,6 +239,88 @@ later slice; use --add directly with the recipient key the PR proposes.`,
 	_ = cmd.MarkFlagRequired("project")
 
 	return cmd
+}
+
+// buildRotationInput runs the two mandatory pre-flight checks and assembles a
+// rotate.RotationInput with real values sourced from the SourceVerified registry
+// and the admin decrypt-all-existing verification.
+//
+// When deps.RotatePreFlight is nil (integration-test setups without a live
+// registry), the function falls back to SourceVerified:true and
+// AdminCanDecryptAll:true with empty PreRotationRecipients and
+// RegisteredAdmins — matching the prior stub behaviour. This fallback is
+// intentional for unit tests that inject a fakeRotator; end-to-end tests and
+// production must always wire RotatePreFlight.
+func buildRotationInput(
+	ctx context.Context,
+	deps *Deps,
+	projectID string,
+	addRecips, removeRecips []rectypes.Recipient,
+	pairs []rotate.ReplacePair,
+	dryRun, yes, nonInteractive bool,
+) (rotate.RotationInput, error) {
+	base := rotate.RotationInput{
+		ProjectID:      projectID,
+		Mode:           deps.CurrentMode,
+		AddPubkeys:     addRecips,
+		RemovePubkeys:  removeRecips,
+		ReplacePairs:   pairs,
+		DryRun:         dryRun,
+		Yes:            yes,
+		NonInteractive: nonInteractive,
+	}
+
+	if deps.RotatePreFlight == nil {
+		// No pre-flight adapter wired; fall back to prior stub values.
+		// Production wiring always provides RotatePreFlight; this path is
+		// for unit tests that inject fakeRotator without a registry.
+		base.SourceVerified = true
+		base.AdminCanDecryptAll = true
+		return base, nil
+	}
+
+	// Pre-flight (a): fetch the SourceVerified, non-stale admin set.
+	adminSet, err := deps.RotatePreFlight.FetchVerifiedAdminSet(ctx, projectID)
+	if err != nil {
+		return rotate.RotationInput{}, err
+	}
+
+	// Populate from the verified admin set.
+	preRecips := make([]rectypes.Recipient, 0, len(adminSet.PreRotationRecipients))
+	for _, pk := range adminSet.PreRotationRecipients {
+		preRecips = append(preRecips, rectypes.Recipient{AgePubKey: pk})
+	}
+	regAdmins := make([]rectypes.Recipient, 0, len(adminSet.RegisteredAdmins))
+	for _, pk := range adminSet.RegisteredAdmins {
+		regAdmins = append(regAdmins, rectypes.Recipient{AgePubKey: pk})
+	}
+
+	// Populate pre-rotation files from snapshots.
+	preFiles := make([]rotate.FileSnapshot, 0, len(adminSet.FileSnapshots))
+	for _, snap := range adminSet.FileSnapshots {
+		preFiles = append(preFiles, rotate.FileSnapshot{
+			LogicalName:    snap.LogicalName,
+			CurrentCounter: snap.CurrentCounter,
+			CurrentEpoch:   snap.CurrentEpoch,
+		})
+	}
+
+	// Pre-flight (b): verify the admin can decrypt every existing file.
+	// CanDecryptAllFiles returns a sentinel wrapping
+	// rotate.ErrRotationCannotDecryptExisting on any failure; plaintext
+	// is never surfaced.
+	if decryptErr := deps.RotatePreFlight.CanDecryptAllFiles(ctx, adminSet.FileSnapshots); decryptErr != nil {
+		return rotate.RotationInput{}, decryptErr
+	}
+
+	base.SourceVerified = true
+	base.RegistryStale = false
+	base.AdminCanDecryptAll = true
+	base.PreRotationRecipients = preRecips
+	base.RegisteredAdmins = regAdmins
+	base.PreRotationFiles = preFiles
+	base.CurrentMaxEpoch = adminSet.CurrentMaxEpoch
+	return base, nil
 }
 
 // rotateMappedExitCode maps a rotate-path error to the appropriate
@@ -388,8 +457,8 @@ func printRotationPlan(r *render.Renderer, plan rotate.RotationPlan, jsonOut boo
 	_, _ = fmt.Fprintf(r.Out, "  removed recipients:  %d\n", len(plan.RemovedRecipients))
 	_, _ = fmt.Fprintf(r.Out, "  files to re-encrypt: %d\n", len(plan.FilesToReencrypt))
 	if plan.HasRemovals {
-		_, _ = fmt.Fprintln(r.Out, "  WARNING: recipients are being removed; "+
-			"forward secrecy requires re-encryption of all files.")
+		_, _ = fmt.Fprintln(r.Out)
+		_, _ = fmt.Fprintln(r.Out, rotate.ForwardSecrecyWarning) //nolint:forbidigo // boundary: CLI R4a output — this is the sole legitimate non-test emission site; the docgate asserts it byte-for-byte
 	}
 }
 
@@ -421,4 +490,8 @@ func printRotationResult(r *render.Renderer, result rotate.RotationResult, jsonO
 		result.Phase2.MergedSHA,
 		result.Phase2.CommitRotationSHA,
 	)
+	if result.Plan.HasRemovals {
+		_, _ = fmt.Fprintln(r.Out)
+		_, _ = fmt.Fprintln(r.Out, rotate.ForwardSecrecyWarning) //nolint:forbidigo // boundary: CLI R4a output — this is the sole legitimate non-test emission site; the docgate asserts it byte-for-byte
+	}
 }

@@ -14,11 +14,15 @@ package cli_test
 //   - V5.ROTATE.non-interactive-without-yes-fails-closed-no-plan-leak
 //   - V5.ROTATE.no-bypass-to-registry-adapter
 //   - V5.ROTATE.exit-code-matrix
+//   - V5.ROTATE.preflight-stale-registry
+//   - V5.ROTATE.preflight-cant-decrypt
+//   - V5.ROTATE.preflight-success-input-populated
 
 import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -767,11 +771,218 @@ func TestAdminRotationReconcile_Race(t *testing.T) {
 	}
 }
 
+// ---- pre-flight test helpers ------------------------------------------------
+
+// fakePreFlight is a configurable test double for cli.RotatePreFlightReader.
+type fakePreFlight struct {
+	adminSet    cli.RotatePreFlightAdminSet
+	adminSetErr error
+	decryptErr  error
+
+	fetchCalls   atomic.Int32
+	decryptCalls atomic.Int32
+}
+
+func (f *fakePreFlight) FetchVerifiedAdminSet(
+	_ context.Context, _ string,
+) (cli.RotatePreFlightAdminSet, error) {
+	f.fetchCalls.Add(1)
+	return f.adminSet, f.adminSetErr
+}
+
+func (f *fakePreFlight) CanDecryptAllFiles(
+	_ context.Context, _ []cli.RotatePreFlightFileSnap,
+) error {
+	f.decryptCalls.Add(1)
+	return f.decryptErr
+}
+
+// makeRotateDepsWithPreflight builds Deps with both a fakeRotator and a
+// fakePreFlight wired.
+func makeRotateDepsWithPreflight(
+	m mode.Mode,
+	rotator rotate.Rotator,
+	pf cli.RotatePreFlightReader,
+) *cli.Deps {
+	return &cli.Deps{
+		Policy:          &mode.Policy{},
+		CurrentMode:     m,
+		Rotator:         rotator,
+		RotatePreFlight: pf,
+	}
+}
+
+// ---- V5.ROTATE.preflight-stale-registry -------------------------------------
+
+// TestRotate_PreFlight_StaleRegistry proves that when FetchVerifiedAdminSet
+// returns an error wrapping ErrRotationRequiresFreshRegistry, the CLI surfaces
+// that exit class and does NOT invoke Phase-1 (rotator call count = 0).
+func TestRotate_PreFlight_StaleRegistry(t *testing.T) {
+	t.Parallel()
+
+	// V5.ROTATE.preflight-stale-registry
+	pf := &fakePreFlight{
+		adminSetErr: fmt.Errorf("%w: stale", rotate.ErrRotationRequiresFreshRegistry),
+	}
+	fr := &fakeRotator{}
+	deps := makeRotateDepsWithPreflight(mode.ModeAdmin, fr, pf)
+
+	_, _, err := runRotateCmd(deps, []string{
+		"rotate", "--project", "test-proj",
+		"--add", "age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq3lhfrt",
+		"--yes",
+	}, "")
+
+	if err == nil {
+		t.Fatal("expected ErrRotationRequiresFreshRegistry, got nil")
+	}
+	if !errors.Is(err, rotate.ErrRotationRequiresFreshRegistry) {
+		t.Errorf("want errors.Is(err, ErrRotationRequiresFreshRegistry), got: %v", err)
+	}
+	exitCode := cli.ExitCodeOf(err)
+	if exitCode != int(render.ExitTrustError) {
+		t.Errorf("exit code = %d, want %d (ExitTrustError)", exitCode, int(render.ExitTrustError))
+	}
+	if fr.calls.Load() != 0 {
+		t.Errorf("rotator called %d times; want 0 (Phase-1 must not start on stale registry)",
+			fr.calls.Load())
+	}
+	if pf.fetchCalls.Load() != 1 {
+		t.Errorf("FetchVerifiedAdminSet called %d times; want 1", pf.fetchCalls.Load())
+	}
+}
+
+// ---- V5.ROTATE.preflight-cant-decrypt ---------------------------------------
+
+// TestRotate_PreFlight_CantDecrypt proves that when CanDecryptAllFiles returns
+// an error wrapping ErrRotationCannotDecryptExisting, the CLI surfaces
+// ExitAuthError and does NOT invoke Phase-1.
+func TestRotate_PreFlight_CantDecrypt(t *testing.T) {
+	t.Parallel()
+
+	// V5.ROTATE.preflight-cant-decrypt
+	adminSet := cli.RotatePreFlightAdminSet{
+		PreRotationRecipients: []string{"age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq3lhfrt"},
+		RegisteredAdmins:      []string{"age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq3lhfrt"},
+		ConfiguredFiles:       map[string]string{"prod": "vault/prod.enc.yaml"},
+		CurrentMaxEpoch:       0,
+		FileSnapshots:         []cli.RotatePreFlightFileSnap{{LogicalName: "prod"}},
+	}
+	pf := &fakePreFlight{
+		adminSet:   adminSet,
+		decryptErr: fmt.Errorf("%w: admin key not in recipient set", rotate.ErrRotationCannotDecryptExisting),
+	}
+	fr := &fakeRotator{}
+	deps := makeRotateDepsWithPreflight(mode.ModeAdmin, fr, pf)
+
+	_, _, err := runRotateCmd(deps, []string{
+		"rotate", "--project", "test-proj",
+		"--add", "age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq3lhfrt",
+		"--yes",
+	}, "")
+
+	if err == nil {
+		t.Fatal("expected ErrRotationCannotDecryptExisting, got nil")
+	}
+	if !errors.Is(err, rotate.ErrRotationCannotDecryptExisting) {
+		t.Errorf("want errors.Is(err, ErrRotationCannotDecryptExisting), got: %v", err)
+	}
+	exitCode := cli.ExitCodeOf(err)
+	if exitCode != int(render.ExitAuthError) {
+		t.Errorf("exit code = %d, want %d (ExitAuthError)", exitCode, int(render.ExitAuthError))
+	}
+	if fr.calls.Load() != 0 {
+		t.Errorf("rotator called %d times; want 0 (Phase-1 must not start when admin cannot decrypt)",
+			fr.calls.Load())
+	}
+}
+
+// ---- V5.ROTATE.preflight-success-input-populated ----------------------------
+
+// TestRotate_PreFlight_SuccessInputPopulated proves that on a happy-path
+// pre-flight, RotationInput.SourceVerified and .AdminCanDecryptAll are both
+// true and reflect real pre-flight results (not hard-coded stubs). It also
+// asserts that PreRotationRecipients and RegisteredAdmins are populated from
+// the pre-flight result, not from flags.
+func TestRotate_PreFlight_SuccessInputPopulated(t *testing.T) {
+	t.Parallel()
+
+	// V5.ROTATE.preflight-success-input-populated
+	addKey := "age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq3lhfrt"
+	existingRecip := "age1pppppppppppppppppppppppppppppppppppppppppppppppppppppt36pzn"
+	adminSet := cli.RotatePreFlightAdminSet{
+		PreRotationRecipients: []string{existingRecip},
+		RegisteredAdmins:      []string{existingRecip},
+		ConfiguredFiles:       map[string]string{"prod": "vault/prod.enc.yaml"},
+		CurrentMaxEpoch:       3,
+		FileSnapshots: []cli.RotatePreFlightFileSnap{
+			{LogicalName: "prod", CurrentCounter: 5, CurrentEpoch: 3},
+		},
+	}
+	pf := &fakePreFlight{
+		adminSet: adminSet,
+	}
+	fr := &fakeRotator{
+		result: rotate.RotationResult{
+			Plan:           rotate.RotationPlan{ProjectID: "test-proj", NewEpoch: 4},
+			Phase1Executed: true,
+			Phase2Executed: true,
+		},
+	}
+	deps := makeRotateDepsWithPreflight(mode.ModeAdmin, fr, pf)
+
+	_, _, err := runRotateCmd(deps, []string{
+		"rotate", "--project", "test-proj",
+		"--add", addKey,
+		"--yes",
+	}, "")
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if fr.calls.Load() != 1 {
+		t.Errorf("rotator call count = %d, want 1", fr.calls.Load())
+	}
+
+	in := fr.captured
+	// SourceVerified and AdminCanDecryptAll must be true from real pre-flight.
+	if !in.SourceVerified {
+		t.Error("RotationInput.SourceVerified = false; want true from real pre-flight")
+	}
+	if !in.AdminCanDecryptAll {
+		t.Error("RotationInput.AdminCanDecryptAll = false; want true from real pre-flight")
+	}
+	// CurrentMaxEpoch must come from the pre-flight admin set.
+	if in.CurrentMaxEpoch != 3 {
+		t.Errorf("RotationInput.CurrentMaxEpoch = %d, want 3", in.CurrentMaxEpoch)
+	}
+	// PreRotationRecipients must be populated from the pre-flight admin set.
+	if len(in.PreRotationRecipients) != 1 || in.PreRotationRecipients[0].AgePubKey != existingRecip {
+		t.Errorf("RotationInput.PreRotationRecipients = %v, want [{%s}]",
+			in.PreRotationRecipients, existingRecip)
+	}
+	// RegisteredAdmins must be populated.
+	if len(in.RegisteredAdmins) != 1 {
+		t.Errorf("RotationInput.RegisteredAdmins len = %d, want 1", len(in.RegisteredAdmins))
+	}
+	// PreRotationFiles must have one entry from the pre-flight snapshot.
+	if len(in.PreRotationFiles) != 1 || in.PreRotationFiles[0].LogicalName != "prod" {
+		t.Errorf("RotationInput.PreRotationFiles = %v, want [{prod ...}]", in.PreRotationFiles)
+	}
+	if in.PreRotationFiles[0].CurrentCounter != 5 {
+		t.Errorf("RotationInput.PreRotationFiles[0].CurrentCounter = %d, want 5",
+			in.PreRotationFiles[0].CurrentCounter)
+	}
+}
+
 // Compile-time: fakeRotator must satisfy the rotate.Rotator interface.
 var _ rotate.Rotator = (*fakeRotator)(nil)
 
 // Compile-time: fakeReconciler must satisfy the rotate.RotationReconciler interface.
 var _ rotate.RotationReconciler = (*fakeReconciler)(nil)
+
+// Compile-time: fakePreFlight must satisfy the cli.RotatePreFlightReader interface.
+var _ cli.RotatePreFlightReader = (*fakePreFlight)(nil)
 
 // Compile-time: time package used for fakeClock (avoids "imported and not used").
 var _ = time.Now

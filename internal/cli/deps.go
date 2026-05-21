@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"os"
 
@@ -76,6 +77,74 @@ type Deps struct {
 	// render.ExitCode. When nil, the rotate verb falls back to ExitGeneralError.
 	// This is a function-field so the CLI layer never imports internal/adapter.
 	RotateExitCode func(err error) render.ExitCode
+
+	// RotatePreFlight is the narrow read-only port the rotate command uses to
+	// perform the two pre-flight checks required before invoking Rotator.Rotate:
+	//   (a) registry freshness/verification — SourceVerified + non-stale
+	//   (b) admin decrypt-all-existing — the running admin can decrypt every
+	//       current project secrets file
+	//
+	// When nil the rotate command falls back to the prior hard-coded stubs
+	// (SourceVerified:true, AdminCanDecryptAll:true), which is safe only in
+	// integration test setups where a real pre-flight is unnecessary. Production
+	// wiring sets this to the real pre-flight adapter at BuildProductionDeps.
+	RotatePreFlight RotatePreFlightReader
+}
+
+// RotatePreFlightReader is the narrow consumer-defined port the rotate command
+// uses for the two mandatory pre-flight checks. It is defined in the CLI layer
+// (the consumer) so that internal/core packages never need to import it.
+//
+// The implementation lives in internal/app (production wiring) or in test code;
+// neither the CLI nor the core imports an adapter directly.
+type RotatePreFlightReader interface {
+	// FetchVerifiedAdminSet fetches the signature-verified, non-stale admin set
+	// for the given project. Returns an error wrapping
+	// rotate.ErrRotationRequiresFreshRegistry when the result is stale or
+	// unverified. The returned value contains the pre-rotation recipients,
+	// registered admins, configured files map, and the current max epoch across
+	// all project files.
+	FetchVerifiedAdminSet(ctx context.Context, projectID string) (RotatePreFlightAdminSet, error)
+
+	// CanDecryptAllFiles attempts to decrypt each of the provided file snapshots
+	// using the running admin's identity. Returns nil when every file decrypts
+	// successfully. Returns an error wrapping
+	// rotate.ErrRotationCannotDecryptExisting when ANY file cannot be decrypted.
+	// The implementation MUST NOT leak plaintext in errors, logs, or return
+	// values — only a boolean "all-or-nothing" result is surfaced.
+	CanDecryptAllFiles(ctx context.Context, snapshots []RotatePreFlightFileSnap) error
+}
+
+// RotatePreFlightAdminSet carries the SourceVerified registry data needed to
+// populate a rotate.RotationInput before invoking Rotator.Rotate.
+type RotatePreFlightAdminSet struct {
+	// PreRotationRecipients is R, sourced from the SourceVerified registry.
+	PreRotationRecipients []string
+	// RegisteredAdmins is the full admin set from the SourceVerified registry HEAD.
+	RegisteredAdmins []string
+	// ConfiguredFiles maps logical_file_name → registry-configured path.
+	ConfiguredFiles map[string]string
+	// CurrentMaxEpoch is the highest per-file rotation_epoch in the project.
+	CurrentMaxEpoch uint64
+	// FileSnapshots are the current project secrets files for the pre-flight
+	// CanDecryptAllFiles check and RotationInput.PreRotationFiles population.
+	FileSnapshots []RotatePreFlightFileSnap
+}
+
+// RotatePreFlightFileSnap carries the per-file snapshot data for the pre-flight
+// decrypt check. It mirrors rotate.FileSnapshot but uses only string/uint64
+// domain types so the CLI layer stays free of crypto artifact imports.
+type RotatePreFlightFileSnap struct {
+	// LogicalName is the registry-canonical logical file name.
+	LogicalName string
+	// CurrentCounter is the per-file last_accepted_counter at pre-rotation.
+	CurrentCounter uint64
+	// CurrentEpoch is the per-file rotation_epoch at pre-rotation.
+	CurrentEpoch uint64
+	// EncodedBytes is the raw on-disk bytes of the signed file-of-record.
+	// The pre-flight adapter passes these to the Decryptor and MUST zeroize
+	// any plaintext derived from them before returning.
+	EncodedBytes []byte
 }
 
 // ExitCodeFromReadPathError maps a usecase.ExitClass to the corresponding

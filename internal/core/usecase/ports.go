@@ -122,3 +122,22 @@ type ManifestSigner interface {
 	// signature is produced.
 	Sign(ctx context.Context, m manifest.Manifest) (signerID string, sig []byte, err error)
 }
+
+// RotationGuard is a narrow read-only port the Merge use-case consults before
+// finalising a single-file CommitBump. When a rotation transaction is in
+// flight for the same (projectID, fileName) pair, advancing a single-file
+// counter would corrupt the rotation's N-file atomic commit; the guard
+// surfaces rotate.ErrCommitBumpRejectedRotationInFlight before any write.
+//
+// The concrete implementation delegates to RegistryClient.RotationInFlight.
+// The guard is optional in MergeDeps: when nil, the check is skipped (V0.1
+// production deployments without the rotation adapter wired remain unblocked).
+// Fail-closed contract: on any uncertainty (network error, source-verified
+// failure) the guard reports in-flight=true so callers refuse the CommitBump
+// rather than risk corrupting a partial rotation.
+type RotationGuard interface {
+	// RotationInFlight reports whether a rotation transaction is currently
+	// in flight for the given (projectID, fileName). Returns true on any
+	// uncertainty (fail-closed toward rotation protection).
+	RotationInFlight(ctx context.Context, projectID, fileName string) (bool, error)
+}

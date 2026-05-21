@@ -20,6 +20,7 @@ import (
 	"github.com/ByReisK/byreis/internal/core/logging"
 	"github.com/ByReisK/byreis/internal/core/mode"
 	"github.com/ByReisK/byreis/internal/core/registry/rectypes"
+	"github.com/ByReisK/byreis/internal/core/usecase/rotate"
 )
 
 // Sentinel errors owned by the Merge use-case.
@@ -121,6 +122,12 @@ type MergeDeps struct {
 	Mode          ModeGate
 	Audit         audit.Logger
 	Log           logging.Logger
+	// RotationGuard is optional. When non-nil, Merge consults it before each
+	// CommitBump: if a rotation is in flight for the (project, file) pair, the
+	// CommitBump is refused with rotate.ErrCommitBumpRejectedRotationInFlight
+	// so the operator can retry after the rotation completes. When nil the
+	// check is skipped (backwards-compatible with pre-rotation deployments).
+	RotationGuard RotationGuard
 }
 
 // Merger is the consumer-defined interface for the admin Merge use-case.
@@ -426,6 +433,29 @@ func (m *mergeUseCase) Merge(ctx context.Context, in MergeInput) (MergeResult, e
 	// final: a re-run resumes from the matching pending and completes the
 	// bump. A read-only/VerifyOfRecord caller NEVER drives this — only this
 	// merge path does, and only against the pre-existing matching pending.
+	//
+	// Rotation-in-flight guard (FL-V5b-1): when a rotation is mid-flight for
+	// this (project, file) pair, a single-file CommitBump would corrupt the
+	// rotation's N-file atomic counter commit. Refuse before any write and
+	// surface ErrCommitBumpRejectedRotationInFlight so the operator retries
+	// after the rotation completes. Fail-closed: uncertainty → in-flight=true.
+	if m.d.RotationGuard != nil {
+		inFlight, rgErr := m.d.RotationGuard.RotationInFlight(ctx, in.ExpectedProjectID, in.ExpectedFileName)
+		if rgErr != nil {
+			return MergeResult{}, fmt.Errorf(
+				"%w: rotation-in-flight check failed before CommitBump for "+
+					"project=%q file=%q: %v — run `byreis admin rotation reconcile` "+
+					"to inspect state",
+				rotate.ErrCommitBumpRejectedRotationInFlight,
+				in.ExpectedProjectID, in.ExpectedFileName, rgErr)
+		}
+		if inFlight {
+			return MergeResult{}, fmt.Errorf(
+				"%w: project=%q file=%q",
+				rotate.ErrCommitBumpRejectedRotationInFlight,
+				in.ExpectedProjectID, in.ExpectedFileName)
+		}
+	}
 	if err := m.d.Counter.CommitBump(ctx, CommitBumpInput{
 		ProjectID:      in.ExpectedProjectID,
 		FileName:       in.ExpectedFileName,

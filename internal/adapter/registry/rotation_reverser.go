@@ -159,7 +159,7 @@ func (a *RotationReverserAdapter) FetchPartialState(ctx context.Context, project
 	}
 
 	cloneDir := filepath.Join(tmpDir, "registry")
-	env := a.hardenedEnv(tmpDir, token)
+	env := a.buildEnv(tmpDir, token, true)
 
 	// Shallow clone the registry.
 	cloneCtx, cloneCancel := fetchtransport.WithBoundedDeadline(ctx, writeTimeout)
@@ -216,6 +216,8 @@ func (a *RotationReverserAdapter) walkCounterStore(
 		return obs, fmt.Errorf("reading counter directory: %w", readErr)
 	}
 
+	seen := make(map[string]struct{}, len(entries))
+
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
 			continue
@@ -223,28 +225,51 @@ func (a *RotationReverserAdapter) walkCounterStore(
 		filePath := filepath.Join(counterDir, entry.Name())
 		raw, readFileErr := os.ReadFile(filePath) //nolint:gosec
 		if readFileErr != nil {
-			continue
+			return obs, fmt.Errorf("walkCounterStore: reading counter file %q: %w — "+
+				"check registry clone integrity: run `byreis doctor`", entry.Name(), readFileErr)
 		}
 		if len(raw) > maxCounterJSONBytes {
+			return obs, fmt.Errorf("walkCounterStore: counter file %q exceeds maximum size (%d bytes) — "+
+				"registry may be corrupted: run `byreis doctor`", entry.Name(), maxCounterJSONBytes)
+		}
+
+		if len(strings.TrimSpace(string(raw))) == 0 {
 			continue
+		}
+
+		if dupErr := checkDuplicateJSONKeys(raw); dupErr != nil {
+			return obs, fmt.Errorf("%w: walkCounterStore: duplicate JSON key in counter file %q: %v — "+
+				"registry may be corrupted: run `byreis doctor`",
+				ErrRegistryConcurrentWrite, entry.Name(), dupErr)
 		}
 
 		var cf counterFileJSON
 		if decErr := json.Unmarshal(raw, &cf); decErr != nil {
-			continue
+			return obs, fmt.Errorf("walkCounterStore: JSON parse failure in counter file %q: %w — "+
+				"registry may be corrupted: run `byreis doctor`", entry.Name(), decErr)
 		}
 		if cf.Pending == nil {
-			continue
-		}
-		// Check if target_pr matches the byreis/rotate-* pattern.
-		targetPR := cf.Pending.TargetPR
-		if !strings.Contains(targetPR, "byreis/rotate-") {
 			continue
 		}
 
 		logicalName := cf.File
 		if logicalName == "" {
 			logicalName = strings.TrimSuffix(entry.Name(), ".json")
+		}
+
+		// Duplicate-key collision guard: two counter files with the same logical name.
+		if _, dup := seen[logicalName]; dup {
+			return obs, fmt.Errorf("walkCounterStore: duplicate logical name %q in counter store for project %q — "+
+				"registry may be corrupted: run `byreis doctor`", logicalName, projectID)
+		}
+		seen[logicalName] = struct{}{}
+
+		// Check if target_pr matches the byreis/rotate-* pattern.
+		// Non-rotation pendings are silently skipped (not an error: normal submit pendings
+		// coexist with the counter store).
+		targetPR := cf.Pending.TargetPR
+		if !strings.Contains(targetPR, "byreis/rotate-") {
+			continue
 		}
 
 		var pendingCounter uint64
@@ -302,7 +327,7 @@ func (a *RotationReverserAdapter) checkRotationBranch(
 		return false, false, git.PRRef{}, fmt.Errorf("chmod branch-check workspace: %w", chErr)
 	}
 
-	env := a.hardenedEnv(tmpDir, token)
+	env := a.buildEnv(tmpDir, token, true)
 
 	// Use git ls-remote to list branches without a full clone.
 	lsCtx, lsCancel := fetchtransport.WithBoundedDeadline(ctx, 20*time.Second)
@@ -412,7 +437,7 @@ func (a *RotationReverserAdapter) ClearPendings(
 	}
 
 	cloneDir := filepath.Join(tmpDir, "repo")
-	env := a.hardenedEnv(tmpDir, token)
+	env := a.buildEnv(tmpDir, token, true)
 
 	// Step 1: shallow clone the registry.
 	cloneCtx, cloneCancel := fetchtransport.WithBoundedDeadline(ctx, writeTimeout)
@@ -579,13 +604,20 @@ func (a *RotationReverserAdapter) ClearPendings(
 	fullMessage := commitMsgBody + "\n\nbyreis-signer: " + signerID +
 		"\nbyreis-sig: " + fmt.Sprintf("%x", sig) + "\n"
 
-	// Step 9: create the signed commit.
+	// Step 9: write the commit message to a temp file so the byreis-sig: footer
+	// never appears in the git subprocess argv.
+	msgFile := filepath.Join(tmpDir, "commitmsg-reversal.txt")
+	if wErr := os.WriteFile(msgFile, []byte(fullMessage), 0o600); wErr != nil { //nolint:gosec
+		return fmt.Errorf("ClearPendings: writing commit message file: %w", wErr)
+	}
+	defer func() { _ = os.Remove(msgFile) }()
+
 	commitCtx, commitCancel := fetchtransport.WithBoundedDeadline(ctx, 30*time.Second)
 	defer commitCancel()
 
 	_, commitStderr, commitExit, commitErr := a.d.Runner.Run(
 		commitCtx, cloneDir, a.hardenedEnvNoAuth(tmpDir),
-		"git", "commit", "-m", fullMessage,
+		"git", "commit", "-F", msgFile,
 	)
 	if commitErr != nil {
 		return fmt.Errorf("ClearPendings: git commit error: %w", commitErr)
@@ -669,7 +701,7 @@ func (a *RotationReverserAdapter) DeleteRotationBranch(ctx context.Context, ref 
 		return fmt.Errorf("DeleteRotationBranch: cannot extract branch name from ref %+v", ref)
 	}
 
-	env := a.hardenedEnv(tmpDir, token)
+	env := a.buildEnv(tmpDir, token, true)
 
 	pushCtx, pushCancel := fetchtransport.WithBoundedDeadline(ctx, writeTimeout)
 	defer pushCancel()
@@ -710,35 +742,32 @@ func (a *RotationReverserAdapter) DeleteRotationBranch(ctx context.Context, ref 
 }
 
 // extractBranchFromRef extracts the branch name from a rotation PRRef.
-// Rotation branch refs use the convention PRRef.Project = "<owner/repo>/<branchName>".
+// PartialStateObservation.RotationBranchRef.Project encodes exactly three
+// slash-separated segments: <owner>/<repo>/<branchName>, where branchName may
+// itself contain slashes (e.g. "byreis/rotate-key-ts"). A Project value with a
+// segment count other than exactly 3 returns the empty string; callers surface
+// a descriptive error rather than producing a partial or mis-routed push-delete.
 func extractBranchFromRef(ref git.PRRef) string {
-	// The branch name is the segment after the third "/" in the Project field.
-	// e.g. "myorg/my-app-secrets/byreis/rotate-key-1234567890"
-	// → "byreis/rotate-key-1234567890"
 	parts := strings.SplitN(ref.Project, "/", 3)
-	if len(parts) < 3 {
+	if len(parts) != 3 {
 		return ""
 	}
-	return parts[2] // "byreis/rotate-key-<timestamp>"
+	return parts[2]
 }
 
-// hardenedEnv builds the isolation environment for git operations including
-// HTTP authentication.
-func (a *RotationReverserAdapter) hardenedEnv(tmpDir, token string) []string {
+// buildEnv constructs the git isolation environment with exactly one
+// GIT_CONFIG_COUNT entry. When withAuth is true and token is non-empty,
+// the count is 3 and the Authorization header entry is appended; otherwise
+// count is 2. This eliminates the duplicate-COUNT bug that silently dropped
+// the auth header when hardenedEnv(authEnv()...) was used.
+func (a *RotationReverserAdapter) buildEnv(tmpDir, token string, withAuth bool) []string {
 	base := fetchtransport.CleanGitEnv()
-	env := append(base,
-		"GIT_CONFIG_NOSYSTEM=1",
-		"HOME="+tmpDir,
-		"GIT_TERMINAL_PROMPT=0",
-		"GIT_ALLOW_PROTOCOL=file:https:ssh",
-		"GIT_CONFIG_COUNT=2",
-		"GIT_CONFIG_KEY_0=core.hooksPath",
-		"GIT_CONFIG_VALUE_0=/dev/null",
-		"GIT_CONFIG_KEY_1=core.fsmonitor",
-		"GIT_CONFIG_VALUE_1=",
-	)
-	if token != "" {
-		env = append(env,
+	if withAuth && token != "" {
+		return append(base,
+			"GIT_CONFIG_NOSYSTEM=1",
+			"HOME="+tmpDir,
+			"GIT_TERMINAL_PROMPT=0",
+			"GIT_ALLOW_PROTOCOL=file:https:ssh",
 			"GIT_CONFIG_COUNT=3",
 			"GIT_CONFIG_KEY_0=core.hooksPath",
 			"GIT_CONFIG_VALUE_0=/dev/null",
@@ -748,13 +777,6 @@ func (a *RotationReverserAdapter) hardenedEnv(tmpDir, token string) []string {
 			"GIT_CONFIG_VALUE_2=Authorization: Bearer "+token,
 		)
 	}
-	return env
-}
-
-// hardenedEnvNoAuth builds the isolation environment without HTTP auth (for
-// operations that don't need credentials, like git commit or git add).
-func (a *RotationReverserAdapter) hardenedEnvNoAuth(tmpDir string) []string {
-	base := fetchtransport.CleanGitEnv()
 	return append(base,
 		"GIT_CONFIG_NOSYSTEM=1",
 		"HOME="+tmpDir,
@@ -766,6 +788,12 @@ func (a *RotationReverserAdapter) hardenedEnvNoAuth(tmpDir string) []string {
 		"GIT_CONFIG_KEY_1=core.fsmonitor",
 		"GIT_CONFIG_VALUE_1=",
 	)
+}
+
+// hardenedEnvNoAuth builds the isolation environment without HTTP auth.
+// Delegates to buildEnv with withAuth=false.
+func (a *RotationReverserAdapter) hardenedEnvNoAuth(tmpDir string) []string {
+	return a.buildEnv(tmpDir, "", false)
 }
 
 // buildReversalCommitMessageBody returns the canonical signed-payload envelope

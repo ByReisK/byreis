@@ -210,29 +210,38 @@ func BuildProductionDeps(ctx context.Context) (*cli.Deps, error) {
 		buildAuditSinkProd(configDir),
 	)
 
-	// Build the rotation use-cases. The Rotator requires Phase-1/Phase-2
-	// executors that land in a later slice; buildRotatorProd returns nil when
-	// those ports are not yet wired. The Reconciler is wired now: the
-	// RotationReverserAdapter satisfies both RotationStateProbe and
-	// RotationStateReverser. Both are nil-safe: the CLI surfaces a "not
-	// configured" error at command time when nil.
-	rotator, rotateExitCode := buildRotatorProd(currentMode)
+	// Build the rotation use-cases. The Rotator now wires the production
+	// Phase-1/Phase-2 executors (V5b). Both are nil-safe: the CLI surfaces a
+	// "not configured" error at command time when the Rotator is nil. The
+	// Reconciler is wired via RotationReverserAdapter for both probe and reverser.
+	rotator, rotateExitCode := buildRotatorProd(
+		ctx, currentMode, regClient, writeTokenProvider, manifestSigner,
+		decrypt.New(), encrypt.New(), idLoader, codec,
+	)
 	reconciler := buildRotationReconcilerProd(
 		currentMode, writeSigner, writeTokenProvider,
 	)
 
+	// Build the rotate pre-flight reader. It requires the write-enabled registry
+	// client (for FetchRotationEpochs and CounterAuthority), the file-of-record
+	// source, the codec, the identity loader, and the decryptor.
+	rotatePreflight := buildRotatePreFlightProd(
+		regClient, forSource, codec, idLoader, decrypt.New(), projectIDFromEnvProd(),
+	)
+
 	return &cli.Deps{
-		Policy:         pol,
-		CurrentMode:    currentMode,
-		ConfigDir:      configDir,
-		Getter:         getter,
-		Decryptor:      decryptor,
-		Editor:         editorUC,
-		Merger:         merger,
-		MergeExitCode:  mergeExitCode,
-		Rotator:        rotator,
-		Reconciler:     reconciler,
-		RotateExitCode: rotateExitCode,
+		Policy:          pol,
+		CurrentMode:     currentMode,
+		ConfigDir:       configDir,
+		Getter:          getter,
+		Decryptor:       decryptor,
+		Editor:          editorUC,
+		Merger:          merger,
+		MergeExitCode:   mergeExitCode,
+		Rotator:         rotator,
+		Reconciler:      reconciler,
+		RotateExitCode:  rotateExitCode,
+		RotatePreFlight: rotatePreflight,
 	}, nil
 }
 
@@ -545,6 +554,7 @@ func buildMergerProd(
 		Mode:          gate,
 		Audit:         auditLog,
 		Log:           logging.Discard,
+		RotationGuard: regClient,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "byreis: warning: admin merge not available: %v\n", err)
@@ -1456,12 +1466,22 @@ func buildRegistryWriteWiringProd(
 
 // ─── rotation use-case builders ──────────────────────────────────────────────
 
-// buildRotatorProd constructs the Rotator use-case spine and a corresponding
-// RotateExitCode mapping function. Phase-1 and Phase-2 executors are not wired
-// in the current slice; buildRotatorProd returns (nil, nonNilFn). The CLI
-// surfaces a "not configured" error at command time when the Rotator is nil.
-// The exit-code function is always non-nil.
-func buildRotatorProd(currentMode mode.Mode) (rotate.Rotator, func(error) render.ExitCode) {
+// buildRotatorProd constructs the Rotator use-case spine with the real Phase-1
+// and Phase-2 executors wired via RotationPhaseAdapters. Returns (nil, fn)
+// when any required dependency is unavailable (missing registry, missing write
+// credentials, missing identity loader, non-ADMIN mode). The exit-code function
+// is always non-nil.
+func buildRotatorProd(
+	ctx context.Context,
+	currentMode mode.Mode,
+	regClient coreregistry.RegistryClient,
+	tokenProvider registryadapter.RegistryWriteTokenProvider,
+	manifestSigner usecase.ManifestSigner,
+	decryptor decrypt.Decryptor,
+	encryptor encrypt.Encryptor,
+	idLoader identity.Loader,
+	codec usecase.ArtifactCodec,
+) (rotate.Rotator, func(error) render.ExitCode) {
 	rotateExitCode := func(err error) render.ExitCode {
 		if err == nil {
 			return render.ExitOK
@@ -1490,11 +1510,69 @@ func buildRotatorProd(currentMode mode.Mode) (rotate.Rotator, func(error) render
 		return render.ExitGeneralError
 	}
 
-	// Phase-1/Phase-2 executors are not wired in this slice. Return nil Rotator
-	// so the CLI surfaces a "not configured" error at command time. The
-	// currentMode parameter is held for future use when executors are wired.
-	_ = currentMode
-	return nil, rotateExitCode
+	// Fail closed when required dependencies are unavailable.
+	if currentMode != mode.ModeAdmin && currentMode != mode.ModeSuper {
+		return nil, rotateExitCode
+	}
+	if regClient == nil || tokenProvider == nil || manifestSigner == nil ||
+		decryptor == nil || encryptor == nil || idLoader == nil || codec == nil {
+		fmt.Fprintf(os.Stderr,
+			"byreis: warning: rotation executor not wired (required dependency unavailable)\n")
+		return nil, rotateExitCode
+	}
+
+	registryURL := os.Getenv("BYREIS_REGISTRY")
+	projectRepoURL := os.Getenv("BYREIS_PROJECT_REPO")
+	projectID := projectIDFromEnvProd()
+	if registryURL == "" || projectRepoURL == "" || projectID == "" {
+		return nil, rotateExitCode
+	}
+
+	// Fetch the SourceVerified AdminSet to get ConfiguredFiles. Failure is
+	// non-fatal: the rotator returns nil and the CLI surfaces a "not configured"
+	// message at command time.
+	adminSet, asErr := regClient.FetchAdminSet(ctx, projectID)
+	if asErr != nil || !adminSet.SourceVerified || adminSet.Stale {
+		fmt.Fprintf(os.Stderr,
+			"byreis: warning: cannot fetch SourceVerified admin set for rotation wiring: "+
+				"rotator unavailable\n")
+		return nil, rotateExitCode
+	}
+
+	phaseAdapters, paErr := registryadapter.NewRotationPhaseAdapters(registryadapter.RotationPhaseAdapterDeps{
+		ProjectRepoURL:  projectRepoURL,
+		RegistryURL:     registryURL,
+		RegistryClient:  regClient,
+		ProjectID:       projectID,
+		ConfiguredFiles: adminSet.ConfiguredFiles,
+		Decryptor:       decryptor,
+		Encryptor:       encryptor,
+		ManifestSigner:  manifestSigner,
+		Codec:           codec,
+		IdentityLoader:  idLoader,
+		TokenProvider:   tokenProvider,
+		Runner:          registryadapter.SubprocessRunner{},
+	})
+	if paErr != nil {
+		fmt.Fprintf(os.Stderr,
+			"byreis: warning: rotation phase adapters construction failed: %v\n", paErr)
+		return nil, rotateExitCode
+	}
+
+	rotator, err := rotate.NewRotator(rotate.RotatorDeps{
+		Planner: rotate.NewPlanner(),
+		Phase1:  phaseAdapters.Phase1,
+		Phase2:  phaseAdapters.Phase2,
+		Clock:   &prodRotateClock{},
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr,
+			"byreis: warning: rotation use-case construction failed: %v\n", err)
+		return nil, rotateExitCode
+	}
+
+	_ = ctx // used above for FetchAdminSet
+	return rotator, rotateExitCode
 }
 
 // buildRotationReconcilerProd constructs the RotationReconciler use-case. The
@@ -1560,6 +1638,189 @@ type prodRotateClock struct{}
 
 func (c *prodRotateClock) Now() time.Time { return time.Now() }
 
+// ─── production rotate pre-flight adapter ────────────────────────────────────
+
+// prodRotatePreFlight implements cli.RotatePreFlightReader. It wraps the
+// SourceVerified registry client, the project-repo file-of-record source, the
+// identity loader, and the decrypt port to provide the two mandatory pre-flight
+// checks for the rotate command:
+//
+//  1. FetchVerifiedAdminSet: registry freshness + SourceVerified gate.
+//  2. CanDecryptAllFiles: admin decrypt-all-existing pre-flight.
+//
+// The adapter lives in internal/app so it can import both registry adapters and
+// crypto adapters without violating the Clean Architecture inward-dependency
+// rule (adapters depend inward on core; this type is at the composition root).
+type prodRotatePreFlight struct {
+	regClient coreregistry.RegistryClient
+	forSource usecase.FileOfRecordSource
+	codec     usecase.ArtifactCodec
+	idLoader  identity.Loader
+	decryptor decrypt.Decryptor
+	projectID string
+}
+
+// FetchVerifiedAdminSet fetches the SourceVerified, non-stale admin set and
+// populates a RotatePreFlightAdminSet. Returns an error wrapping
+// rotate.ErrRotationRequiresFreshRegistry when the set is stale or unverified.
+func (p *prodRotatePreFlight) FetchVerifiedAdminSet(
+	ctx context.Context, projectID string,
+) (cli.RotatePreFlightAdminSet, error) {
+	if err := ctx.Err(); err != nil {
+		return cli.RotatePreFlightAdminSet{},
+			fmt.Errorf("FetchVerifiedAdminSet cancelled: %w", err)
+	}
+
+	set, err := p.regClient.FetchAdminSet(ctx, projectID)
+	if err != nil {
+		return cli.RotatePreFlightAdminSet{},
+			fmt.Errorf("%w: registry fetch failed: %v",
+				rotate.ErrRotationRequiresFreshRegistry, err)
+	}
+	if !set.SourceVerified || set.Stale {
+		return cli.RotatePreFlightAdminSet{},
+			fmt.Errorf("%w: admin set is not SourceVerified or is stale",
+				rotate.ErrRotationRequiresFreshRegistry)
+	}
+
+	// Pre-rotation recipients.
+	preRecips := make([]string, 0, len(set.Recipients))
+	for _, r := range set.Recipients {
+		preRecips = append(preRecips, r.AgePubKey)
+	}
+
+	// Registered admins.
+	regAdmins := make([]string, 0, len(set.Recipients))
+	for _, r := range set.Recipients {
+		regAdmins = append(regAdmins, r.AgePubKey)
+	}
+
+	// Fetch rotation epochs.
+	epochMap, epochErr := p.regClient.FetchRotationEpochs(ctx, projectID)
+	if epochErr != nil {
+		epochMap = nil
+	}
+
+	// Enumerate configured files and build snapshots from the project repo.
+	var snapshots []cli.RotatePreFlightFileSnap
+	var maxEpoch uint64
+	for logicalName := range set.ConfiguredFiles {
+		// Fetch current epoch.
+		var epoch uint64
+		if epochMap != nil {
+			epoch = epochMap[logicalName]
+		}
+		if epoch > maxEpoch {
+			maxEpoch = epoch
+		}
+
+		// Fetch counter authority for the current counter value.
+		ca, caErr := p.regClient.CounterAuthority(ctx, projectID, logicalName)
+		var currentCounter uint64
+		if caErr == nil && ca.Valid() {
+			currentCounter = ca.LastAccepted()
+		}
+
+		// Fetch file bytes from the project repo for the decrypt check.
+		var encodedBytes []byte
+		if p.forSource != nil {
+			rec, recErr := p.forSource.FileOfRecord(ctx, projectID, logicalName)
+			if recErr == nil {
+				encodedBytes = rec.Bytes
+			}
+		}
+
+		snapshots = append(snapshots, cli.RotatePreFlightFileSnap{
+			LogicalName:    logicalName,
+			CurrentCounter: currentCounter,
+			CurrentEpoch:   epoch,
+			EncodedBytes:   encodedBytes,
+		})
+	}
+
+	return cli.RotatePreFlightAdminSet{
+		PreRotationRecipients: preRecips,
+		RegisteredAdmins:      regAdmins,
+		ConfiguredFiles:       set.ConfiguredFiles,
+		CurrentMaxEpoch:       maxEpoch,
+		FileSnapshots:         snapshots,
+	}, nil
+}
+
+// CanDecryptAllFiles attempts to decrypt each snapshot using the running
+// admin's identity. Returns an error wrapping
+// rotate.ErrRotationCannotDecryptExisting if any file fails to decrypt.
+// Plaintext is zeroized in a defer before returning.
+func (p *prodRotatePreFlight) CanDecryptAllFiles(
+	ctx context.Context, snapshots []cli.RotatePreFlightFileSnap,
+) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("CanDecryptAllFiles cancelled: %w", err)
+	}
+	if len(snapshots) == 0 {
+		return nil
+	}
+
+	id, idErr := p.idLoader.Load(ctx)
+	if idErr != nil {
+		return fmt.Errorf("%w: loading admin identity: %v",
+			rotate.ErrRotationCannotDecryptExisting, idErr)
+	}
+
+	for _, snap := range snapshots {
+		if len(snap.EncodedBytes) == 0 {
+			// No bytes fetched; treat as cannot-decrypt.
+			return fmt.Errorf("%w: no file bytes available for %q",
+				rotate.ErrRotationCannotDecryptExisting, snap.LogicalName)
+		}
+
+		signed, decodeErr := p.codec.DecodeSigned(snap.EncodedBytes)
+		if decodeErr != nil {
+			return fmt.Errorf("%w: decoding file %q: %v",
+				rotate.ErrRotationCannotDecryptExisting, snap.LogicalName, decodeErr)
+		}
+
+		plaintext, decErr := p.decryptor.Decrypt(ctx, signed, id)
+		if decErr != nil {
+			return fmt.Errorf("%w: file %q not decryptable by running admin",
+				rotate.ErrRotationCannotDecryptExisting, snap.LogicalName)
+		}
+		// Zeroize plaintext immediately; we only need the boolean signal.
+		for k := range plaintext {
+			b := []byte(plaintext[k])
+			for i := range b {
+				b[i] = 0
+			}
+			plaintext[k] = ""
+		}
+	}
+	return nil
+}
+
+// buildRotatePreFlightProd constructs the production RotatePreFlightReader.
+// Returns nil when required dependencies are unavailable; the CLI falls back
+// to the stub path in that case.
+func buildRotatePreFlightProd(
+	regClient coreregistry.RegistryClient,
+	forSource usecase.FileOfRecordSource,
+	codec usecase.ArtifactCodec,
+	idLoader identity.Loader,
+	decryptor decrypt.Decryptor,
+	projectID string,
+) cli.RotatePreFlightReader {
+	if regClient == nil || codec == nil || idLoader == nil || decryptor == nil {
+		return nil
+	}
+	return &prodRotatePreFlight{
+		regClient: regClient,
+		forSource: forSource,
+		codec:     codec,
+		idLoader:  idLoader,
+		decryptor: decryptor,
+		projectID: projectID,
+	}
+}
+
 // ─── compile-time assertions ─────────────────────────────────────────────────
 
 var (
@@ -1570,4 +1831,5 @@ var (
 	_ registryadapter.RegistryWriteTokenProvider = (*appRegistryWriteTokenBridge)(nil)
 	_ rotate.RotationStateReverser               = (*registryadapter.RotationReverserAdapter)(nil)
 	_ rotate.RotationStateProbe                  = (*registryadapter.RotationReverserAdapter)(nil)
+	_ cli.RotatePreFlightReader                  = (*prodRotatePreFlight)(nil)
 )
