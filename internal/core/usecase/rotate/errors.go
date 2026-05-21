@@ -140,4 +140,26 @@ var (
 	ErrRequestAccessShapeInfeasible = errors.New(
 		"request-access is not feasible against this registry configuration — " +
 			"out-of-band onboarding + `byreis rotate --add` is the supported v0.2 path")
+
+	// ErrRotationReversalNoBranchRef is surfaced by BuildRotationReversalAuditEvent
+	// when the observation has an empty RotationBranchRef. The reversal audit
+	// event must carry the rotation branch PR ref so the audit trail can be
+	// joined back to the failed rotation; a missing ref is a probe defect, not
+	// an absence of action — the producer fails closed rather than emitting a
+	// partial event.
+	ErrRotationReversalNoBranchRef = errors.New(
+		"refusing to emit rotation reversal audit event: observation carries an " +
+			"empty rotation branch ref — the probe must populate RotationBranchRef " +
+			"for any PHASE_1_ONLY observation")
+
+	// ErrRotationFingerprintMismatch is surfaced when the operator-typed
+	// fingerprint confirm value does not match the recipient's full SHA-256
+	// fingerprint. The CLI's --remove / --replace path requires a full-64-char
+	// typed confirm to defeat shoulder-surfed visual-only attacks; a mismatch
+	// is a deliberate operator-side decision to abort. The verb surfaces this
+	// sentinel so the CLI render layer can emit a clear, non-leaky message.
+	ErrRotationFingerprintMismatch = errors.New(
+		"refusing to rotate: the typed fingerprint does not match the displayed " +
+			"recipient — re-run and type the full 64-char SHA-256 fingerprint exactly " +
+			"as displayed; rotation never proceeds on a partial-match")
 )

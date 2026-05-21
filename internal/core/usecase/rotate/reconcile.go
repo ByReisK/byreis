@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/ByReisK/byreis/internal/core/git"
 	"github.com/ByReisK/byreis/internal/core/registry/countertypes"
 )
 
@@ -22,16 +23,20 @@ type ReconcilerDeps struct {
 	// Reverser acts on a PHASE_1_ONLY classification: clear pendings + delete
 	// the unmerged rotation branch.
 	Reverser RotationStateReverser
+	// Clock supplies the OccurredAt timestamp for the rotation-reversal audit
+	// event emitted alongside ClearPendings. Required: no real clock is used
+	// in tests; production wires a system clock at composition.
+	Clock Clock
 }
 
 // NewReconciler returns a RotationReconciler with the given dependencies.
 // All ports are required; a nil port returns an error (no nil-port silent
 // downgrade — security paths fail closed).
 func NewReconciler(d ReconcilerDeps) (RotationReconciler, error) {
-	if d.Probe == nil || d.Reverser == nil {
+	if d.Probe == nil || d.Reverser == nil || d.Clock == nil {
 		return nil, errors.New(
 			"rotate.NewReconciler: a required port is nil — " +
-				"wire RotationStateProbe and RotationStateReverser")
+				"wire RotationStateProbe, RotationStateReverser, and Clock")
 	}
 	return &reconciler{d: d}, nil
 }
@@ -55,16 +60,60 @@ func (r *reconciler) Classify(ctx context.Context, projectID string) (PartialSta
 }
 
 // Reconcile classifies the partial state, then acts on the classification
-// with bounded retries on CAS rejection during the pending-clear path.
+// with bounded retries on CAS rejection during the pending-clear path AND
+// the branch-delete path. The retry budget is uniform across the two steps:
+// each CAS failure costs one retry; the budget caps at reconcileMaxRetries
+// regardless of which step burned it.
+//
+// Branch-delete-pending discipline: once ClearPendings has succeeded for an
+// observation, the reconciler must NOT re-probe or re-classify on a
+// branch-delete failure. Re-probing after the clear succeeded would risk
+// (a) racing a fresh rotation start that has not yet observed the clear,
+// classifying the live partial-state as something other than Phase1Only,
+// and (b) re-running ClearPendings against the already-cleared registry
+// state. Instead, the loop snapshots the rotation branch ref and the
+// cleared-pendings count from the observation that drove the successful
+// ClearPendings, and on subsequent iterations goes DIRECTLY to
+// DeleteRotationBranch using the snapshot.
 func (r *reconciler) Reconcile(ctx context.Context, projectID string) (ReconcileResult, error) {
 	if err := ctx.Err(); err != nil {
 		return ReconcileResult{}, fmt.Errorf("rotation reconcile cancelled: %w", err)
 	}
 
-	var retries int
+	var (
+		retries             int
+		branchDeletePending bool
+		snapshotBranchRef   = git.PRRef{}
+		snapshotCleared     int
+	)
 	for {
 		if err := ctx.Err(); err != nil {
 			return ReconcileResult{Retries: retries}, fmt.Errorf("rotation reconcile cancelled: %w", err)
+		}
+
+		// Branch-delete-pending fast path: skip probe + classify + clear,
+		// retry the delete directly against the snapshotted branch ref.
+		if branchDeletePending {
+			if err := r.d.Reverser.DeleteRotationBranch(ctx, snapshotBranchRef); err != nil {
+				retries++
+				if retries >= reconcileMaxRetries {
+					return ReconcileResult{
+							Classification:  Phase1Only,
+							PendingsCleared: snapshotCleared,
+							Retries:         retries,
+						}, fmt.Errorf(
+							"%w: branch-delete CAS rejected after %d retries; "+
+								"manual cleanup required via `git push origin --delete %s`: %v",
+							ErrRotationReconcile, retries, formatBranchRef(snapshotBranchRef), err)
+				}
+				continue
+			}
+			return ReconcileResult{
+				Classification:  Phase1Only,
+				BranchDeleted:   true,
+				PendingsCleared: snapshotCleared,
+				Retries:         retries,
+			}, nil
 		}
 
 		obs, err := r.d.Probe.FetchPartialState(ctx, projectID)
@@ -87,10 +136,19 @@ func (r *reconciler) Reconcile(ctx context.Context, projectID string) (Reconcile
 					ErrRotationReconcile)
 
 		case Phase1Only:
-			// Apply the PHASE_1_ONLY reversal: clear pendings then delete the
-			// unmerged branch. A CAS rejection on either step triggers a
+			// Build the rotation-reversal audit event for this observation
+			// against the injected clock. An empty branch ref surfaces
+			// ErrRotationReversalNoBranchRef as a probe defect — terminal.
+			ev, evErr := BuildRotationReversalAuditEvent(obs, projectID, r.d.Clock.Now())
+			if evErr != nil {
+				return ReconcileResult{Classification: Phase1Only, Retries: retries},
+					fmt.Errorf("rotation reconcile: %w", evErr)
+			}
+
+			// Apply the PHASE_1_ONLY reversal: clear pendings (same-commit
+			// audit append per the port contract). A CAS rejection triggers a
 			// re-classification + retry up to the bounded budget.
-			if err := r.d.Reverser.ClearPendings(ctx, projectID, obs.PendingsTaggedRotation); err != nil {
+			if err := r.d.Reverser.ClearPendings(ctx, projectID, obs.PendingsTaggedRotation, ev); err != nil {
 				// Counter-authority reconcile errors are terminal — surface them
 				// directly (the registry's counter authority demands operator
 				// reconciliation, never an auto-retry).
@@ -106,19 +164,33 @@ func (r *reconciler) Reconcile(ctx context.Context, projectID string) (Reconcile
 				}
 				continue
 			}
-			if err := r.d.Reverser.DeleteRotationBranch(ctx, obs.RotationBranchRef); err != nil {
+
+			// Clear succeeded — snapshot the branch ref and the cleared count
+			// so the subsequent delete-retry path does not re-derive them
+			// from a fresh probe (which could race a concurrent rotation
+			// start and mis-classify).
+			branchDeletePending = true
+			snapshotBranchRef = obs.RotationBranchRef
+			snapshotCleared = len(obs.PendingsTaggedRotation)
+
+			if err := r.d.Reverser.DeleteRotationBranch(ctx, snapshotBranchRef); err != nil {
 				retries++
 				if retries >= reconcileMaxRetries {
-					return ReconcileResult{Classification: Phase1Only, Retries: retries},
-						fmt.Errorf("%w: branch-delete CAS rejected after %d retries: %v",
-							ErrRotationReconcile, retries, err)
+					return ReconcileResult{
+							Classification:  Phase1Only,
+							PendingsCleared: snapshotCleared,
+							Retries:         retries,
+						}, fmt.Errorf(
+							"%w: branch-delete CAS rejected after %d retries; "+
+								"manual cleanup required via `git push origin --delete %s`: %v",
+							ErrRotationReconcile, retries, formatBranchRef(snapshotBranchRef), err)
 				}
 				continue
 			}
 			return ReconcileResult{
 				Classification:  Phase1Only,
 				BranchDeleted:   true,
-				PendingsCleared: len(obs.PendingsTaggedRotation),
+				PendingsCleared: snapshotCleared,
 				Retries:         retries,
 			}, nil
 
@@ -128,6 +200,17 @@ func (r *reconciler) Reconcile(ctx context.Context, projectID string) (Reconcile
 					ErrRotationReconcile, cls)
 		}
 	}
+}
+
+// formatBranchRef returns a short, runbook-readable rendering of a PRRef for
+// use in the branch-delete error message. The format is
+// "<project>#<number>"; an empty PRRef renders as a sentinel "<unknown-ref>"
+// so the operator notices the gap in the runbook hint.
+func formatBranchRef(ref git.PRRef) string {
+	if ref.Project == "" && ref.Number == 0 {
+		return "<unknown-ref>"
+	}
+	return fmt.Sprintf("%s#%d", ref.Project, ref.Number)
 }
 
 // classifyObservation applies the reconcile classification logic to a single

@@ -96,17 +96,19 @@ type Result struct {
 // Command enumerates all byreis v0.1 commands for the permission matrix.
 type Command string
 
-// Command constants enumerate all byreis v0.1 CLI verbs for the permission matrix.
+// Command constants enumerate all byreis CLI verbs for the permission matrix.
 const (
-	CommandVersion Command = "version"
-	CommandInit    Command = "init"
-	CommandDoctor  Command = "doctor"
-	CommandSubmit  Command = "submit"
-	CommandReview  Command = "review"
-	CommandMerge   Command = "merge"
-	CommandGet     Command = "get"
-	CommandDecrypt Command = "decrypt"
-	CommandEdit    Command = "edit"
+	CommandVersion           Command = "version"
+	CommandInit              Command = "init"
+	CommandDoctor            Command = "doctor"
+	CommandSubmit            Command = "submit"
+	CommandReview            Command = "review"
+	CommandMerge             Command = "merge"
+	CommandGet               Command = "get"
+	CommandDecrypt           Command = "decrypt"
+	CommandEdit              Command = "edit"
+	CommandRotate            Command = "rotate"
+	CommandRotationReconcile Command = "rotation-reconcile"
 )
 
 // ErrKeyPermissions is a hard error returned when the private key file exists
@@ -287,15 +289,17 @@ type Policy struct{}
 // permitted in a mode iff its entry contains that mode. Any command or mode not
 // represented here is denied (fail closed) — there is no default-allow path.
 var matrix = map[Command]map[Mode]bool{
-	CommandVersion: {ModeContributor: true, ModeAdmin: true, ModeSuper: true},
-	CommandInit:    {ModeContributor: true, ModeAdmin: true, ModeSuper: true},
-	CommandDoctor:  {ModeContributor: true, ModeAdmin: true, ModeSuper: true},
-	CommandSubmit:  {ModeContributor: true, ModeAdmin: true, ModeSuper: true},
-	CommandReview:  {ModeAdmin: true, ModeSuper: true},
-	CommandMerge:   {ModeAdmin: true, ModeSuper: true},
-	CommandGet:     {ModeAdmin: true, ModeSuper: true},
-	CommandDecrypt: {ModeAdmin: true, ModeSuper: true},
-	CommandEdit:    {ModeAdmin: true, ModeSuper: true},
+	CommandVersion:           {ModeContributor: true, ModeAdmin: true, ModeSuper: true},
+	CommandInit:              {ModeContributor: true, ModeAdmin: true, ModeSuper: true},
+	CommandDoctor:            {ModeContributor: true, ModeAdmin: true, ModeSuper: true},
+	CommandSubmit:            {ModeContributor: true, ModeAdmin: true, ModeSuper: true},
+	CommandReview:            {ModeAdmin: true, ModeSuper: true},
+	CommandMerge:             {ModeAdmin: true, ModeSuper: true},
+	CommandGet:               {ModeAdmin: true, ModeSuper: true},
+	CommandDecrypt:           {ModeAdmin: true, ModeSuper: true},
+	CommandEdit:              {ModeAdmin: true, ModeSuper: true},
+	CommandRotate:            {ModeAdmin: true, ModeSuper: true},
+	CommandRotationReconcile: {ModeAdmin: true, ModeSuper: true},
 }
 
 // Allow returns nil if cmd is permitted in mode m, or an error wrapping

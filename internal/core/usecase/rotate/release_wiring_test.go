@@ -33,9 +33,14 @@ package rotate_test
 import (
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
+	"strings"
 	"testing"
 
 	"go.yaml.in/yaml/v3"
@@ -218,3 +223,141 @@ func headSample(b []byte) string {
 	}
 	return string(b[:max]) + "..."
 }
+
+// V5a (BO-V5-T10 RULING-V5-T3 shape-(a) confirmation) — closed-world structural
+// check on the rotate CLI handler.
+//
+// The V5a slice ships internal/cli/rotate_cmd.go as a CLI verb whose
+// --from-request flag is deferred: the handler refuses the flag with an
+// actionable error before any port is invoked (RULING-V5-T3 shape (a),
+// "CLI-handler refusal"). The alternative shape (b), "wired-but-port-nil-fail",
+// would have required importing a placeholder V6 read-side port that does not
+// yet exist (internal/adapter/git/github/pr_read.go is the V6 read helper).
+//
+// This test structurally confirms shape (a) by AST-inspecting rotate_cmd.go
+// and asserting it does NOT import the V6 read helper. The V6 path does not
+// exist in the tree at V5a, so any future PR that imports it via a placeholder
+// would be a structural deviation from RULING-V5-T3 shape (a). This test
+// surfaces that deviation as a docgate red before the change can ship.
+//
+// Discipline:
+//   - stdlib go/parser only; no new third-party deps.
+//   - Built under //go:build docgate (same constraint as the rest of this
+//     file); never compiled into a shipped binary.
+//   - Path-resolves rotate_cmd.go via the module root walker already in
+//     this file, so the test runs deterministically from any cwd.
+const rotateCmdRelPath = "internal/cli/rotate_cmd.go"
+
+// forbiddenRotateCmdImports lists Go package import paths that
+// internal/cli/rotate_cmd.go must NOT import at V5a. The V6 read helper
+// (pr_read.go) is the canonical candidate: it does not exist in the V5a
+// tree, and structurally confirming its absence in rotate_cmd.go's import
+// set is how this test pins RULING-V5-T3 shape (a).
+//
+// The check is over import PATHS (the string in the import declaration),
+// not files. Including the file basename "pr_read.go" in the rationale is
+// for human readers; the assertion's mechanism is the path-string match.
+var forbiddenRotateCmdImports = []string{
+	"github.com/ByReisK/byreis/internal/adapter/git/github/pr_read",
+}
+
+// TestRotateCmd_ShapeAConfirmation_NoV6ReadHelperImport asserts that
+// internal/cli/rotate_cmd.go does not import the V6 read helper. A
+// regression on this assertion is a deliberate review event: the V6
+// read helper does not exist in the V5a tree, and an import of it would
+// be a structural change to the deferred --from-request handling shape
+// that the V5a slice locked in.
+func TestRotateCmd_ShapeAConfirmation_NoV6ReadHelperImport(t *testing.T) {
+	t.Parallel()
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("WIRING GATE FAIL: cannot get working directory: %v", err)
+	}
+	root, err := findModuleRoot(cwd)
+	if err != nil {
+		t.Fatalf("WIRING GATE FAIL: cannot find module root from %s: %v.\n"+
+			"This test requires a go.mod ancestor to locate %s.",
+			cwd, err, rotateCmdRelPath)
+	}
+	abs := filepath.Join(root, rotateCmdRelPath)
+	info, statErr := os.Stat(abs)
+	if statErr != nil {
+		t.Fatalf("WIRING GATE FAIL: %s not found at %s: %v.\n"+
+			"Either the file was removed (V5a CLI scaffold is broken) or "+
+			"the path constant is stale.", rotateCmdRelPath, abs, statErr)
+	}
+	if info.IsDir() {
+		t.Fatalf("WIRING GATE FAIL: expected %s to be a file, got a directory", abs)
+	}
+
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, abs, nil, parser.ImportsOnly)
+	if err != nil {
+		t.Fatalf("WIRING GATE FAIL: cannot parse %s: %v.\n"+
+			"The structural-check gate fails closed when the source cannot be parsed.",
+			abs, err)
+	}
+
+	imports := make([]string, 0, len(f.Imports))
+	for _, spec := range f.Imports {
+		if spec == nil || spec.Path == nil {
+			continue
+		}
+		raw := spec.Path.Value
+		path, unquoteErr := strconv.Unquote(raw)
+		if unquoteErr != nil {
+			t.Fatalf("WIRING GATE FAIL: malformed import literal %q in %s: %v",
+				raw, abs, unquoteErr)
+		}
+		imports = append(imports, path)
+	}
+	sort.Strings(imports)
+
+	for _, forbidden := range forbiddenRotateCmdImports {
+		if containsImport(imports, forbidden) {
+			t.Fatalf("WIRING GATE FAIL: %s imports %q.\n"+
+				"V5a locked --from-request as a CLI-handler refusal (no V6 read-side "+
+				"port wired). An import of the V6 read helper is a structural deviation "+
+				"from that shape — it must land alongside the V6 slice that ships the "+
+				"actual read-side port, not as a placeholder in V5a.\n\n"+
+				"observed imports:\n  %s",
+				rotateCmdRelPath, forbidden, strings.Join(imports, "\n  "))
+		}
+	}
+
+	// Defense-in-depth: also confirm that no observed import in rotate_cmd.go
+	// references a path containing the basename "pr_read". This catches a
+	// future move/rename of the V6 read helper that would otherwise slip past
+	// the exact-path match above. The basename is a stable signal: any file
+	// purposed as the rotate-from-request reader will carry it.
+	for _, imp := range imports {
+		if strings.Contains(imp, "pr_read") {
+			t.Fatalf("WIRING GATE FAIL: %s imports a path containing \"pr_read\" (%q).\n"+
+				"V5a does not wire a V6 read-side port for --from-request; an import "+
+				"matching this basename is a structural deviation from RULING-V5-T3 shape (a).\n\n"+
+				"observed imports:\n  %s",
+				rotateCmdRelPath, imp, strings.Join(imports, "\n  "))
+		}
+	}
+
+	t.Logf("OK: %s does not import any V6 read helper; --from-request is "+
+		"deferred via CLI-handler refusal (RULING-V5-T3 shape (a)). "+
+		"imports observed: %d", rotateCmdRelPath, len(imports))
+}
+
+// containsImport returns true iff target is in imports. Linear scan is fine —
+// rotate_cmd.go has a small fixed number of imports.
+func containsImport(imports []string, target string) bool {
+	for _, imp := range imports {
+		if imp == target {
+			return true
+		}
+	}
+	return false
+}
+
+// ast import is referenced indirectly via parser.ParseFile; this blank usage
+// keeps the import explicit so a future refactor that drops the *ast.File
+// return value notices the import is no longer needed.
+var _ = (*ast.File)(nil)

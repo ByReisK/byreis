@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/ByReisK/byreis/internal/core/audit"
 	"github.com/ByReisK/byreis/internal/core/crypto/artifact"
 	"github.com/ByReisK/byreis/internal/core/git"
 	"github.com/ByReisK/byreis/internal/core/registry/rectypes"
@@ -296,12 +297,14 @@ type PendingObservation struct {
 // wire RegistryWriteSigner + GitProvider; V1 tests inject a fake.
 type RotationStateReverser interface {
 	// ClearPendings clears every per-file rotation-tagged pending for the
-	// project in one signed registry commit (or N commits — atomicity is not
-	// load-bearing for Phase-1-only state — no file has been committed to
-	// project main yet). A CAS rejection on the
-	// pending-clear push surfaces a non-nil error which the reconciler treats
-	// as retryable up to a bounded budget.
-	ClearPendings(ctx context.Context, projectID string, pendings []PendingObservation) error
+	// project AND appends the supplied rotation-reversal audit event in a
+	// SINGLE signed registry commit. Same-commit atomicity is load-bearing
+	// here: the audit trail and the cleared-pendings state must land together
+	// or not at all, so a reader of any post-reconcile registry snapshot
+	// either sees both the cleared pendings AND the reversal audit row, or
+	// neither. A CAS rejection on the push surfaces a non-nil error which
+	// the reconciler treats as retryable up to a bounded budget.
+	ClearPendings(ctx context.Context, projectID string, pendings []PendingObservation, auditEvent audit.Event) error
 	// DeleteRotationBranch deletes the unmerged rotation branch on the
 	// project repo. A CAS rejection (the branch was concurrently merged
 	// between classification and now) surfaces a non-nil error which the

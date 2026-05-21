@@ -39,6 +39,7 @@ import (
 	coreregistry "github.com/ByReisK/byreis/internal/core/registry"
 	"github.com/ByReisK/byreis/internal/core/registry/countertypes"
 	"github.com/ByReisK/byreis/internal/core/usecase"
+	"github.com/ByReisK/byreis/internal/core/usecase/rotate"
 )
 
 // BuildProductionDeps constructs the real Deps for the production wiring path.
@@ -209,15 +210,29 @@ func BuildProductionDeps(ctx context.Context) (*cli.Deps, error) {
 		buildAuditSinkProd(configDir),
 	)
 
+	// Build the rotation use-cases. The Rotator requires Phase-1/Phase-2
+	// executors that land in a later slice; buildRotatorProd returns nil when
+	// those ports are not yet wired. The Reconciler is wired now: the
+	// RotationReverserAdapter satisfies both RotationStateProbe and
+	// RotationStateReverser. Both are nil-safe: the CLI surfaces a "not
+	// configured" error at command time when nil.
+	rotator, rotateExitCode := buildRotatorProd(currentMode)
+	reconciler := buildRotationReconcilerProd(
+		currentMode, writeSigner, writeTokenProvider,
+	)
+
 	return &cli.Deps{
-		Policy:        pol,
-		CurrentMode:   currentMode,
-		ConfigDir:     configDir,
-		Getter:        getter,
-		Decryptor:     decryptor,
-		Editor:        editorUC,
-		Merger:        merger,
-		MergeExitCode: mergeExitCode,
+		Policy:         pol,
+		CurrentMode:    currentMode,
+		ConfigDir:      configDir,
+		Getter:         getter,
+		Decryptor:      decryptor,
+		Editor:         editorUC,
+		Merger:         merger,
+		MergeExitCode:  mergeExitCode,
+		Rotator:        rotator,
+		Reconciler:     reconciler,
+		RotateExitCode: rotateExitCode,
 	}, nil
 }
 
@@ -1439,6 +1454,112 @@ func buildRegistryWriteWiringProd(
 	return signerAdapter, bridge, nil
 }
 
+// ─── rotation use-case builders ──────────────────────────────────────────────
+
+// buildRotatorProd constructs the Rotator use-case spine and a corresponding
+// RotateExitCode mapping function. Phase-1 and Phase-2 executors are not wired
+// in the current slice; buildRotatorProd returns (nil, nonNilFn). The CLI
+// surfaces a "not configured" error at command time when the Rotator is nil.
+// The exit-code function is always non-nil.
+func buildRotatorProd(currentMode mode.Mode) (rotate.Rotator, func(error) render.ExitCode) {
+	rotateExitCode := func(err error) render.ExitCode {
+		if err == nil {
+			return render.ExitOK
+		}
+		if isErr(err, registryadapter.ErrRegistryWriteAuth) {
+			return render.ExitAuthError
+		}
+		if isErr(err, registryadapter.ErrRegistryConcurrentWrite) {
+			return render.ExitCounterReconcile
+		}
+		if isErr(err, registryadapter.ErrRegistryWriteRejected) {
+			return render.ExitTrustError
+		}
+		if isErr(err, rotate.ErrRotationReconcile) {
+			return render.ExitCounterReconcile
+		}
+		if isErr(err, rotate.ErrRotationRequiresFreshRegistry) {
+			return render.ExitTrustError
+		}
+		if isErr(err, rotate.ErrRotationCannotDecryptExisting) {
+			return render.ExitAuthError
+		}
+		if isErr(err, rotate.ErrRotationReversalNoBranchRef) {
+			return render.ExitTrustError
+		}
+		return render.ExitGeneralError
+	}
+
+	// Phase-1/Phase-2 executors are not wired in this slice. Return nil Rotator
+	// so the CLI surfaces a "not configured" error at command time. The
+	// currentMode parameter is held for future use when executors are wired.
+	_ = currentMode
+	return nil, rotateExitCode
+}
+
+// buildRotationReconcilerProd constructs the RotationReconciler use-case. The
+// RotationReverserAdapter satisfies both RotationStateProbe and
+// RotationStateReverser, so a single adapter instance is used for both ports.
+//
+// Returns nil when the required write wiring (signer, token provider) is
+// unavailable: reconcile requires ADMIN-gated write credentials. The CLI
+// surfaces a "not configured" error at command time when nil.
+func buildRotationReconcilerProd(
+	currentMode mode.Mode,
+	signer registryadapter.RegistryWriteSigner,
+	tokenProvider registryadapter.RegistryWriteTokenProvider,
+) rotate.RotationReconciler {
+	// Only ADMIN mode can wire the reconciler. CONTRIBUTOR mode never receives
+	// write credentials; fail closed here rather than deferring to the adapter.
+	if currentMode != mode.ModeAdmin && currentMode != mode.ModeSuper {
+		return nil
+	}
+
+	// Write wiring required: both signer and token provider must be non-nil.
+	if signer == nil || tokenProvider == nil {
+		fmt.Fprintf(os.Stderr,
+			"byreis: warning: rotation reconciler not wired (registry write credentials unavailable)\n")
+		return nil
+	}
+
+	registryURL := os.Getenv("BYREIS_REGISTRY")
+	projectRepoURL := os.Getenv("BYREIS_PROJECT_REPO")
+	if registryURL == "" || projectRepoURL == "" {
+		return nil
+	}
+
+	reverserAdapter, err := registryadapter.NewRotationReverserAdapter(registryadapter.RotationReverserDeps{
+		RegistryURL:    registryURL,
+		ProjectRepoURL: projectRepoURL,
+		Signer:         signer,
+		TokenProvider:  tokenProvider,
+		Runner:         registryadapter.SubprocessRunner{},
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr,
+			"byreis: warning: rotation reconciler unavailable: %v\n", err)
+		return nil
+	}
+
+	reconciler, err := rotate.NewReconciler(rotate.ReconcilerDeps{
+		Probe:    reverserAdapter,
+		Reverser: reverserAdapter,
+		Clock:    &prodRotateClock{},
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr,
+			"byreis: warning: rotation reconciler construction failed: %v\n", err)
+		return nil
+	}
+	return reconciler
+}
+
+// prodRotateClock is a system-clock adapter for the rotation use-case domain.
+// It satisfies rotate.Clock.
+type prodRotateClock struct{}
+
+func (c *prodRotateClock) Now() time.Time { return time.Now() }
+
 // ─── compile-time assertions ─────────────────────────────────────────────────
 
 var (
@@ -1447,4 +1568,6 @@ var (
 	_ fileofrecord.ConfiguredPathResolver        = (*prodRegistryConfiguredPathResolver)(nil)
 	_ usecase.CounterStore                       = (*prodRegistryCounterStoreBridge)(nil)
 	_ registryadapter.RegistryWriteTokenProvider = (*appRegistryWriteTokenBridge)(nil)
+	_ rotate.RotationStateReverser               = (*registryadapter.RotationReverserAdapter)(nil)
+	_ rotate.RotationStateProbe                  = (*registryadapter.RotationReverserAdapter)(nil)
 )

@@ -33,6 +33,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ByReisK/byreis/internal/core/audit"
 	"github.com/ByReisK/byreis/internal/core/crypto/artifact"
 	"github.com/ByReisK/byreis/internal/core/git"
 	"github.com/ByReisK/byreis/internal/core/mode"
@@ -468,11 +469,17 @@ type fakeReverser struct {
 	clearErrs       []error
 	deleteErr       error
 	clearedPendings [][]rotate.PendingObservation
+	// clearedEvents captures the audit.Event passed to each ClearPendings
+	// call. V5 ports the reverser signature to carry the rotation-reversal
+	// audit event for same-commit atomicity with the cleared pendings; the
+	// fake records it so per-call assertions can be made.
+	clearedEvents []audit.Event
 }
 
-func (f *fakeReverser) ClearPendings(_ context.Context, _ string, ps []rotate.PendingObservation) error {
+func (f *fakeReverser) ClearPendings(_ context.Context, _ string, ps []rotate.PendingObservation, ev audit.Event) error {
 	idx := f.clearCalls.Add(1) - 1
 	f.clearedPendings = append(f.clearedPendings, ps)
+	f.clearedEvents = append(f.clearedEvents, ev)
 	if int(idx) < len(f.clearErrs) {
 		return f.clearErrs[idx]
 	}
@@ -524,7 +531,7 @@ func noPartialObs() rotate.PartialStateObservation {
 func TestReconcile_Phase1OnlyClassification(t *testing.T) {
 	probe := &fakeProbe{seq: []rotate.PartialStateObservation{phase1OnlyObs()}}
 	rev := &fakeReverser{}
-	rec, err := rotate.NewReconciler(rotate.ReconcilerDeps{Probe: probe, Reverser: rev})
+	rec, err := rotate.NewReconciler(rotate.ReconcilerDeps{Probe: probe, Reverser: rev, Clock: fakeClock{now: time.Date(2026, 5, 20, 12, 0, 0, 0, time.UTC)}})
 	if err != nil {
 		t.Fatalf("NewReconciler: %v", err)
 	}
@@ -548,7 +555,7 @@ func TestReconcile_Phase1OnlyAction_DeletesBranchClearsPendings(t *testing.T) {
 	obs := phase1OnlyObs()
 	probe := &fakeProbe{seq: []rotate.PartialStateObservation{obs}}
 	rev := &fakeReverser{}
-	rec, _ := rotate.NewReconciler(rotate.ReconcilerDeps{Probe: probe, Reverser: rev})
+	rec, _ := rotate.NewReconciler(rotate.ReconcilerDeps{Probe: probe, Reverser: rev, Clock: fakeClock{now: time.Date(2026, 5, 20, 12, 0, 0, 0, time.UTC)}})
 
 	res, err := rec.Reconcile(context.Background(), "myorg/proj")
 	if err != nil {
@@ -581,7 +588,7 @@ func TestReconcile_Phase1OnlyAction_DeletesBranchClearsPendings(t *testing.T) {
 func TestReconcile_Phase2Midflight_TerminalErrRotationReconcile(t *testing.T) {
 	probe := &fakeProbe{seq: []rotate.PartialStateObservation{phase2MidflightObs()}}
 	rev := &fakeReverser{}
-	rec, _ := rotate.NewReconciler(rotate.ReconcilerDeps{Probe: probe, Reverser: rev})
+	rec, _ := rotate.NewReconciler(rotate.ReconcilerDeps{Probe: probe, Reverser: rev, Clock: fakeClock{now: time.Date(2026, 5, 20, 12, 0, 0, 0, time.UTC)}})
 
 	res, err := rec.Reconcile(context.Background(), "myorg/proj")
 	if !errors.Is(err, rotate.ErrRotationReconcile) {
@@ -630,7 +637,7 @@ func TestReconcile_CONTRIBUTOR_DeniedAtVerbWrapper(t *testing.T) {
 	// verb wrapper carries the mode gate, not the port.
 	probe := &fakeProbe{seq: []rotate.PartialStateObservation{noPartialObs()}}
 	rev := &fakeReverser{}
-	rec, _ := rotate.NewReconciler(rotate.ReconcilerDeps{Probe: probe, Reverser: rev})
+	rec, _ := rotate.NewReconciler(rotate.ReconcilerDeps{Probe: probe, Reverser: rev, Clock: fakeClock{now: time.Date(2026, 5, 20, 12, 0, 0, 0, time.UTC)}})
 	if _, err := rec.Reconcile(context.Background(), "myorg/proj"); err != nil {
 		t.Fatalf("port-level Reconcile must not check mode; got %v", err)
 	}
@@ -649,7 +656,7 @@ func TestReconcile_BoundedRetries_OnConcurrentRotation(t *testing.T) {
 		rev := &fakeReverser{
 			clearErrs: []error{errors.New("CAS rejected: registry HEAD moved")},
 		}
-		rec, _ := rotate.NewReconciler(rotate.ReconcilerDeps{Probe: probe, Reverser: rev})
+		rec, _ := rotate.NewReconciler(rotate.ReconcilerDeps{Probe: probe, Reverser: rev, Clock: fakeClock{now: time.Date(2026, 5, 20, 12, 0, 0, 0, time.UTC)}})
 		res, err := rec.Reconcile(context.Background(), "myorg/proj")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -676,7 +683,7 @@ func TestReconcile_BoundedRetries_OnConcurrentRotation(t *testing.T) {
 				errors.New("CAS rejected 4"),
 			},
 		}
-		rec, _ := rotate.NewReconciler(rotate.ReconcilerDeps{Probe: probe, Reverser: rev})
+		rec, _ := rotate.NewReconciler(rotate.ReconcilerDeps{Probe: probe, Reverser: rev, Clock: fakeClock{now: time.Date(2026, 5, 20, 12, 0, 0, 0, time.UTC)}})
 		res, err := rec.Reconcile(context.Background(), "myorg/proj")
 		if !errors.Is(err, rotate.ErrRotationReconcile) {
 			t.Fatalf("expected ErrRotationReconcile after budget exhaustion, got %v", err)
@@ -693,7 +700,7 @@ func TestReconcile_BoundedRetries_OnConcurrentRotation(t *testing.T) {
 		rev := &fakeReverser{
 			clearErrs: []error{countertypes.ErrCounterReconcile},
 		}
-		rec, _ := rotate.NewReconciler(rotate.ReconcilerDeps{Probe: probe, Reverser: rev})
+		rec, _ := rotate.NewReconciler(rotate.ReconcilerDeps{Probe: probe, Reverser: rev, Clock: fakeClock{now: time.Date(2026, 5, 20, 12, 0, 0, 0, time.UTC)}})
 		res, err := rec.Reconcile(context.Background(), "myorg/proj")
 		if !errors.Is(err, countertypes.ErrCounterReconcile) {
 			t.Fatalf("counter-reconcile must propagate terminally, got %v", err)

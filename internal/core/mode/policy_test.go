@@ -22,29 +22,32 @@ func TestPolicy_CommandModeMatrix(t *testing.T) {
 	// v0.1 command set and mode mapping per the locked requirements:
 	//   version/init/doctor/submit : all modes (contributor-runnable spine)
 	//   review/merge/get/decrypt/edit : admin path only (denied for contributor)
+	//   rotate/rotation-reconcile : admin path only (denied for contributor) — V5.ROTATE.contributor-denied
 	allow := map[mode.Command]map[mode.Mode]bool{
-		mode.CommandVersion: {mode.ModeContributor: true, mode.ModeAdmin: true, mode.ModeSuper: true},
-		mode.CommandInit:    {mode.ModeContributor: true, mode.ModeAdmin: true, mode.ModeSuper: true},
-		mode.CommandDoctor:  {mode.ModeContributor: true, mode.ModeAdmin: true, mode.ModeSuper: true},
-		mode.CommandSubmit:  {mode.ModeContributor: true, mode.ModeAdmin: true, mode.ModeSuper: true},
-		mode.CommandReview:  {mode.ModeContributor: false, mode.ModeAdmin: true, mode.ModeSuper: true},
-		mode.CommandMerge:   {mode.ModeContributor: false, mode.ModeAdmin: true, mode.ModeSuper: true},
-		mode.CommandGet:     {mode.ModeContributor: false, mode.ModeAdmin: true, mode.ModeSuper: true},
-		mode.CommandDecrypt: {mode.ModeContributor: false, mode.ModeAdmin: true, mode.ModeSuper: true},
-		mode.CommandEdit:    {mode.ModeContributor: false, mode.ModeAdmin: true, mode.ModeSuper: true},
+		mode.CommandVersion:           {mode.ModeContributor: true, mode.ModeAdmin: true, mode.ModeSuper: true},
+		mode.CommandInit:              {mode.ModeContributor: true, mode.ModeAdmin: true, mode.ModeSuper: true},
+		mode.CommandDoctor:            {mode.ModeContributor: true, mode.ModeAdmin: true, mode.ModeSuper: true},
+		mode.CommandSubmit:            {mode.ModeContributor: true, mode.ModeAdmin: true, mode.ModeSuper: true},
+		mode.CommandReview:            {mode.ModeContributor: false, mode.ModeAdmin: true, mode.ModeSuper: true},
+		mode.CommandMerge:             {mode.ModeContributor: false, mode.ModeAdmin: true, mode.ModeSuper: true},
+		mode.CommandGet:               {mode.ModeContributor: false, mode.ModeAdmin: true, mode.ModeSuper: true},
+		mode.CommandDecrypt:           {mode.ModeContributor: false, mode.ModeAdmin: true, mode.ModeSuper: true},
+		mode.CommandEdit:              {mode.ModeContributor: false, mode.ModeAdmin: true, mode.ModeSuper: true},
+		mode.CommandRotate:            {mode.ModeContributor: false, mode.ModeAdmin: true, mode.ModeSuper: true},
+		mode.CommandRotationReconcile: {mode.ModeContributor: false, mode.ModeAdmin: true, mode.ModeSuper: true},
 	}
 
 	allModes := []mode.Mode{mode.ModeContributor, mode.ModeAdmin, mode.ModeSuper}
 	allCommands := []mode.Command{
 		mode.CommandVersion, mode.CommandInit, mode.CommandDoctor, mode.CommandSubmit,
 		mode.CommandReview, mode.CommandMerge, mode.CommandGet, mode.CommandDecrypt,
-		mode.CommandEdit,
+		mode.CommandEdit, mode.CommandRotate, mode.CommandRotationReconcile,
 	}
 
 	// Guard: the expectation grid must cover the full cross-product so a missing
 	// command or mode cannot silently shrink the asserted matrix.
 	if len(allow) != len(allCommands) {
-		t.Fatalf("expectation grid covers %d commands, want %d (full v0.1 set)", len(allow), len(allCommands))
+		t.Fatalf("expectation grid covers %d commands, want %d (full command set)", len(allow), len(allCommands))
 	}
 
 	p := &mode.Policy{}
@@ -109,7 +112,11 @@ func TestPolicy_UnknownModeDeniedFailClosed(t *testing.T) {
 	forged := mode.Mode(99) // not Contributor/Admin/Super
 	p := &mode.Policy{}
 
-	for _, cmd := range []mode.Command{mode.CommandReview, mode.CommandMerge, mode.CommandGet, mode.CommandDecrypt, mode.CommandEdit} {
+	for _, cmd := range []mode.Command{
+		mode.CommandReview, mode.CommandMerge, mode.CommandGet,
+		mode.CommandDecrypt, mode.CommandEdit,
+		mode.CommandRotate, mode.CommandRotationReconcile,
+	} {
 		if err := p.Allow(forged, cmd); err == nil {
 			t.Fatalf("forged mode value allowed admin command %q — fail-closed violated", cmd)
 		}

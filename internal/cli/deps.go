@@ -7,6 +7,7 @@ import (
 	"github.com/ByReisK/byreis/internal/cli/render"
 	"github.com/ByReisK/byreis/internal/core/mode"
 	"github.com/ByReisK/byreis/internal/core/usecase"
+	"github.com/ByReisK/byreis/internal/core/usecase/rotate"
 )
 
 // Deps bundles all injected use-case dependencies for the CLI command tree.
@@ -61,6 +62,20 @@ type Deps struct {
 	// render.ExitCode. When nil, the merge verb falls back to ExitGeneralError.
 	// This is a function-field so the CLI layer never imports internal/adapter.
 	MergeExitCode func(err error) render.ExitCode
+
+	// Rotator is the admin Rotate use-case. Narrow interface: rotate.Rotator.
+	// May be nil when the rotation path is not yet wired; the rotate command
+	// will return a "not configured" error at command time.
+	Rotator rotate.Rotator
+
+	// Reconciler is the admin rotation reconcile use-case. Narrow interface:
+	// rotate.RotationReconciler. May be nil when not yet wired.
+	Reconciler rotate.RotationReconciler
+
+	// RotateExitCode maps an error from the Rotator use-case to the appropriate
+	// render.ExitCode. When nil, the rotate verb falls back to ExitGeneralError.
+	// This is a function-field so the CLI layer never imports internal/adapter.
+	RotateExitCode func(err error) render.ExitCode
 }
 
 // ExitCodeFromReadPathError maps a usecase.ExitClass to the corresponding

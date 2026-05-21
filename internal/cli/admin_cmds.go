@@ -29,6 +29,7 @@ import (
 	"github.com/ByReisK/byreis/internal/core/git"
 	"github.com/ByReisK/byreis/internal/core/mode"
 	"github.com/ByReisK/byreis/internal/core/usecase"
+	"github.com/ByReisK/byreis/internal/core/usecase/rotate"
 )
 
 // prRefAllowRE is the whitelist for the project portion of a --pr flag value.
@@ -415,18 +416,164 @@ leaves the live file byte-identical.`,
 }
 
 // newAdminCmd constructs the `admin` parent command and registers its
-// sub-commands (currently: `admin merge`).
+// sub-commands (currently: `admin merge`, `admin rotation reconcile`).
 func newAdminCmd(deps *Deps, jsonFlag *bool) *cobra.Command {
 	admin := &cobra.Command{
 		Use:   "admin",
-		Short: "Admin-only operations (merge, counter, etc.)",
+		Short: "Admin-only operations (merge, rotation reconcile, etc.)",
 		Long: `Admin-only operations require ADMIN mode.
 
 Commands under 'admin' are gated by mode policy and denied-by-policy
 (not attempted-then-failed) when running as CONTRIBUTOR.`,
 	}
 	admin.AddCommand(newAdminMergeCmd(deps, jsonFlag))
+	admin.AddCommand(newAdminRotationCmd(deps, jsonFlag))
 	return admin
+}
+
+// newAdminRotationCmd constructs the `admin rotation` parent command.
+func newAdminRotationCmd(deps *Deps, jsonFlag *bool) *cobra.Command {
+	rotation := &cobra.Command{
+		Use:   "rotation",
+		Short: "Rotation lifecycle admin operations",
+		Long:  `Admin-only rotation lifecycle operations (reconcile, etc.).`,
+	}
+	rotation.AddCommand(newAdminRotationReconcileCmd(deps, jsonFlag))
+	return rotation
+}
+
+// newAdminRotationReconcileCmd constructs the `admin rotation reconcile` command.
+//
+// Classify-first composition: invoke Reconciler.Classify FIRST. If the
+// classification is NoPartialState, Phase2Midflight, or InconsistentPartial,
+// NO write-side work is performed and NO keychain load for write credentials
+// is triggered. Only Phase1Only triggers write-side work via Reconciler.Reconcile.
+// This narrows the credential lifetime vs unconditional load.
+func newAdminRotationReconcileCmd(deps *Deps, jsonFlag *bool) *cobra.Command {
+	var project string
+
+	cmd := &cobra.Command{
+		Use:   "reconcile",
+		Short: "Classify and recover partial rotation state (admin only)",
+		Long: `Classify the partial rotation state for a project and act on Phase-1-only partial state.
+
+Requires ADMIN mode: denied-by-policy before any registry observation.
+
+Classification outcomes:
+  no-partial-state      No rotation branch or pending; exits OK with no action.
+  phase-1-only          Rotation branch unmerged + pendings present; reversed (branch deleted +
+                        pendings cleared in a single signed registry commit).
+  phase-2-midflight     Rotation branch merged but CommitRotation did not land; surfaces
+                        ErrRotationReconcile (terminal — requires operator coordination).
+  inconsistent-partial  Unexpected shape; surfaces ErrRotationReconcile (terminal).
+
+Classify-first: the write-side credential is only loaded when the classification is
+phase-1-only. All other classifications exit without any keychain access.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			r := render.New(*jsonFlag)
+			r.Out = cmd.OutOrStdout()
+			r.Err = cmd.ErrOrStderr()
+
+			// Mode gate FIRST — denied-not-attempted before any registry observation.
+			if pErr := checkPolicy(deps, r, mode.CommandRotationReconcile, "admin rotation reconcile"); pErr != nil {
+				return pErr
+			}
+
+			if deps.Reconciler == nil {
+				err := fmt.Errorf(
+					"admin rotation reconcile not available: the reconciler is not wired — " +
+						"run `byreis doctor` or check your installation")
+				r.PrintErrorClass("general-error", err.Error(),
+					"run `byreis doctor` or check your installation")
+				return &exitError{code: render.ExitGeneralError, cause: err}
+			}
+
+			ctx := cmd.Context()
+
+			// Classify-first: read-only probe before any write-side work.
+			classification, classErr := deps.Reconciler.Classify(ctx, project)
+			if classErr != nil {
+				code := reconcileExitCode(classErr)
+				r.PrintErrorClass(reconcileExitClass(code), classErr.Error(),
+					reconcileHintFor(code, classErr))
+				return &exitError{code: code, cause: classErr}
+			}
+
+			// Short-circuit paths that do NOT require write-side composition:
+			// NoPartialState, Phase2Midflight, InconsistentPartial.
+			switch classification {
+			case rotate.NoPartialState:
+				if *jsonFlag {
+					_ = render.EncodeJSON(r.Out, map[string]any{
+						"classification": classification.String(),
+						"action":         "none",
+					})
+					return nil
+				}
+				_, _ = fmt.Fprintf(r.Out, "no partial rotation state detected for project %q\n", project)
+				return nil
+
+			case rotate.Phase2Midflight:
+				err := fmt.Errorf(
+					"rotation is in phase-2-midflight state for project %q: "+
+						"rotation branch merged but CommitRotation did not land — "+
+						"see docs/rotation-runbook.md for the operator recovery procedure",
+					project)
+				r.PrintErrorClass("counter-reconcile", err.Error(),
+					"run `byreis admin rotation reconcile` after operator coordination; "+
+						"see docs/rotation-runbook.md")
+				return &exitError{code: render.ExitCounterReconcile, cause: err}
+
+			case rotate.InconsistentPartial:
+				err := fmt.Errorf(
+					"rotation is in inconsistent-partial state for project %q: "+
+						"unexpected protocol shape — "+
+						"see docs/rotation-runbook.md for the operator recovery procedure",
+					project)
+				r.PrintErrorClass("counter-reconcile", err.Error(),
+					"see docs/rotation-runbook.md")
+				return &exitError{code: render.ExitCounterReconcile, cause: err}
+
+			case rotate.Phase1Only:
+				// Phase1Only falls through to the Reconciler.Reconcile call below.
+			}
+
+			// Phase1Only: write-side work via Reconciler.Reconcile.
+			result, err := deps.Reconciler.Reconcile(ctx, project)
+			if err != nil {
+				code := reconcileExitCode(err)
+				r.PrintErrorClass(reconcileExitClass(code), err.Error(),
+					reconcileHintFor(code, err))
+				return &exitError{code: code, cause: err}
+			}
+
+			if *jsonFlag {
+				_ = render.EncodeJSON(r.Out, map[string]any{
+					"classification":   result.Classification.String(),
+					"branch_deleted":   result.BranchDeleted,
+					"pendings_cleared": result.PendingsCleared,
+					"retries":          result.Retries,
+				})
+				return nil
+			}
+			_, _ = fmt.Fprintf(r.Out,
+				"rotation reconcile complete for project %q "+
+					"(classification=%s branch_deleted=%v pendings_cleared=%d retries=%d)\n",
+				project,
+				result.Classification,
+				result.BranchDeleted,
+				result.PendingsCleared,
+				result.Retries,
+			)
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVar(&project, "project", "", "project ID (required)")
+	_ = cmd.MarkFlagRequired("project")
+
+	return cmd
 }
 
 // newAdminMergeCmd constructs the `admin merge` sub-command.
@@ -572,6 +719,76 @@ func exitClassStringForMerge(code render.ExitCode) string {
 	default:
 		return "general-error"
 	}
+}
+
+// reconcileExitCode maps a reconcile-path error to the appropriate
+// render.ExitCode.
+func reconcileExitCode(err error) render.ExitCode {
+	if err == nil {
+		return render.ExitOK
+	}
+	if errors.Is(err, rotate.ErrRotationReconcile) {
+		return render.ExitCounterReconcile
+	}
+	if errors.Is(err, rotate.ErrRotationRequiresFreshRegistry) {
+		return render.ExitTrustError
+	}
+	if errors.Is(err, mode.ErrPermissionDenied) {
+		return render.ExitPermissionDenied
+	}
+	return render.ExitGeneralError
+}
+
+// reconcileExitClass returns the stable string exit class for --json output.
+func reconcileExitClass(code render.ExitCode) string {
+	switch code {
+	case render.ExitOK:
+		return "ok"
+	case render.ExitPermissionDenied:
+		return "permission-denied"
+	case render.ExitCounterReconcile:
+		return "counter-reconcile"
+	case render.ExitTrustError:
+		return "trust-error"
+	case render.ExitAuthError:
+		return "auth-error"
+	case render.ExitGeneralError:
+		return "general-error"
+	case render.ExitNotFound:
+		return "not-found"
+	case render.ExitReplay:
+		return "replay"
+	case render.ExitDecodeMalformed:
+		return "decode-malformed"
+	case render.ExitVerifyFailure:
+		return "verify-failure"
+	}
+	return "general-error"
+}
+
+// reconcileHintFor returns an actionable hint string for the given exit code.
+func reconcileHintFor(code render.ExitCode, err error) string {
+	switch code {
+	case render.ExitCounterReconcile:
+		return "see docs/rotation-runbook.md for the operator recovery procedure"
+	case render.ExitTrustError:
+		if errors.Is(err, rotate.ErrRotationRequiresFreshRegistry) {
+			return "run `byreis registry refresh` and retry"
+		}
+		return "run `byreis doctor` and verify the registry trust configuration"
+	case render.ExitPermissionDenied:
+		return "run `byreis doctor` to verify your admin mode"
+	case render.ExitAuthError:
+		return "run `byreis auth login` or check your admin key"
+	case render.ExitOK,
+		render.ExitGeneralError,
+		render.ExitNotFound,
+		render.ExitReplay,
+		render.ExitDecodeMalformed,
+		render.ExitVerifyFailure:
+		return "run `byreis doctor` for diagnostics"
+	}
+	return "run `byreis doctor` for diagnostics"
 }
 
 // Ensure parsePRRef and related helpers are only used at the CLI boundary.
