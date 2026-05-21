@@ -180,4 +180,81 @@ var (
 		"refusing to commit counter bump: a rotation is in flight for this " +
 			"(project, file) pair — retry after the rotation has completed or " +
 			"run `byreis admin rotation reconcile` if the rotation appears stale")
+
+	// ErrRequestAccessPRForcePushed is surfaced when the PR HEAD SHA drifts
+	// between the planner's first read (the SHA that anchored the operator's
+	// review of the dry-run plan) and the executor's second read at Phase-1
+	// step 5b. A force-push race between plan and execute is treated as a
+	// structural impersonation attempt; rotation fails closed BEFORE any branch
+	// creation, signed manifest, or pending bump. The operator must re-run the
+	// rotation to re-fetch and re-review the new YAML content.
+	ErrRequestAccessPRForcePushed = errors.New(
+		"refusing to absorb request-access PR: PR HEAD commit SHA drifted " +
+			"between plan and execute (force-push race) — re-run " +
+			"`byreis rotate --add --from-request <PR>` to refetch and review the " +
+			"new content")
+
+	// ErrRequestAccessPRStateInvalid is surfaced when the PR's state machine
+	// is not exactly {state=open, draft=false, merged=false}. Draft PRs signal
+	// the contributor has not finalised the request; closed PRs signal the
+	// contributor revoked it (re-open is suspect); merged PRs were already
+	// absorbed. Each refusal carries the observed state so the operator can
+	// remediate.
+	ErrRequestAccessPRStateInvalid = errors.New(
+		"refusing to absorb request-access PR: PR is not in the {open, " +
+			"non-draft, non-merged} state required for absorption — convert " +
+			"from Draft / re-open / open a new request-access PR as appropriate")
+
+	// ErrRequestAccessCommitAuthorDivergence is surfaced when any commit on
+	// the request-access PR has an author login that differs from the PR
+	// opener's login. Commit-author divergence is a structural impersonation
+	// trip-wire: the operator visually reviews the PR opener but the commits
+	// were authored by a different identity. Login-level only — commit
+	// signature verification is out of scope at v0.2.
+	ErrRequestAccessCommitAuthorDivergence = errors.New(
+		"refusing to absorb request-access PR: the PR contains commits whose " +
+			"author login differs from the PR opener — the contributor must close " +
+			"and re-open the PR with a clean commit set authored by the PR opener")
+
+	// ErrRequestAccessPRFilePathInvalid is surfaced when the PR's files-changed
+	// list contains anything outside the `requests/<handle>.yaml` namespace,
+	// any path-traversal segment, or more than one file. The contributor verb
+	// constructs the path with no operator input; admin-side defence-in-depth
+	// refuses any PR whose write surface escapes the requests/ tree.
+	ErrRequestAccessPRFilePathInvalid = errors.New(
+		"refusing to absorb request-access PR: PR file path is invalid — " +
+			"PR must change exactly one file matching `requests/<handle>.yaml`; " +
+			"no traversal, no other registry paths, no multi-file PRs")
+
+	// ErrRequestAccessForkOwnershipChanged is surfaced when the fork-PR's
+	// `head.repo.owner.login` drifts between the first read at plan time and
+	// the second read at execute time. Fork ownership transfer between plan
+	// and execute means the YAML content the admin reviewed is now under a
+	// different attacker identity; rotation fails closed regardless of the
+	// HEAD SHA being unchanged.
+	ErrRequestAccessForkOwnershipChanged = errors.New(
+		"refusing to absorb request-access PR: fork repo owner changed " +
+			"between plan and execute — re-run `byreis rotate --add --from-request " +
+			"<PR>` so the new ownership is re-evaluated")
+
+	// ErrRequestAccessCommitBodyForgery indicates a request-access PR carries a
+	// commit whose message body contains the byreis-sig: byte sequence, which is
+	// a forgery indicator — contributor-authored commit bodies must never contain
+	// bytes that resemble byreis's own signed-commit footer format.
+	ErrRequestAccessCommitBodyForgery = errors.New(
+		"refusing to absorb request-access PR: a PR commit message body contains the " +
+			"byreis-sig: byte sequence, which is reserved for byreis-authored signed commits " +
+			"and is a forgery indicator — the contributor must close and re-open the PR with " +
+			"a clean commit set whose messages do not include that token",
+	)
+
+	// ErrRequestAccessQuotaExceeded is surfaced when the contributor's
+	// `request-access` verb detects more than the configured ceiling of open
+	// request-access PRs by the same GitHub identity against the registry
+	// repo. A client-side advisory bound complementing GitHub's server-side
+	// rate-limit and the registry's branch-protection enforcement.
+	ErrRequestAccessQuotaExceeded = errors.New(
+		"refusing to open request-access PR: the configured open-PR quota " +
+			"for this GitHub identity is already exhausted — close stale PRs and " +
+			"retry")
 )

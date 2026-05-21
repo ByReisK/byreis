@@ -139,6 +139,12 @@ type Phase1Result struct {
 	// PlannedEpoch is the post-rotation rotation_epoch CommitRotation will
 	// land for every file.
 	PlannedEpoch uint64
+	// FromRequestPR is non-nil when this rotation originated from a
+	// `--from-request <PR>` lift. Threaded from RotationInput by the Rotator
+	// spine after Phase-1 returns and forwarded to Phase-2 so
+	// BuildRotationAuditEvent can record PR provenance in the audit trail.
+	// Nil on a plain `--add` invocation (no contributor PR).
+	FromRequestPR *FromRequestPRMeta
 }
 
 // IntegrityCheck records the per-file post-merge verification result (Phase-2
@@ -343,4 +349,188 @@ type RotationReconciler interface {
 // Clock is the injected time source. Core never reads a real clock in tests.
 type Clock interface {
 	Now() time.Time
+}
+
+// RequestAccessFile is the parsed `requests/<handle>.yaml` payload. It is the
+// only contributor-authored trust input to the admin-side `--from-request`
+// absorption path; every field is strict-decoded and validated before any
+// rotation orchestration consumes it.
+//
+// No PR title, body, description, or comment text appears as a field of this
+// struct on purpose: those operator-visible texts are advisory only and never
+// participate in any trust decision. Adding such a field is a structural
+// regression of the read-only admin trust contract.
+type RequestAccessFile struct {
+	// SchemaVersion pins the YAML payload's version. Must match the regex
+	// `^byreis\.request_access\.v[0-9]+$`; v0.2 accepts any version in that
+	// family. Unknown / malformed values refuse with
+	// ErrRequestAccessSchemaInvalid.
+	SchemaVersion string
+	// GitHubHandle is the canonical lowercase ASCII GitHub login of the
+	// contributor requesting access. It is byte-compared (after lowercase
+	// normalisation) against the PR opener's GitHub login during absorption.
+	// Must match `^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}$` and be
+	// ASCII-only — Unicode confusables, bidi controls, and zero-width joiners
+	// are rejected at schema time.
+	GitHubHandle string
+	// AgePubkey is the age recipient string the contributor wishes to add to
+	// the admin recipient set. Parsed via age.ParseX25519Recipient; base64 /
+	// raw bytes / non-X25519 encodings are rejected at schema time.
+	AgePubkey string
+	// Justification is the contributor's free-text rationale. Capped at 1000
+	// BYTES (not runes) to prevent rune-counting bypass; must be valid UTF-8;
+	// rendered through SanitizeForTerminal at any operator-facing display
+	// site. Audit-log emission of this field is structurally denylisted to
+	// keep contributor-controlled bytes out of permanent audit JSONL.
+	Justification string
+	// RequestedAt is the contributor-local timestamp in RFC3339 form. Used as
+	// an advisory-only display field; no trust decision keys on its value.
+	RequestedAt string
+}
+
+// PRMetadata is the typed projection of GitHub's PR resource the request-access
+// validation consumes. The field set is deliberately minimal: only the canonical
+// GitHub-controlled attributes that participate in a trust decision appear here,
+// so the use-case has no API surface to mis-key against (e.g. PR body / title).
+//
+// The struct is populated by the adapter at the github seam (V6.2). Every
+// validation decision against PRMetadata is byte-equal or enumerated; no field
+// is regex-parsed out of free text.
+type PRMetadata struct {
+	// AuthorLogin is `pull_request.user.login` — the GitHub-canonical PR
+	// author identity. NEVER `pull_request.head.user.login`, NEVER
+	// commit-author email, NEVER display name. Compared byte-equal
+	// (lowercase-normalised) against the YAML's GitHubHandle.
+	AuthorLogin string
+	// State is `pull_request.state` ∈ {"open", "closed"}. The accepting shape
+	// requires "open".
+	State string
+	// IsDraft is `pull_request.draft`. Draft PRs are refused as
+	// structurally-not-finalised.
+	IsDraft bool
+	// IsMerged is `pull_request.merged`. Already-merged PRs are refused;
+	// re-absorption is not the intended path.
+	IsMerged bool
+	// HeadSHA is `pull_request.head.sha` — the PR HEAD commit SHA at the moment
+	// of read. The adapter pins this at the first read; the executor re-reads
+	// at Phase-1 step 5b and asserts byte-equal to refuse force-push races.
+	HeadSHA string
+	// HeadRepoOwnerLogin is `pull_request.head.repo.owner.login` — the fork
+	// owner. Pinned at the first read; the executor re-reads and asserts
+	// byte-equal to refuse fork-ownership-transfer races.
+	HeadRepoOwnerLogin string
+	// AuthorType is `pull_request.user.type` ∈ {"User", "Bot", "Organization",
+	// ...}. The accepting shape requires "User"; bot/org PR-author absorption
+	// is not a v0.2 supported path.
+	AuthorType string
+	// Commits is the list of commits the PR carries with their author logins.
+	// Every commit's author login must equal AuthorLogin; divergence triggers
+	// a commit-author divergence refusal.
+	Commits []CommitInfo
+}
+
+// CommitInfo is the per-commit projection consumed by the commit-author
+// divergence check. The SHA is carried so the refusal message can name the
+// divergent commit; the author login is the load-bearing field.
+//
+// Body carries the full, untruncated commit message body as reported by the
+// upstream git host. It exists as defense-in-depth against operator-visible
+// commit-body forge attempts: the request-access validator inspects every
+// commit body for the reserved byreis-sig: footer token (case-insensitive)
+// and refuses the PR on any match, on the rationale that contributor-authored
+// commit messages must never contain bytes that resemble byreis's own
+// signed-commit footer format. The adapter populates this field from the
+// existing PR commits response so the trip-wire adds no extra HTTP call.
+type CommitInfo struct {
+	SHA         string
+	AuthorLogin string
+	Body        string
+}
+
+// FromRequestPRMeta carries the request-access PR provenance into the rotation
+// audit event. Populated only when a rotation absorbs a `--from-request <PR>`
+// payload; the existing rotation audit-event shape is unchanged when this
+// pointer is nil.
+type FromRequestPRMeta struct {
+	// Project is the registry repo's canonical "<owner>/<repo>" identifier
+	// (the PR's base repository).
+	Project string
+	// Number is the PR number on the registry repo.
+	Number int
+	// HeadSHA is the PR HEAD commit SHA captured at admin absorb time.
+	HeadSHA string
+	// YAMLHandle is the validated YAML `github_handle` (lowercase ASCII).
+	YAMLHandle string
+	// ValidatedAuthorLogin is the PR opener's GitHub login after the
+	// PR-author-vs-YAML byte-equal check succeeded.
+	ValidatedAuthorLogin string
+}
+
+// RequestAccessReader is the consumer-defined port the admin-side `--from-request`
+// orchestration uses to fetch the contributor's PR payload and the canonical
+// GitHub metadata required for the BO-3 PR-author-vs-YAML check. The real
+// adapter (V6.2) sits on the github SDK; this port keeps the use-case spine
+// independent of any SDK type.
+//
+// The adapter implementation MUST fail closed across the following failure
+// modes; the validation use-case asserts the same matrix as a defense-in-depth
+// boundary:
+//
+//  1. PR title spoof — author is read exclusively from the typed
+//     pull_request.user.login field; title / body / description / comments are
+//     NEVER parsed for any trust decision.
+//  2. Base-ref swap — PR HEAD SHA is pinned at the first read and re-asserted
+//     on every subsequent fetch. SHA drift returns
+//     ErrRequestAccessPRForcePushed.
+//  3. Force-push race — same defence as (2); also catches contributor pushes
+//     between plan and execute.
+//  4. Display-name vs login — github_handle is compared byte-equal (after
+//     lowercase normalisation) against pr.User.Login; pr.User.Name (display
+//     name) is NEVER consulted.
+//  5. Deleted / renamed account — pr.User.Login = "ghost" or "" refuses with
+//     ErrRequestAccessIdentityMismatch; renamed accounts naturally fail the
+//     byte-equal compare.
+//  6. Fork-PR vs branch-PR — YAML content is resolved from
+//     pr.Head.Repo.FullName at the pinned HEAD SHA; existence in the base
+//     repo is NOT a security signal. pr.Head.Repo.Owner.Login is pinned for
+//     fork-ownership-change detection.
+//  7. Draft PR — refused as structurally-not-finalised.
+//  8. Closed / re-opened PR — refused on pr.state = "closed" regardless of
+//     pr.merged_at; reopened PRs surface as state=open and re-enter checks
+//     (1)–(7).
+//  9. Bot identity — refused on pr.User.Type != "User".
+type RequestAccessReader interface {
+	// FetchRequestAccessYAML reads `requests/<handle>.yaml` from the PR's HEAD
+	// ref at the SHA captured at the moment of the GitHub "get PR" call. It
+	// returns the parsed YAML payload alongside the canonical PR metadata
+	// projection. Implementations MUST refuse on HEAD-SHA drift between the
+	// author-read and the YAML-read (TOCTOU defence); MUST refuse on path
+	// scope violations (files-changed outside `requests/<handle>.yaml`); MUST
+	// reject non-ASCII handles and any payload that fails strict-decoder
+	// validation.
+	FetchRequestAccessYAML(ctx context.Context, prRef git.PRRef) (RequestAccessFile, PRMetadata, error)
+	// FetchPRHeadSHA returns the PR HEAD commit SHA and the fork-repo owner
+	// login at the moment of call. Both values are sourced from the same
+	// PullRequests.Get call; the executor re-asserts both against the values
+	// pinned at FetchRequestAccessYAML call time. SHA drift means a force-push
+	// race; ownerLogin drift means the fork was transferred between plan and
+	// execute. Both conditions fail closed before Phase-1 starts.
+	FetchPRHeadSHA(ctx context.Context, prRef git.PRRef) (sha string, ownerLogin string, err error)
+}
+
+// RegistryReadTokenProvider is a NEW consumer-defined port introduced at V6
+// for the read-only registry surfaces the admin side opens (the
+// request-access PR fetch path, principally). It is structurally distinct
+// from auth.RegistryWriteTokenStore so a read-only caller cannot accidentally
+// acquire the write capability via port-reuse.
+//
+// The pre-existing RotationStateProbe.FetchPartialState read site remains on
+// the write-token reuse path; broader migration of that read site to this
+// new read-only provider is deferred to a later release.
+type RegistryReadTokenProvider interface {
+	// RegistryReadToken returns a registry-scoped read token. Implementations
+	// MUST NOT return a token that also carries write capability — read /
+	// write separation at the credential layer is load-bearing on the
+	// asymmetric-access invariant for this new admin-mode read path.
+	RegistryReadToken(ctx context.Context) (string, error)
 }

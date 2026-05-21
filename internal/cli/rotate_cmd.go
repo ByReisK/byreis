@@ -59,11 +59,15 @@ The rotation is a strict two-phase commit:
     commit, post-merge integrity check.
 
 Use --dry-run to preview the plan without writing anything.
-Use --yes to skip the interactive typed-fingerprint confirm for --remove or --replace.
+Use --yes to skip the interactive typed-fingerprint confirm for --remove, --replace,
+or --from-request.
 Set BYREIS_NON_INTERACTIVE=1 (or --non-interactive) to fail closed if --yes is absent.
 
-The --from-request flag requires the request-access PR contract which lands at a
-later slice; use --add directly with the recipient key the PR proposes.`,
+--from-request <registry>#<number> absorbs a contributor's request-access PR:
+fetches requests/<handle>.yaml from the PR HEAD, validates the 9-mode state
+machine, prints the admin warning, then fires the typed-fingerprint confirm gate.
+A force-push race between plan and execute is caught by re-checking the HEAD SHA
+immediately before Phase-1 starts.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			r := render.New(*jsonFlag)
@@ -75,14 +79,18 @@ later slice; use --add directly with the recipient key the PR proposes.`,
 				return pErr
 			}
 
-			// --from-request deferred: return immediately with actionable hint.
+			// --from-request: absorb a contributor's request-access PR.
+			var fromRequestMeta *rotate.FromRequestPRMeta
 			if fromRequest != "" {
-				err := fmt.Errorf(
-					"--from-request requires the request-access PR contract which lands at a later slice; " +
-						"until then, pass --add <age1...> directly with the recipient key the PR proposes")
-				r.PrintErrorClass("general-error", err.Error(),
-					"pass --add <age1...> directly with the recipient key the PR proposes")
-				return &exitError{code: render.ExitGeneralError, cause: err}
+				var frErr error
+				fromRequestMeta, frErr = resolveFromRequest(
+					cmd, deps, r, fromRequest,
+					yes, nonInteractive,
+					&addPubkeys,
+				)
+				if frErr != nil {
+					return frErr
+				}
 			}
 
 			// Resolve non-interactive from env OR flag.
@@ -199,6 +207,9 @@ later slice; use --add directly with the recipient key the PR proposes.`,
 				r.PrintErrorClass(class, preflightErr.Error(), hint)
 				return &exitError{code: code, cause: preflightErr}
 			}
+			// Attach PR provenance so the audit event records which request-access
+			// PR triggered this rotation.
+			in.FromRequestPR = fromRequestMeta
 
 			result, err := deps.Rotator.Rotate(cmd.Context(), in)
 			if err != nil {
@@ -226,7 +237,7 @@ later slice; use --add directly with the recipient key the PR proposes.`,
 	cmd.Flags().StringArrayVar(&replacePairs, "replace", nil,
 		"replace one recipient with another in old=new form (repeatable; single composed delta)")
 	cmd.Flags().StringVar(&fromRequest, "from-request", "",
-		"read recipient key from a request-access PR (deferred to a later slice)")
+		"absorb recipient key from a request-access PR (e.g. myorg/admins#42)")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false,
 		"compute and print the rotation plan without writing anything")
 	cmd.Flags().BoolVar(&yes, "yes", false,
@@ -239,6 +250,189 @@ later slice; use --add directly with the recipient key the PR proposes.`,
 	_ = cmd.MarkFlagRequired("project")
 
 	return cmd
+}
+
+// resolveFromRequest handles the `--from-request <PR>` path for `byreis rotate`.
+// It fetches the contributor's request-access YAML, validates the 9-mode state
+// machine, prints RequestAccessAdminWarning, fires the typed-fingerprint confirm
+// gate, and re-checks the PR HEAD SHA to detect force-push races.
+//
+// On success it adds the validated age pubkey to addPubkeys and returns a
+// populated *rotate.FromRequestPRMeta. The caller threads this into
+// RotationInput.FromRequestPR for audit-trail provenance.
+//
+// Pre-condition: deps.RequestAccessReader must be non-nil; callers check before
+// invoking this function.
+func resolveFromRequest(
+	cmd *cobra.Command,
+	deps *Deps,
+	r *render.Renderer,
+	fromRequest string,
+	yes bool,
+	nonInteractive bool,
+	addPubkeys *[]string,
+) (*rotate.FromRequestPRMeta, error) {
+	if deps.RequestAccessReader == nil {
+		err := fmt.Errorf(
+			"--from-request requires a RequestAccessReader but none is wired — " +
+				"check that BYREIS_GITHUB_TOKEN is set and `byreis init` has been run")
+		r.PrintErrorClass("general-error", err.Error(),
+			"set BYREIS_GITHUB_TOKEN and run `byreis init`")
+		return nil, &exitError{code: render.ExitGeneralError, cause: err}
+	}
+
+	// Parse the PR ref (e.g. "myorg/byreis-admins#42").
+	prRef, parseErr := parsePRRef(fromRequest)
+	if parseErr != nil {
+		r.PrintErrorClass("general-error", parseErr.Error(),
+			"use the form <owner>/<repo>#<number> (e.g. myorg/byreis-admins#42)")
+		return nil, &exitError{code: render.ExitGeneralError, cause: parseErr}
+	}
+
+	ctx := cmd.Context()
+
+	// Fetch and validate the contributor's YAML + PR metadata.
+	file, prMeta, fetchErr := deps.RequestAccessReader.FetchRequestAccessYAML(ctx, prRef)
+	if fetchErr != nil {
+		r.PrintErrorClass("general-error", fetchErr.Error(),
+			"check that the PR exists, is accessible, and contains exactly one requests/<handle>.yaml file")
+		return nil, &exitError{code: render.ExitGeneralError, cause: fetchErr}
+	}
+
+	if valErr := rotate.ValidateRequestAccess(ctx, file, prMeta); valErr != nil {
+		code := fromRequestValidateExitCode(valErr)
+		r.PrintErrorClass(rotateExitClass(code), valErr.Error(),
+			fromRequestValidateHint(valErr))
+		return nil, &exitError{code: code, cause: valErr}
+	}
+
+	// Print the admin warning before the typed-fingerprint confirm so the
+	// operator sees the full risk summary before being asked to type the key
+	// fingerprint. This is the sole legitimate emission site for this warning.
+	_, _ = fmt.Fprint(r.Out, rotate.RequestAccessAdminWarning) //nolint:forbidigo // boundary: CLI from-request absorption — sole legitimate emission site
+
+	// Build a display line for the confirm prompt.
+	sanitizedJust := render.SanitizeForTerminal(file.Justification)
+	ageRecip := rotate.RecipientFingerprintFull(
+		rectypes.Recipient{AgePubKey: file.AgePubkey},
+	)
+
+	// Typed-fingerprint confirm gate: required even when there is no --remove,
+	// because absorbing a contributor-submitted key carries the same risk as
+	// adding an unverified key manually.
+	if !yes && !nonInteractive {
+		prefix16 := ageRecip
+		if len(ageRecip) >= 16 {
+			prefix16 = ageRecip[:16]
+		}
+		_, _ = fmt.Fprintf(r.Out,
+			"Adding recipient %s from PR %s;\n"+
+				"  PR author      = %s\n"+
+				"  YAML handle    = %s\n"+
+				"  Justification  = %s\n"+
+				"  Fingerprint prefix: %s\n"+
+				"Type the FULL 64-char SHA-256 fingerprint of the recipient to confirm: ",
+			file.AgePubkey, fromRequest,
+			prMeta.AuthorLogin, file.GitHubHandle,
+			sanitizedJust, prefix16)
+
+		scanner := bufio.NewScanner(cmd.InOrStdin())
+		var typed string
+		if scanner.Scan() {
+			typed = strings.TrimSpace(scanner.Text())
+		}
+
+		if typed != ageRecip {
+			err := rotate.ErrRotationFingerprintMismatch
+			r.PrintErrorClass("general-error", err.Error(),
+				"re-run and type the full 64-char SHA-256 fingerprint exactly as displayed")
+			return nil, &exitError{code: render.ExitGeneralError, cause: err}
+		}
+	}
+
+	// Re-fetch the PR HEAD SHA and fork-repo owner login immediately before
+	// Phase-1 starts. Both values are pinned at the FetchRequestAccessYAML call
+	// above; any drift between that read and this re-check means the contributor
+	// pushed new content (force-push race) or the fork was transferred to a
+	// different account (ownership-transfer race). Either condition fails closed:
+	// the admin reviewed content under the original identity and the original
+	// commit; mismatches make that review invalid.
+	currentSHA, currentOwner, recheckErr := deps.RequestAccessReader.FetchPRHeadSHA(ctx, prRef)
+	if recheckErr != nil {
+		r.PrintErrorClass("general-error", recheckErr.Error(),
+			"could not re-verify PR HEAD SHA — re-run `byreis rotate --add --from-request` to retry")
+		return nil, &exitError{code: render.ExitGeneralError, cause: recheckErr}
+	}
+	if currentSHA != prMeta.HeadSHA {
+		err := fmt.Errorf("%w: HEAD SHA drifted from %q to %q between plan and execute",
+			rotate.ErrRequestAccessPRForcePushed, prMeta.HeadSHA, currentSHA)
+		r.PrintErrorClass("general-error", err.Error(),
+			"re-run `byreis rotate --add --from-request` to re-fetch and re-review the new content")
+		return nil, &exitError{code: render.ExitGeneralError, cause: err}
+	}
+	// Fork-ownership re-check: a fork transferred to a new account after the
+	// admin's plan review retains the same HEAD SHA but places the YAML content
+	// under a different identity. The audit row's validated_author_login would
+	// no longer match the human who now controls the source; refuse to proceed.
+	if currentOwner != prMeta.HeadRepoOwnerLogin {
+		err := fmt.Errorf("%w: fork repo owner changed from %q to %q between plan and execute",
+			rotate.ErrRequestAccessForkOwnershipChanged, prMeta.HeadRepoOwnerLogin, currentOwner)
+		r.PrintErrorClass("general-error", err.Error(),
+			"re-run `byreis rotate --add --from-request` so the new ownership is re-evaluated")
+		return nil, &exitError{code: render.ExitGeneralError, cause: err}
+	}
+
+	// Inject the validated pubkey into --add list.
+	*addPubkeys = append(*addPubkeys, file.AgePubkey)
+
+	return &rotate.FromRequestPRMeta{
+		Project:              prRef.Project,
+		Number:               prRef.Number,
+		HeadSHA:              prMeta.HeadSHA,
+		YAMLHandle:           file.GitHubHandle,
+		ValidatedAuthorLogin: prMeta.AuthorLogin,
+	}, nil
+}
+
+// fromRequestValidateExitCode maps a ValidateRequestAccess error to the
+// appropriate render.ExitCode.
+func fromRequestValidateExitCode(err error) render.ExitCode {
+	if errors.Is(err, rotate.ErrRequestAccessPRStateInvalid) {
+		return render.ExitGeneralError
+	}
+	if errors.Is(err, rotate.ErrRequestAccessIdentityMismatch) {
+		return render.ExitPermissionDenied
+	}
+	if errors.Is(err, rotate.ErrRequestAccessCommitAuthorDivergence) {
+		return render.ExitPermissionDenied
+	}
+	if errors.Is(err, rotate.ErrRequestAccessForkOwnershipChanged) {
+		return render.ExitGeneralError
+	}
+	if errors.Is(err, rotate.ErrRequestAccessSchemaInvalid) {
+		return render.ExitDecodeMalformed
+	}
+	return render.ExitGeneralError
+}
+
+// fromRequestValidateHint returns an actionable hint for a validate error.
+func fromRequestValidateHint(err error) string {
+	if errors.Is(err, rotate.ErrRequestAccessPRStateInvalid) {
+		return "the PR must be open, non-draft, and not yet merged"
+	}
+	if errors.Is(err, rotate.ErrRequestAccessIdentityMismatch) {
+		return "the YAML github_handle must match the PR opener's GitHub login exactly"
+	}
+	if errors.Is(err, rotate.ErrRequestAccessCommitAuthorDivergence) {
+		return "all commits on the PR must be authored by the PR opener"
+	}
+	if errors.Is(err, rotate.ErrRequestAccessForkOwnershipChanged) {
+		return "re-run after the fork ownership is stable"
+	}
+	if errors.Is(err, rotate.ErrRequestAccessSchemaInvalid) {
+		return "check the YAML schema (schema_version, github_handle, age_pubkey, justification, requested_at)"
+	}
+	return "run `byreis doctor` for diagnostics"
 }
 
 // buildRotationInput runs the two mandatory pre-flight checks and assembles a

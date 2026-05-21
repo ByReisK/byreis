@@ -34,6 +34,7 @@ import (
 	"testing"
 
 	"github.com/ByReisK/byreis/internal/cli"
+	coregit "github.com/ByReisK/byreis/internal/core/git"
 	"github.com/ByReisK/byreis/internal/core/mode"
 	"github.com/ByReisK/byreis/internal/core/registry/rectypes"
 	"github.com/ByReisK/byreis/internal/core/usecase/rotate"
@@ -183,5 +184,159 @@ func (*docgateFakeRotatorCompleted) Rotate(_ context.Context, _ rotate.RotationI
 			NewEpoch:          1,
 		},
 	}, nil
+}
+
+// ---- V6 docgate (T-V6-14) — RequestAccessAdminWarning verbatim emission ----
+
+// docgateFakeRequestAccessReader returns a happy-path RequestAccessFile +
+// PRMetadata pair whose values satisfy every ValidateRequestAccess check, so
+// the rotate-side --from-request handler reaches the warning-print stage.
+// The fake records no state; each call returns the canned response.
+//
+// FetchPRHeadSHA returns the same HeadSHA the YAML fetch reported, so the
+// force-push-race re-check passes cleanly.
+type docgateFakeRequestAccessReader struct{}
+
+const (
+	docgateRequestAccessHandle = "alice"
+	// docgateRequestAccessPubkey is a canonical-bech32 age recipient that
+	// passes age.ParseX25519Recipient (BO-V6-CRYPTO-5); the request-access
+	// schema validator refuses any other shape. Same fixture used by
+	// internal/core/usecase/rotate/request_test.go.
+	docgateRequestAccessPubkey  = "age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p"
+	docgateRequestAccessHeadSHA = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+)
+
+func (*docgateFakeRequestAccessReader) FetchRequestAccessYAML(
+	_ context.Context, _ coregit.PRRef,
+) (rotate.RequestAccessFile, rotate.PRMetadata, error) {
+	file := rotate.RequestAccessFile{
+		SchemaVersion: "byreis.request_access.v1",
+		GitHubHandle:  docgateRequestAccessHandle,
+		AgePubkey:     docgateRequestAccessPubkey,
+		Justification: "team A onboarding",
+		RequestedAt:   "2026-05-22T00:00:00Z",
+	}
+	prMeta := rotate.PRMetadata{
+		AuthorLogin:        docgateRequestAccessHandle,
+		State:              "open",
+		IsDraft:            false,
+		IsMerged:           false,
+		HeadSHA:            docgateRequestAccessHeadSHA,
+		HeadRepoOwnerLogin: docgateRequestAccessHandle,
+		AuthorType:         "User",
+		Commits: []rotate.CommitInfo{
+			{SHA: "cafecafecafecafecafecafecafecafecafecafe", AuthorLogin: docgateRequestAccessHandle},
+		},
+	}
+	return file, prMeta, nil
+}
+
+func (*docgateFakeRequestAccessReader) FetchPRHeadSHA(
+	_ context.Context, _ coregit.PRRef,
+) (string, string, error) {
+	return docgateRequestAccessHeadSHA, docgateRequestAccessHandle, nil
+}
+
+// docgateFakeRotatorFromRequest accepts the rotation input the CLI hands it
+// after --from-request validation completes and returns a completed result.
+// HasRemovals=false because --from-request is an additive --add path; the
+// forward-secrecy warning is irrelevant on this row.
+type docgateFakeRotatorFromRequest struct{}
+
+func (*docgateFakeRotatorFromRequest) Rotate(
+	_ context.Context, _ rotate.RotationInput,
+) (rotate.RotationResult, error) {
+	return rotate.RotationResult{
+		Plan: rotate.RotationPlan{
+			ProjectID:   "docgate-proj",
+			NewEpoch:    2,
+			HasRemovals: false,
+		},
+		DryRun: false,
+		Phase2: rotate.Phase2Result{
+			MergedSHA:         "1111111111111111111111111111111111111111",
+			CommitRotationSHA: "2222222222222222222222222222222222222222",
+			NewEpoch:          2,
+		},
+	}, nil
+}
+
+// TestDocGate_RequestAccessAdminWarning_VerbatimEmitted is the V6 docgate row
+// for T-V6-14.
+//
+// It drives `byreis rotate --project <id> --add --from-request <PR> --yes`
+// through the REAL cobra root (cli.NewRootCmdWithDeps) with:
+//   - A fake RequestAccessReader that returns a happy-path YAML + PR meta
+//     pair, so ValidateRequestAccess succeeds and the warning-print stage
+//     is reached. (Mismatch refusals never reach the warning emission.)
+//   - A fake Rotator that records the call and returns a completed result.
+//   - --yes to skip the typed-fingerprint confirm (the warning emits BEFORE
+//     the confirm prompt, but skipping the prompt keeps the test
+//     deterministic without an stdin pipe).
+//
+// The assertion: stdout contains the verbatim
+// rotate.RequestAccessAdminWarning constant, byte-for-byte. The Go constant
+// is the single source of truth; the test does not re-declare the string.
+func TestDocGate_RequestAccessAdminWarning_VerbatimEmitted(t *testing.T) {
+	t.Parallel()
+
+	deps := &cli.Deps{
+		Policy:              &mode.Policy{},
+		CurrentMode:         mode.ModeAdmin,
+		Rotator:             &docgateFakeRotatorFromRequest{},
+		RequestAccessReader: &docgateFakeRequestAccessReader{},
+	}
+
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+
+	root := cli.NewRootCmdWithDeps(deps)
+	root.SetOut(stdout)
+	root.SetErr(stderr)
+	root.SetArgs([]string{
+		"rotate",
+		"--project", "docgate-proj",
+		"--add", docgateRequestAccessPubkey,
+		"--from-request", "myorg/byreis-admins#42",
+		"--yes",
+	})
+
+	if execErr := root.ExecuteContext(context.Background()); execErr != nil {
+		t.Fatalf("V6 T-V6-14: rotate --add --from-request --yes exited with error: %v "+
+			"(stderr=%q, stdout=%q)", execErr, stderr.String(), stdout.String())
+	}
+
+	got := stdout.String()
+
+	// T-V6-14 assertion: the verbatim rotate.RequestAccessAdminWarning must
+	// appear in stdout. A missing or truncated warning is release-blocking:
+	// operators rely on this admin-honesty paragraph to understand the
+	// PR-author-vs-YAML byte-compare semantics before they type the
+	// SHA-256 fingerprint confirm.
+	want := rotate.RequestAccessAdminWarning //nolint:forbidigo // boundary: equality assertion only
+	if !strings.Contains(got, want) {
+		t.Fatalf("V6 T-V6-14: stdout does not contain the verbatim "+
+			"RequestAccessAdminWarning.\nThis is release-blocking: the CLI must "+
+			"emit the full admin-warning block before the typed-fingerprint "+
+			"confirm, so operators cannot miss the BO-3 PR-author-vs-YAML "+
+			"semantics.\n\nwant (substring):\n%q\n\ngot (full stdout):\n%q",
+			want, got)
+	}
+
+	// The constant ends with a trailing newline + blank line (so its closing
+	// boundary is `Mismatch refuses the rotation.\n\n`). Confirm the boundary
+	// marker is present so a future refactor cannot silently drop the trailing
+	// whitespace block and still match a prefix-only substring.
+	const trailingBoundary = "Mismatch refuses the rotation.\n\n"
+	if !strings.Contains(got, trailingBoundary) {
+		t.Errorf("V6 T-V6-14: warning trailing boundary marker missing — "+
+			"the constant ends with %q but emission truncated it.\n"+
+			"got:\n%q", trailingBoundary, got)
+	}
+
+	t.Logf("V6 T-V6-14: PASS — stdout contains the verbatim "+
+		"RequestAccessAdminWarning (%d chars) with trailing boundary intact",
+		len(want))
 }
 

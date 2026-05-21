@@ -44,18 +44,55 @@ var agePubkeyRE = regexp.MustCompile(`^age1[0-9a-z]{58}$`)
 // alphanumeric plus . _ / - characters, 1 to 256 characters.
 var projectIDOrFileNameRE = regexp.MustCompile(`^[a-zA-Z0-9._\-/]{1,256}$`)
 
+// shaHexRE matches canonical lowercase hex SHA-style digests: 1 to 128
+// hexadecimal characters. Audit-event fields carrying SHAs (commit SHAs,
+// content SHAs, blob SHAs, audit-entry SHAs) are typed: only canonical hex
+// passes. The 128-char ceiling covers SHA-512 and shorter cryptographic
+// hashes the registry might surface; non-hex (or any value outside that set)
+// fails-closed at validation rather than slipping through the high-entropy
+// heuristic with a false-positive secret-leak alarm.
+var shaHexRE = regexp.MustCompile(`^[0-9a-f]{1,128}$`)
+
+// prURLRE matches the canonical "<owner>/<repo>#<number>" PR-reference
+// string emitted by the rotation audit-event producer's reversal_target_pr
+// and from_request_pr_url fields. This is a strict structural form — no
+// query strings, no fragments, no schemes — so a producer that accidentally
+// serialised a raw URL or an opaque ID fails validation here.
+var prURLRE = regexp.MustCompile(`^[A-Za-z0-9._\-/]{1,256}#[0-9]+$`)
+
 // ValidateEventFields checks that every Details entry in e carries a
 // canonical-typed value. It is a pure function with no side effects.
 //
 // Callers MUST invoke ValidateEventFields before persisting an Event to any
 // durable audit channel (signed registry commit or host-local audit log).
+//
+// Forward-defense: keys matching `from_request_yaml_just*` are explicitly
+// denylisted. The contributor-authored free-text justification field from the
+// request-access YAML must never enter the permanent audit JSONL — sanitised
+// terminal-render is the only operator-facing surface where that bytes live.
+// A future code path that accidentally added the field would be caught here.
 func ValidateEventFields(e Event) error {
 	for k, v := range e.Details {
 		lk := strings.ToLower(k)
+		if strings.HasPrefix(lk, "from_request_yaml_just") {
+			return fmt.Errorf(
+				"%w: details key %q is on the contributor-text denylist (justification bytes never enter the permanent audit log)",
+				ErrAuditEventInvalidField, k)
+		}
 		switch {
 		case strings.Contains(lk, "pubkey") || strings.Contains(lk, "recipient") || strings.Contains(lk, "age_key"):
 			if !agePubkeyRE.MatchString(v) {
 				return fmt.Errorf("%w: details field %q value does not match age pubkey format (^age1[0-9a-z]{58}$): %q",
+					ErrAuditEventInvalidField, k, truncate(v))
+			}
+		case strings.HasSuffix(lk, "_url") || strings.HasSuffix(lk, "_pr") || strings.HasSuffix(lk, "_pr_url"):
+			if !prURLRE.MatchString(v) {
+				return fmt.Errorf("%w: details field %q value does not match canonical PR ref format (<owner>/<repo>#<number>): %q",
+					ErrAuditEventInvalidField, k, truncate(v))
+			}
+		case strings.Contains(lk, "sha") || strings.Contains(lk, "hash") || strings.Contains(lk, "digest"):
+			if !shaHexRE.MatchString(v) {
+				return fmt.Errorf("%w: details field %q value does not match canonical hex SHA format (^[0-9a-f]{1,128}$): %q",
 					ErrAuditEventInvalidField, k, truncate(v))
 			}
 		case strings.Contains(lk, "project") || strings.Contains(lk, "file") || strings.Contains(lk, "name"):

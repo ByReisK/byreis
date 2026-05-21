@@ -201,11 +201,30 @@ common incident-response mistake at this layer. The warning is the
 honest signal that running the byreis command is the start of the
 remediation, not the end of it.
 
+## Recipient onboarding via `request-access`
+
+The complementary "add a recipient" path uses the contributor verb
+`byreis request-access` to open a PR against the registry repo with
+the proposed pubkey, and the admin verb
+`byreis rotate --add --from-request <PR>` to absorb the proposed key
+into a rotation after a typed-fingerprint confirm. The onboarding flow
+does not touch the forward-secrecy property of past ciphertext (it is
+an additive `--add`), but a single rotation invocation MAY combine
+`--add --from-request` with `--remove <old>` to onboard a replacement
+key in one transaction — in which case the forward-secrecy warning
+above applies to the removed recipient just as it does on a standalone
+`--remove`. See `docs/request-access-runbook.md` for the contributor
+and admin procedures, the state-machine matrix, and the public-registry
+disclosure surface.
+
 ## Related reading
 
 - `byreis doctor --rotation-history` shows the audit-log history of
   past rotations on the current project, including which recipients
   were removed at each rotation.
+- `docs/request-access-runbook.md` — opening, reviewing, and absorbing
+  contributor request-access PRs. The complementary onboarding path
+  to this runbook's removal procedure.
 - The native `age` format byreis uses for ciphertext is the upstream
   `age` Model B; the project's design rationale for choosing Model B
   is recorded in the public design notes and ADRs.

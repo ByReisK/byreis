@@ -271,16 +271,21 @@ func TestRotate_TypedFingerprintPrefixRejected(t *testing.T) {
 	}
 }
 
-// ---- V5.ROTATE.from-request-deferred-to-later-slice ------------------------
+// ---- V5.ROTATE.from-request-no-reader-wired ---------------------------------
 
-// TestRotate_FromRequestDeferred proves --from-request returns an error
-// referencing the later-slice availability and does NOT read any PR content.
+// TestRotate_FromRequestDeferred proves --from-request returns an error when
+// no RequestAccessReader is wired in deps (the "not configured" guard), and
+// that the Rotator is never invoked.
+//
+// When deps.RequestAccessReader is nil the CLI surface returns an actionable
+// "not wired" error before any PR fetch or rotation phase is attempted.
 func TestRotate_FromRequestDeferred(t *testing.T) {
 	t.Parallel()
 
-	// V5.ROTATE.from-request-deferred-to-later-slice
 	fr := &fakeRotator{}
 	deps := makeRotateDeps(mode.ModeAdmin, fr)
+	// RequestAccessReader is nil: the "not wired" guard in resolveFromRequest
+	// must refuse before any rotation code runs.
 
 	_, _, err := runRotateCmd(deps, []string{
 		"rotate", "--project", "test-proj",
@@ -288,13 +293,17 @@ func TestRotate_FromRequestDeferred(t *testing.T) {
 	}, "")
 
 	if err == nil {
-		t.Fatal("expected error for --from-request, got nil")
+		t.Fatal("expected error for --from-request with nil RequestAccessReader, got nil")
 	}
-	if !strings.Contains(err.Error(), "later slice") {
-		t.Errorf("error message should mention 'later slice', got: %v", err)
+	// The error must mention the missing wiring, not a domain-specific failure.
+	if !strings.Contains(err.Error(), "RequestAccessReader") &&
+		!strings.Contains(err.Error(), "not wired") &&
+		!strings.Contains(err.Error(), "BYREIS_GITHUB_TOKEN") {
+		t.Errorf("error message should mention missing reader wiring, got: %v", err)
 	}
 	if fr.calls.Load() != 0 {
-		t.Errorf("rotator was called %d times; want 0 (--from-request must not reach rotator)", fr.calls.Load())
+		t.Errorf("rotator was called %d times; want 0 (--from-request must not reach rotator when reader is nil)",
+			fr.calls.Load())
 	}
 }
 

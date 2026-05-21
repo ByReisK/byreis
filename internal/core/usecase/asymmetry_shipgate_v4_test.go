@@ -1630,7 +1630,7 @@ func (p *v4RealPhase2Executor) runRealCommitRotation(_ context.Context, p1 rotat
 		return fmt.Errorf("mkdir audit: %w", err)
 	}
 	plan := p.lastRotationPlan()
-	ev := rotate.BuildRotationAuditEvent(plan, shipgateProjectID, time.Date(2026, 5, 21, 12, 0, 0, 0, time.UTC))
+	ev := rotate.BuildRotationAuditEvent(plan, shipgateProjectID, time.Date(2026, 5, 21, 12, 0, 0, 0, time.UTC), nil)
 	line, err := json.Marshal(ev)
 	if err != nil {
 		return fmt.Errorf("marshal audit event: %w", err)

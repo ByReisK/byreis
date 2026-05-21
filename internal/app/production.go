@@ -11,6 +11,8 @@ import (
 	"strings"
 	"time"
 
+	ghsdkpkg "github.com/google/go-github/v72/github"
+
 	"github.com/ByReisK/byreis/internal/adapter/artifactcodec"
 	auditadapter "github.com/ByReisK/byreis/internal/adapter/audit"
 	editadapter "github.com/ByReisK/byreis/internal/adapter/editor"
@@ -229,20 +231,43 @@ func BuildProductionDeps(ctx context.Context) (*cli.Deps, error) {
 		regClient, forSource, codec, idLoader, decrypt.New(), projectIDFromEnvProd(),
 	)
 
+	// Build the RequestAccessReader for the `--from-request` path. Uses the
+	// admin's GitHub token (same auth source as submit) and does not acquire a
+	// registry-write credential. The reader is the only consumer of this port
+	// at this release; the pre-existing FetchPartialState read site remains on
+	// the write-token path and is not migrated here.
+	var requestAccessReader rotate.RequestAccessReader
+	registryRepo := registryProjectFromURLProd(os.Getenv("BYREIS_REGISTRY"))
+	if registryRepo != "" {
+		adminToken := githubTokenProd()
+		if adminToken != "" {
+			ghsdk := ghClientProd(adminToken)
+			if reader, readerErr := gitadapter.NewRequestAccessReader(ghsdk, registryRepo); readerErr == nil {
+				requestAccessReader = reader
+			}
+		}
+	}
+
 	return &cli.Deps{
-		Policy:          pol,
-		CurrentMode:     currentMode,
-		ConfigDir:       configDir,
-		Getter:          getter,
-		Decryptor:       decryptor,
-		Editor:          editorUC,
-		Merger:          merger,
-		MergeExitCode:   mergeExitCode,
-		Rotator:         rotator,
-		Reconciler:      reconciler,
-		RotateExitCode:  rotateExitCode,
-		RotatePreFlight: rotatePreflight,
+		Policy:              pol,
+		CurrentMode:         currentMode,
+		ConfigDir:           configDir,
+		Getter:              getter,
+		Decryptor:           decryptor,
+		Editor:              editorUC,
+		Merger:              merger,
+		MergeExitCode:       mergeExitCode,
+		Rotator:             rotator,
+		Reconciler:          reconciler,
+		RotateExitCode:      rotateExitCode,
+		RotatePreFlight:     rotatePreflight,
+		RequestAccessReader: requestAccessReader,
 	}, nil
+}
+
+// ghClientProd constructs a *github.Client authenticated with the given token.
+func ghClientProd(token string) *ghsdkpkg.Client {
+	return ghsdkpkg.NewClient(nil).WithAuthToken(token)
 }
 
 // buildRegistryClientProd constructs the real registry client. Returns (nil, err)
@@ -519,6 +544,9 @@ func buildMergerProd(
 		}
 		if isErr(err, coreregistry.ErrRegistryRollback) {
 			return render.ExitReplay
+		}
+		if isErr(err, rotate.ErrCommitBumpRejectedRotationInFlight) {
+			return render.ExitCounterReconcile
 		}
 		return render.ExitGeneralError
 	}

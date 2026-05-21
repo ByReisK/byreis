@@ -109,6 +109,12 @@ const (
 	CommandEdit              Command = "edit"
 	CommandRotate            Command = "rotate"
 	CommandRotationReconcile Command = "rotation-reconcile"
+	// CommandRequestAccess is the contributor-side in-band promotion request
+	// verb. Permission inversion vs CommandRotate: contributor-only, denied
+	// for ADMIN/SUPER. The verb opens a PR against the registry repo via the
+	// contributor's own GitHub identity (the same v0.1 submit transport) and
+	// introduces no new registry-write keychain credential.
+	CommandRequestAccess Command = "request-access"
 )
 
 // ErrKeyPermissions is a hard error returned when the private key file exists
@@ -300,6 +306,10 @@ var matrix = map[Command]map[Mode]bool{
 	CommandEdit:              {ModeAdmin: true, ModeSuper: true},
 	CommandRotate:            {ModeAdmin: true, ModeSuper: true},
 	CommandRotationReconcile: {ModeAdmin: true, ModeSuper: true},
+	// Permission inversion vs CommandRotate: contributor-only. ADMIN/SUPER
+	// invocation is denied — an admin who wants to add themselves goes
+	// through the out-of-band registry admin-add flow instead.
+	CommandRequestAccess: {ModeContributor: true},
 }
 
 // Allow returns nil if cmd is permitted in mode m, or an error wrapping

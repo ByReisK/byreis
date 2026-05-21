@@ -33,11 +33,13 @@ test-testhook:
 test-shipgate:
 	go test $(GO_TEST_FLAGS) -tags shipgate -run TestAsymmetryShipGate ./internal/core/usecase/
 
-## test-docgate: run the docgate suite (forward-secrecy warning verbatim + release-wiring assertion)
+## test-docgate: run the docgate suite (forward-secrecy warning verbatim + release-wiring
+## assertion + V5a R4a CLI emission + V6 request-access honesty contract + V6 admin warning).
 ## The docgate tag is a non-default sibling lane to shipgate; it is never compiled into a shipped
 ## binary (asserted structurally by shipped_surface_test.go and by the CI release-build-clean check).
 test-docgate:
 	go test $(GO_TEST_FLAGS) -tags docgate -run 'TestForwardSecrecyWarning_VerbatimMatch|TestForwardSecrecyWarning_RunbookPathReferenceIntact|TestReleaseWorkflow_DocgateGateWiringIntact' ./internal/core/usecase/rotate/
+	go test $(GO_TEST_FLAGS) -tags docgate -run 'TestV5R4aCLI_RotateRemoveDryRunEmitsVerbatimForwardSecrecyWarning|TestV5R4aCLI_RotateRemoveNonDryRunEmitsVerbatimForwardSecrecyWarning|TestDocGate_RequestAccessHelp_VerbatimHonestyContract|TestDocGate_RequestAccessAdminWarning_VerbatimEmitted' ./internal/cli/
 
 ## lint: run golangci-lint (enforces Clean Architecture dependency rules)
 lint:

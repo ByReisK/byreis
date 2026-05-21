@@ -26,15 +26,36 @@ const RotationOutcomeReverted = "reverted"
 //     the index assignment is deterministic across runs.
 //   - "rotation_epoch": the new epoch as a decimal string.
 //
+// When fromRequestPR is non-nil (a `--from-request <PR>` lift), the event
+// additionally carries the absorbed PR's provenance so the audit trail can
+// be joined back to the source contribution:
+//
+//   - "from_request_pr_url": the canonical "<project>#<number>" string.
+//   - "from_request_pr_head_sha": the PR HEAD commit SHA captured at absorb
+//     time.
+//   - "from_request_yaml_handle": the validated lowercase YAML
+//     github_handle (post-schema validation).
+//   - "from_request_validated_author_login": the PR opener's GitHub login
+//     after the byte-equal PR-author-vs-YAML check succeeded.
+//
+// The contributor's free-text justification is explicitly NOT emitted into
+// audit-log Details — operator-supplied bytes stay out of the permanent
+// audit JSONL by design.
+//
 // Ordering: removed recipients are sorted ascending by AgePubKey before
 // index assignment, so the mapping is reproducible regardless of the order
-// in which the planner computed RemovedRecipients.
+// in which the planner computed RemovedRecipients. The from_request_* keys
+// are independent of the recipients list and do not affect that ordering.
 //
 // This helper is consumed by the rotate use-case orchestrator; tests exercise
 // it directly so the producer is covered in its owning package rather than
 // only at the registry-adapter boundary.
-func BuildRotationAuditEvent(plan RotationPlan, projectID string, when time.Time) audit.Event {
-	details := make(map[string]string, len(plan.RemovedRecipients)+1)
+func BuildRotationAuditEvent(plan RotationPlan, projectID string, when time.Time, fromRequestPR *FromRequestPRMeta) audit.Event {
+	capacity := len(plan.RemovedRecipients) + 1
+	if fromRequestPR != nil {
+		capacity += 4
+	}
+	details := make(map[string]string, capacity)
 
 	// Sort removed recipients ascending by AgePubKey for deterministic N
 	// assignment. Copy to avoid mutating the plan's slice.
@@ -48,6 +69,14 @@ func BuildRotationAuditEvent(plan RotationPlan, projectID string, when time.Time
 		details[fmt.Sprintf("removed_recipients_%d", i)] = pk
 	}
 	details["rotation_epoch"] = fmt.Sprintf("%d", plan.NewEpoch)
+
+	if fromRequestPR != nil {
+		details["from_request_pr_url"] = fmt.Sprintf("%s#%d",
+			fromRequestPR.Project, fromRequestPR.Number)
+		details["from_request_pr_head_sha"] = fromRequestPR.HeadSHA
+		details["from_request_yaml_handle"] = fromRequestPR.YAMLHandle
+		details["from_request_validated_author_login"] = fromRequestPR.ValidatedAuthorLogin
+	}
 
 	return audit.Event{
 		Kind:       audit.EventKindRotation,

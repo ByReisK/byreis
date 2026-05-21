@@ -25,7 +25,7 @@ func TestBuildRotationAuditEvent_ZeroRemovedRecipients(t *testing.T) {
 		RemovedRecipients: nil,
 	}
 
-	ev := rotate.BuildRotationAuditEvent(plan, "proj-zero", when)
+	ev := rotate.BuildRotationAuditEvent(plan, "proj-zero", when, nil)
 
 	if ev.Kind != audit.EventKindRotation {
 		t.Errorf("Kind = %q, want %q", ev.Kind, audit.EventKindRotation)
@@ -67,7 +67,7 @@ func TestBuildRotationAuditEvent_OneRemovedRecipient(t *testing.T) {
 		},
 	}
 
-	ev := rotate.BuildRotationAuditEvent(plan, "proj-one", when)
+	ev := rotate.BuildRotationAuditEvent(plan, "proj-one", when, nil)
 
 	if ev.Details["removed_recipients_0"] != pubkey {
 		t.Errorf("removed_recipients_0 = %q, want %q", ev.Details["removed_recipients_0"], pubkey)
@@ -105,7 +105,7 @@ func TestBuildRotationAuditEvent_NRemovedRecipients(t *testing.T) {
 		},
 	}
 
-	ev := rotate.BuildRotationAuditEvent(plan, "proj-n", when)
+	ev := rotate.BuildRotationAuditEvent(plan, "proj-n", when, nil)
 
 	// Sorted ascending: pkA < pkB < pkC.
 	if ev.Details["removed_recipients_0"] != pkA {
@@ -126,7 +126,7 @@ func TestBuildRotationAuditEvent_NRemovedRecipients(t *testing.T) {
 	}
 
 	// Second call with same plan must produce identical event (deterministic).
-	ev2 := rotate.BuildRotationAuditEvent(plan, "proj-n", when)
+	ev2 := rotate.BuildRotationAuditEvent(plan, "proj-n", when, nil)
 	if ev2.Details["removed_recipients_0"] != ev.Details["removed_recipients_0"] ||
 		ev2.Details["removed_recipients_1"] != ev.Details["removed_recipients_1"] ||
 		ev2.Details["removed_recipients_2"] != ev.Details["removed_recipients_2"] {
@@ -145,7 +145,7 @@ func TestBuildRotationAuditEvent_ProjectIDPropagates(t *testing.T) {
 		ProjectID: "plan-pid",
 		NewEpoch:  1,
 	}
-	ev := rotate.BuildRotationAuditEvent(plan, "canonical-pid", time.Now())
+	ev := rotate.BuildRotationAuditEvent(plan, "canonical-pid", time.Now(), nil)
 	if ev.ProjectID != "canonical-pid" {
 		t.Errorf("ProjectID = %q, want canonical-pid", ev.ProjectID)
 	}
@@ -158,9 +158,95 @@ func TestBuildRotationAuditEvent_OccurredAtSetFromClock(t *testing.T) {
 
 	frozen := time.Date(2026, 1, 15, 12, 30, 0, 0, time.UTC)
 	plan := rotate.RotationPlan{ProjectID: "proj-clk", NewEpoch: 2}
-	ev := rotate.BuildRotationAuditEvent(plan, "proj-clk", frozen)
+	ev := rotate.BuildRotationAuditEvent(plan, "proj-clk", frozen, nil)
 	if !ev.OccurredAt.Equal(frozen) {
 		t.Errorf("OccurredAt = %v, want %v", ev.OccurredAt, frozen)
+	}
+}
+
+// TestBuildRotationAuditEvent_FromRequestPRNilUnchanged proves the existing
+// rotation audit-event shape is unchanged when fromRequestPR is nil. The
+// audit Details map contains rotation_epoch + removed_recipients_<N> only,
+// with no from_request_* keys. T-V6-13 backwards-compat row.
+func TestBuildRotationAuditEvent_FromRequestPRNilUnchanged(t *testing.T) {
+	t.Parallel()
+
+	when := time.Date(2026, 5, 21, 12, 0, 0, 0, time.UTC)
+	plan := rotate.RotationPlan{ProjectID: "proj-no-req", NewEpoch: 4}
+	ev := rotate.BuildRotationAuditEvent(plan, "proj-no-req", when, nil)
+	for k := range ev.Details {
+		if k == "rotation_epoch" {
+			continue
+		}
+		if len(k) >= len("removed_recipients_") &&
+			k[:len("removed_recipients_")] == "removed_recipients_" {
+			continue
+		}
+		t.Errorf("nil fromRequestPR must not emit Details key %q", k)
+	}
+}
+
+// TestBuildRotationAuditEvent_FromRequestPRPopulated — T-V6-13 happy path.
+// When fromRequestPR is non-nil, the four required keys appear with the
+// expected values; the existing rotation_epoch + removed_recipients_<N>
+// keys remain present and ordered.
+func TestBuildRotationAuditEvent_FromRequestPRPopulated(t *testing.T) {
+	t.Parallel()
+
+	when := time.Date(2026, 5, 21, 12, 0, 0, 0, time.UTC)
+	plan := rotate.RotationPlan{ProjectID: "proj-req", NewEpoch: 9}
+	meta := &rotate.FromRequestPRMeta{
+		Project:              "org/registry",
+		Number:               42,
+		HeadSHA:              "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+		YAMLHandle:           "alice",
+		ValidatedAuthorLogin: "alice",
+	}
+	ev := rotate.BuildRotationAuditEvent(plan, "proj-req", when, meta)
+
+	wants := map[string]string{
+		"from_request_pr_url":                 "org/registry#42",
+		"from_request_pr_head_sha":            "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+		"from_request_yaml_handle":            "alice",
+		"from_request_validated_author_login": "alice",
+		"rotation_epoch":                      "9",
+	}
+	for k, want := range wants {
+		if ev.Details[k] != want {
+			t.Errorf("Details[%q] = %q, want %q", k, ev.Details[k], want)
+		}
+	}
+	if ev.Kind != audit.EventKindRotation {
+		t.Errorf("Kind = %q, want %q", ev.Kind, audit.EventKindRotation)
+	}
+	if ev.Outcome != "ok" {
+		t.Errorf("Outcome = %q, want ok", ev.Outcome)
+	}
+}
+
+// TestBuildRotationAuditEvent_FromRequestPR_NoJustificationLeak proves that
+// the helper does NOT emit any from_request_yaml_just* key — the contributor's
+// free-text justification stays out of the permanent audit JSONL (F38 forward
+// defense). Even when a future caller passes a populated FromRequestPRMeta,
+// no such key appears in Details.
+func TestBuildRotationAuditEvent_FromRequestPR_NoJustificationLeak(t *testing.T) {
+	t.Parallel()
+
+	when := time.Date(2026, 5, 21, 12, 0, 0, 0, time.UTC)
+	plan := rotate.RotationPlan{ProjectID: "proj-req", NewEpoch: 1}
+	meta := &rotate.FromRequestPRMeta{
+		Project:              "org/registry",
+		Number:               7,
+		HeadSHA:              "abc123",
+		YAMLHandle:           "alice",
+		ValidatedAuthorLogin: "alice",
+	}
+	ev := rotate.BuildRotationAuditEvent(plan, "proj-req", when, meta)
+	for k := range ev.Details {
+		if len(k) >= len("from_request_yaml_just") &&
+			k[:len("from_request_yaml_just")] == "from_request_yaml_just" {
+			t.Errorf("audit Details must NOT carry %q (F38 denylist)", k)
+		}
 	}
 }
 

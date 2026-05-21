@@ -78,6 +78,16 @@ type Deps struct {
 	// This is a function-field so the CLI layer never imports internal/adapter.
 	RotateExitCode func(err error) render.ExitCode
 
+	// RequestAccessReader is the narrow read-only port the rotate command uses
+	// when `--from-request <PR>` is supplied. It fetches the contributor's
+	// request-access YAML and PR metadata from GitHub. When nil the
+	// `--from-request` flag is rejected with a "not configured" error.
+	//
+	// The real adapter is internal/adapter/git/github.RequestAccessReader.
+	// It is wired at BuildProductionDeps when BYREIS_GITHUB_TOKEN is set.
+	// Tests inject a fake that returns canned RequestAccessFile + PRMetadata.
+	RequestAccessReader rotate.RequestAccessReader
+
 	// RotatePreFlight is the narrow read-only port the rotate command uses to
 	// perform the two pre-flight checks required before invoking Rotator.Rotate:
 	//   (a) registry freshness/verification — SourceVerified + non-stale

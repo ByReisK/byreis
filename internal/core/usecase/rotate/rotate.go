@@ -48,6 +48,12 @@ type RotationInput struct {
 	PreRotationFiles   []FileSnapshot
 	AdminCanDecryptAll bool
 	CurrentMaxEpoch    uint64
+	// FromRequestPR is non-nil when the rotation was invoked via
+	// `byreis rotate --add --from-request <PR>`. The CLI layer populates it
+	// after a successful ValidateRequestAccess call; the Phase-2 executor
+	// threads it into BuildRotationAuditEvent so the audit trail records the
+	// PR provenance. Nil on a plain `--add` invocation (no contributor PR).
+	FromRequestPR *FromRequestPRMeta
 	// DryRun selects preview-only behaviour: plan is computed and returned in
 	// the result, but no Phase-1 work occurs.
 	DryRun bool
@@ -207,6 +213,12 @@ func (r *rotator) Rotate(ctx context.Context, in RotationInput) (RotationResult,
 	if err != nil {
 		return RotationResult{Plan: plan}, fmt.Errorf("rotation phase 1: %w", err)
 	}
+
+	// Carry the request-access PR provenance from the spine input into the
+	// Phase-1 result so the Phase-2 executor can record it on the rotation
+	// audit event. Plain (non-request-access) rotations leave this nil and the
+	// downstream audit-event builder omits the provenance fields.
+	p1.FromRequestPR = in.FromRequestPR
 
 	// (8) Phase-2 execution.
 	p2, err := r.d.Phase2.Execute(ctx, p1)

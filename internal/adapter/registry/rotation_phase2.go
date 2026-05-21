@@ -239,7 +239,9 @@ func (a *rotationPhase2Adapter) Execute(ctx context.Context, p1 rotate.Phase1Res
 	}
 
 	// Build the rotation audit event using the plan stored by Phase-1.
-	auditEvent := rotate.BuildRotationAuditEvent(*plan, a.d.ProjectID, time.Now().UTC())
+	// p1.FromRequestPR is non-nil only on `--from-request` lifts; nil keeps
+	// the existing rotation audit-event shape for plain --add/--remove runs.
+	auditEvent := rotate.BuildRotationAuditEvent(*plan, a.d.ProjectID, time.Now().UTC(), p1.FromRequestPR)
 
 	commitRotInput := coreregistry.CommitRotationInput{
 		ProjectID:         a.d.ProjectID,

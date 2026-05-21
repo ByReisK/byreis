@@ -169,6 +169,62 @@ func TestValidateEventFields_AcceptsGeneralFieldBelowThreshold(t *testing.T) {
 	}
 }
 
+// TestValidateEventFields_DenylistsFromRequestYAMLJustification — F38
+// forward-defense row. Any key matching `from_request_yaml_just*` is refused.
+// Exact match and prefix-match variants are both covered so a future
+// regression that adds `from_request_yaml_justification_normalised` (or any
+// other arbitrary `_just` suffix) is caught.
+func TestValidateEventFields_DenylistsFromRequestYAMLJustification(t *testing.T) {
+	t.Parallel()
+
+	cases := []string{
+		"from_request_yaml_justification",
+		"from_request_yaml_just_anything",
+		"from_request_yaml_justa",
+		"from_request_yaml_just",
+	}
+	for _, k := range cases {
+		k := k
+		t.Run(k, func(t *testing.T) {
+			t.Parallel()
+			e := audit.Event{
+				Kind:    audit.EventKindRotation,
+				Details: map[string]string{k: "innocent looking value"},
+			}
+			err := audit.ValidateEventFields(e)
+			if err == nil {
+				t.Fatalf("expected ErrAuditEventInvalidField for denylisted key %q", k)
+			}
+			if !errors.Is(err, audit.ErrAuditEventInvalidField) {
+				t.Errorf("want errors.Is(err, ErrAuditEventInvalidField), got: %v", err)
+			}
+		})
+	}
+}
+
+// TestValidateEventFields_AcceptsFromRequestPRProvenanceKeys — T-V6-13 happy
+// path: the canonical four `from_request_pr_*` provenance keys MUST pass
+// validation. They are typed fields populated by the rotation audit-event
+// producer and verified by the registry-side sink.
+func TestValidateEventFields_AcceptsFromRequestPRProvenanceKeys(t *testing.T) {
+	t.Parallel()
+
+	e := audit.Event{
+		Kind:      audit.EventKindRotation,
+		ProjectID: "proj-from-req",
+		Details: map[string]string{
+			"from_request_pr_url":                 "org/registry#42",
+			"from_request_pr_head_sha":            "a1b2c3d4e5",
+			"from_request_yaml_handle":            "alice",
+			"from_request_validated_author_login": "alice",
+			"rotation_epoch":                      "5",
+		},
+	}
+	if err := audit.ValidateEventFields(e); err != nil {
+		t.Errorf("provenance keys must pass validation: %v", err)
+	}
+}
+
 // TestValidateEventFields_ErrSentinelIsWrapped proves that ErrAuditEventInvalidField
 // is the sentinel wrapped inside the returned error, so callers can use
 // errors.Is for typed dispatch.

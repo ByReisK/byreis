@@ -188,6 +188,39 @@ func fingerprintSet(rs []rectypes.Recipient) []string {
 	return out
 }
 
+// checkRotationGuardBeforeCommitBump runs the rotation-in-flight consultation
+// contract: nil guard (legacy / pre-rotation deployment) returns nil and lets
+// CommitBump proceed; a non-nil guard is consulted exactly once and any error
+// OR an inFlight=true verdict refuses the bump with
+// rotate.ErrCommitBumpRejectedRotationInFlight wrapped via %w. Fail-closed on
+// uncertainty: a probe error is treated as "rotation possibly in flight" and
+// refuses, preserving the rotation's N-file atomic counter commit.
+//
+// Factored out of the Merger step-6 path so the contract can be exercised by
+// a focused unit test without driving the full merge pipeline; the production
+// semantics are identical to the inline form they replaced.
+func checkRotationGuardBeforeCommitBump(ctx context.Context, g RotationGuard, projectID, fileName string) error {
+	if g == nil {
+		return nil
+	}
+	inFlight, rgErr := g.RotationInFlight(ctx, projectID, fileName)
+	if rgErr != nil {
+		return fmt.Errorf(
+			"%w: rotation-in-flight check failed before CommitBump for "+
+				"project=%q file=%q: %v — run `byreis admin rotation reconcile` "+
+				"to inspect state",
+			rotate.ErrCommitBumpRejectedRotationInFlight,
+			projectID, fileName, rgErr)
+	}
+	if inFlight {
+		return fmt.Errorf(
+			"%w: project=%q file=%q",
+			rotate.ErrCommitBumpRejectedRotationInFlight,
+			projectID, fileName)
+	}
+	return nil
+}
+
 func equalSets(a, b []string) bool {
 	if len(a) != len(b) {
 		return false
@@ -434,27 +467,16 @@ func (m *mergeUseCase) Merge(ctx context.Context, in MergeInput) (MergeResult, e
 	// bump. A read-only/VerifyOfRecord caller NEVER drives this — only this
 	// merge path does, and only against the pre-existing matching pending.
 	//
-	// Rotation-in-flight guard (FL-V5b-1): when a rotation is mid-flight for
-	// this (project, file) pair, a single-file CommitBump would corrupt the
+	// Rotation-in-flight guard: when a rotation is mid-flight for this
+	// (project, file) pair, a single-file CommitBump would corrupt the
 	// rotation's N-file atomic counter commit. Refuse before any write and
 	// surface ErrCommitBumpRejectedRotationInFlight so the operator retries
 	// after the rotation completes. Fail-closed: uncertainty → in-flight=true.
-	if m.d.RotationGuard != nil {
-		inFlight, rgErr := m.d.RotationGuard.RotationInFlight(ctx, in.ExpectedProjectID, in.ExpectedFileName)
-		if rgErr != nil {
-			return MergeResult{}, fmt.Errorf(
-				"%w: rotation-in-flight check failed before CommitBump for "+
-					"project=%q file=%q: %v — run `byreis admin rotation reconcile` "+
-					"to inspect state",
-				rotate.ErrCommitBumpRejectedRotationInFlight,
-				in.ExpectedProjectID, in.ExpectedFileName, rgErr)
-		}
-		if inFlight {
-			return MergeResult{}, fmt.Errorf(
-				"%w: project=%q file=%q",
-				rotate.ErrCommitBumpRejectedRotationInFlight,
-				in.ExpectedProjectID, in.ExpectedFileName)
-		}
+	// The check is factored to checkRotationGuardBeforeCommitBump so the
+	// consultation contract is exercisable by a focused unit test without
+	// driving the full merge pipeline; the production semantics are unchanged.
+	if err := checkRotationGuardBeforeCommitBump(ctx, m.d.RotationGuard, in.ExpectedProjectID, in.ExpectedFileName); err != nil {
+		return MergeResult{}, err
 	}
 	if err := m.d.Counter.CommitBump(ctx, CommitBumpInput{
 		ProjectID:      in.ExpectedProjectID,
