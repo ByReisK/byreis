@@ -591,3 +591,203 @@ func TestN11_ForeignCommitOnTopIsAmbiguous(t *testing.T) {
 func TestN12_MergedAfterTimeoutIsRegistryAuthoritative(t *testing.T) {
 	t.Skip("N-12 behavioural assertion lands in B3d-3 (usecase/Merge: registry pending/CommitBump is merge-state authority); B3d-1 fixes the contract only")
 }
+
+// ---- SubmissionMeta v2 (bulk submit) decode contract ----
+
+// TestParseSubmissionMeta_V2_HappyPath covers a well-formed v2 block carrying
+// an ordered keys: [{key, action}] array with mixed add/replace, and verifies
+// file order is preserved and the normalised key list reflects it.
+func TestParseSubmissionMeta_V2_HappyPath(t *testing.T) {
+	t.Parallel()
+
+	body := "Bulk submission justification.\n\n" +
+		"```byreis-submission\n" +
+		`{"schema_version":2,"project":"myorg/proj","secrets_path":"secrets/app.enc.yaml","base_file_path":"secrets/app.enc.yaml","keys":[{"key":"DATABASE_URL","action":"add"},{"key":"API_TOKEN","action":"replace"}],"artifact_sha":"abc123"}` + "\n" +
+		"```\n"
+
+	got, err := coregit.ParseSubmissionMeta(body)
+	if err != nil {
+		t.Fatalf("ParseSubmissionMeta v2: unexpected error: %v", err)
+	}
+	if got.SchemaVersion != 2 {
+		t.Errorf("SchemaVersion: got %d, want 2", got.SchemaVersion)
+	}
+	if got.SecretsPath != "secrets/app.enc.yaml" {
+		t.Errorf("SecretsPath: got %q", got.SecretsPath)
+	}
+	want := []coregit.KeyAction{
+		{Key: "DATABASE_URL", Action: "add"},
+		{Key: "API_TOKEN", Action: "replace"},
+	}
+	normalised := got.NormalisedKeys()
+	if len(normalised) != len(want) {
+		t.Fatalf("NormalisedKeys len: got %d, want %d (%v)", len(normalised), len(want), normalised)
+	}
+	for i := range want {
+		if normalised[i] != want[i] {
+			t.Errorf("NormalisedKeys[%d]: got %+v, want %+v", i, normalised[i], want[i])
+		}
+	}
+}
+
+// TestParseSubmissionMeta_V1_BackCompat_NormalisesToOneKey verifies the binding
+// back-compat requirement: a pre-V9 v1 single-key block still decodes on a
+// current binary and normalises to a one-element key list.
+func TestParseSubmissionMeta_V1_BackCompat_NormalisesToOneKey(t *testing.T) {
+	t.Parallel()
+
+	body := "```byreis-submission\n" +
+		`{"schema_version":1,"project":"myorg/proj","secrets_path":"secrets/prod.yaml","base_file_path":"secrets/prod.yaml","key":"api_key","action":"replace","artifact_sha":"abc"}` + "\n" +
+		"```\n"
+
+	got, err := coregit.ParseSubmissionMeta(body)
+	if err != nil {
+		t.Fatalf("ParseSubmissionMeta v1 back-compat: %v", err)
+	}
+	normalised := got.NormalisedKeys()
+	if len(normalised) != 1 {
+		t.Fatalf("v1 must normalise to a one-element key list, got %d", len(normalised))
+	}
+	if normalised[0] != (coregit.KeyAction{Key: "api_key", Action: "replace"}) {
+		t.Errorf("v1 normalised key = %+v, want {api_key replace}", normalised[0])
+	}
+	// The scalar fields remain populated for v1.
+	if got.Key != "api_key" || got.Action != "replace" {
+		t.Errorf("v1 scalar fields: got key=%q action=%q", got.Key, got.Action)
+	}
+}
+
+// TestParseSubmissionMeta_SchemaVersionGate verifies the gate accepts {1,2}
+// and rejects anything else with the updated "must be 1 or 2" hint.
+func TestParseSubmissionMeta_SchemaVersionGate(t *testing.T) {
+	t.Parallel()
+	for _, sv := range []int{0, 3, 99, -1} {
+		t.Run(strconv.Itoa(sv), func(t *testing.T) {
+			t.Parallel()
+			body := "```byreis-submission\n" +
+				`{"schema_version":` + strconv.Itoa(sv) + `,"project":"p","secrets_path":"secrets/prod.yaml","base_file_path":"secrets/prod.yaml","key":"k","action":"add","artifact_sha":"x"}` + "\n" +
+				"```\n"
+			_, err := coregit.ParseSubmissionMeta(body)
+			if err == nil {
+				t.Fatalf("want ErrSubmissionMetaInvalid for schema_version=%d, got nil", sv)
+			}
+			if !errors.Is(err, coregit.ErrSubmissionMetaInvalid) {
+				t.Errorf("want ErrSubmissionMetaInvalid, got %v", err)
+			}
+			if !strings.Contains(err.Error(), "1 or 2") {
+				t.Errorf("schema_version error %q must say 'must be 1 or 2'", err.Error())
+			}
+		})
+	}
+}
+
+// TestParseSubmissionMeta_PerVersionStrictShape verifies fail-closed per-version
+// field validity: a v1 block carrying keys, a v2 block carrying scalar
+// key/action, and a v2 block with empty keys all reject.
+func TestParseSubmissionMeta_PerVersionStrictShape(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		json string
+	}{
+		{
+			name: "v1 block carrying a keys array",
+			json: `{"schema_version":1,"project":"p","secrets_path":"secrets/prod.yaml","base_file_path":"secrets/prod.yaml","keys":[{"key":"k","action":"add"}],"artifact_sha":"x"}`,
+		},
+		{
+			name: "v2 block carrying a top-level scalar key",
+			json: `{"schema_version":2,"project":"p","secrets_path":"secrets/prod.yaml","base_file_path":"secrets/prod.yaml","key":"k","action":"add","keys":[{"key":"k","action":"add"}],"artifact_sha":"x"}`,
+		},
+		{
+			name: "v2 block carrying a top-level scalar action",
+			json: `{"schema_version":2,"project":"p","secrets_path":"secrets/prod.yaml","base_file_path":"secrets/prod.yaml","action":"add","keys":[{"key":"k","action":"add"}],"artifact_sha":"x"}`,
+		},
+		{
+			name: "v2 block with empty keys array",
+			json: `{"schema_version":2,"project":"p","secrets_path":"secrets/prod.yaml","base_file_path":"secrets/prod.yaml","keys":[],"artifact_sha":"x"}`,
+		},
+		{
+			name: "v2 keys element with an unknown field",
+			json: `{"schema_version":2,"project":"p","secrets_path":"secrets/prod.yaml","base_file_path":"secrets/prod.yaml","keys":[{"key":"k","action":"add","secret":"oops"}],"artifact_sha":"x"}`,
+		},
+		{
+			name: "v2 keys element missing action",
+			json: `{"schema_version":2,"project":"p","secrets_path":"secrets/prod.yaml","base_file_path":"secrets/prod.yaml","keys":[{"key":"k"}],"artifact_sha":"x"}`,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			body := "```byreis-submission\n" + tc.json + "\n```\n"
+			_, err := coregit.ParseSubmissionMeta(body)
+			if err == nil {
+				t.Fatalf("want ErrSubmissionMetaInvalid, got nil")
+			}
+			if !errors.Is(err, coregit.ErrSubmissionMetaInvalid) {
+				t.Errorf("want ErrSubmissionMetaInvalid, got %v", err)
+			}
+		})
+	}
+}
+
+// TestParseSubmissionMeta_V2_ExactlyOneBlock verifies the exactly-one-fenced-
+// block invariant holds for bulk: N pairs are ONE block with N keys; zero or
+// more than one block stays ErrSubmissionMetaInvalid.
+func TestParseSubmissionMeta_V2_ExactlyOneBlock(t *testing.T) {
+	t.Parallel()
+	v2 := `{"schema_version":2,"project":"p","secrets_path":"secrets/prod.yaml","base_file_path":"secrets/prod.yaml","keys":[{"key":"A","action":"add"},{"key":"B","action":"add"}],"artifact_sha":"x"}`
+
+	// One block with N keys: OK.
+	okBody := "```byreis-submission\n" + v2 + "\n```\n"
+	got, err := coregit.ParseSubmissionMeta(okBody)
+	if err != nil {
+		t.Fatalf("single v2 block: %v", err)
+	}
+	if len(got.NormalisedKeys()) != 2 {
+		t.Fatalf("want 2 normalised keys, got %d", len(got.NormalisedKeys()))
+	}
+
+	// Two blocks: rejected.
+	twoBody := "```byreis-submission\n" + v2 + "\n```\n\n```byreis-submission\n" + v2 + "\n```\n"
+	if _, err := coregit.ParseSubmissionMeta(twoBody); !errors.Is(err, coregit.ErrSubmissionMetaInvalid) {
+		t.Fatalf("two blocks must be ErrSubmissionMetaInvalid, got %v", err)
+	}
+}
+
+// TestParseSubmissionMeta_V2_PathValidationUnchanged verifies the path lexical-
+// containment checks apply identically to v2.
+func TestParseSubmissionMeta_V2_PathValidationUnchanged(t *testing.T) {
+	t.Parallel()
+	body := "```byreis-submission\n" +
+		`{"schema_version":2,"project":"p","secrets_path":"../escape.yaml","base_file_path":"secrets/prod.yaml","keys":[{"key":"A","action":"add"}],"artifact_sha":"x"}` + "\n" +
+		"```\n"
+	if _, err := coregit.ParseSubmissionMeta(body); !errors.Is(err, coregit.ErrSubmissionMetaInvalid) {
+		t.Fatalf("v2 with '..' path must reject, got %v", err)
+	}
+}
+
+// TestEncodeSubmissionMeta_V2_RoundTrip verifies a v2 block encodes and parses
+// back with its keys array in file order.
+func TestEncodeSubmissionMeta_V2_RoundTrip(t *testing.T) {
+	t.Parallel()
+	meta := coregit.SubmissionMeta{ //nolint:gosec // test fixture key names, not real credentials
+		SchemaVersion: 2,
+		Project:       "myorg/my-secrets",
+		SecretsPath:   "secrets/app.enc.yaml",
+		BaseFilePath:  "secrets/app.enc.yaml",
+		Keys: []coregit.KeyAction{
+			{Key: "FIRST", Action: "add"},
+			{Key: "SECOND", Action: "replace"},
+		},
+		ArtifactSHA: "deadbeef",
+	}
+	encoded := coregit.EncodeSubmissionMeta(meta)
+	parsed, err := coregit.ParseSubmissionMeta(encoded)
+	if err != nil {
+		t.Fatalf("round-trip parse: %v", err)
+	}
+	got := parsed.NormalisedKeys()
+	if len(got) != 2 || got[0] != meta.Keys[0] || got[1] != meta.Keys[1] {
+		t.Fatalf("round-trip keys: got %+v, want %+v", got, meta.Keys)
+	}
+}

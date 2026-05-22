@@ -45,15 +45,40 @@ type ReviewInput struct {
 	ExpectedFileName  string
 }
 
+// KeyReviewLine is the per-key review display line for one submitted key. It
+// carries the key's own add-vs-replace action (from the submission metadata)
+// and the result of a per-key value-validation pass. It never carries the
+// plaintext value, and its ValidationMsg never includes plaintext.
+type KeyReviewLine struct {
+	// Key is the submitted key name. Not secret.
+	Key string
+	// Action is this key's own action ("add" or "replace").
+	Action string
+	// ValidationOK reports whether the per-key validation pass accepted the
+	// decrypted value. When no validator is wired, it is true (not asserted).
+	ValidationOK bool
+	// ValidationMsg is a non-secret, human-readable reason when ValidationOK is
+	// false; empty otherwise. It never contains the plaintext value.
+	ValidationMsg string
+}
+
 // ReviewResult is the rendered, decrypted review surface. PinnedSHA is the
 // S_unsigned content pin the admin passes to `merge --expect`.
 type ReviewResult struct {
 	Ref           git.PRRef
 	Author        string
 	Justification string
-	Action        string
-	Key           string
-	SecretsPath   string
+	// Action and Key are the single-key (schema_version 1) scalar fields, kept
+	// for back-compat with single-key submissions. For a bulk submission read
+	// PerKey instead.
+	Action      string
+	Key         string
+	SecretsPath string
+	// PerKey is the ordered per-key review view, in the contributor's file
+	// order, for both single-key and bulk submissions (a single-key submission
+	// yields a one-element list). Each line carries its own action and a
+	// per-key validation result.
+	PerKey []KeyReviewLine
 	// Plaintext maps key name → decrypted plaintext value, decrypted from the
 	// fetched ARTIFACT bytes (never the PR diff/description). The caller must
 	// zeroize these after rendering.
@@ -67,6 +92,16 @@ type ReviewResult struct {
 	PinnedSHA string
 }
 
+// ValueValidator is the consumer-defined per-key value-validation port for the
+// review per-key display. It is optional: when nil, each key reports OK (the
+// content is simply not asserted at review time). Defined here so Review does
+// not depend on the validator package directly and the rule is unit-mockable.
+type ValueValidator interface {
+	// ValidateValue returns a non-nil error if the decrypted value is
+	// unacceptable. The returned error must not contain the plaintext value.
+	ValidateValue(value string) error
+}
+
 // ReviewDeps bundles the injected ports for the Review use-case.
 type ReviewDeps struct {
 	Git           git.GitProvider
@@ -74,8 +109,11 @@ type ReviewDeps struct {
 	IDLoader      IDLoader
 	ArtifactCodec ArtifactCodec
 	Mode          ModeGate
-	Audit         audit.Logger
-	Log           logging.Logger
+	// Validator is the optional per-key value-validation port for the per-key
+	// review display. When nil, each key reports OK (content not asserted).
+	Validator ValueValidator
+	Audit     audit.Logger
+	Log       logging.Logger
 }
 
 // Reviewer is the consumer-defined interface for the admin Review use-case.
@@ -169,6 +207,12 @@ func (r *reviewUseCase) Review(ctx context.Context, in ReviewInput) (ReviewResul
 	}
 	sort.Strings(keyNames)
 
+	// Build the per-key view from the submission metadata's normalised key list
+	// (file order, version-agnostic), running a per-key validation pass over the
+	// decrypted value when a validator is wired. The validation message never
+	// includes the plaintext value.
+	perKey := r.buildPerKey(sub.Meta.NormalisedKeys(), plaintext)
+
 	// (5) Pin EXACTLY the reviewed (unsigned) artifact bytes. The git adapter
 	// computed this over the raw fetched buffer; review echoes it as the
 	// `merge --expect` pin so a branch re-push between review and merge is
@@ -198,10 +242,38 @@ func (r *reviewUseCase) Review(ctx context.Context, in ReviewInput) (ReviewResul
 		Action:        sub.Meta.Action,
 		Key:           sub.Meta.Key,
 		SecretsPath:   sub.Meta.SecretsPath,
+		PerKey:        perKey,
 		Plaintext:     plaintext,
 		KeyNames:      keyNames,
 		PinnedSHA:     pinned,
 	}, nil
+}
+
+// buildPerKey assembles the ordered per-key review view from the submission's
+// normalised (key, action) list, validating each decrypted value when a
+// validator is wired. A missing plaintext for a listed key is reported as a
+// validation failure (the metadata and the artifact disagree) rather than
+// silently OK. No plaintext value is ever placed in a ValidationMsg.
+func (r *reviewUseCase) buildPerKey(keys []git.KeyAction, plaintext map[string]string) []KeyReviewLine {
+	lines := make([]KeyReviewLine, 0, len(keys))
+	for _, ka := range keys {
+		line := KeyReviewLine{Key: ka.Key, Action: ka.Action, ValidationOK: true}
+
+		value, present := plaintext[ka.Key]
+		switch {
+		case !present:
+			line.ValidationOK = false
+			line.ValidationMsg = "no decrypted value present for this key " +
+				"(the submission metadata and the artifact disagree)"
+		case r.d.Validator != nil:
+			if err := r.d.Validator.ValidateValue(value); err != nil {
+				line.ValidationOK = false
+				line.ValidationMsg = err.Error()
+			}
+		}
+		lines = append(lines, line)
+	}
+	return lines
 }
 
 // Compile-time assertions that the consumed core ports are satisfied by the

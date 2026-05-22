@@ -286,3 +286,144 @@ func TestReview_UndecodableArtifactIsHardRefusal(t *testing.T) {
 		t.Fatalf("decrypt attempted on an undecodable artifact (calls=%d)", dec.calls)
 	}
 }
+
+// stubValueValidator validates per-key values for the review per-key display.
+// It marks any key whose decrypted value contains "BAD" as invalid.
+type stubValueValidator struct{ calls int }
+
+func (v *stubValueValidator) ValidateKeyName(string) error { return nil }
+
+func (v *stubValueValidator) ValidateValue(value string) error {
+	v.calls++
+	if strings.Contains(value, "BAD") {
+		return errors.New("value failed policy")
+	}
+	return nil
+}
+
+// Review of a bulk (v2) PR produces a per-key view in file order, each line
+// carrying its own action and a per-key validation result.
+func TestReview_BulkV2_PerKeyView(t *testing.T) {
+	t.Parallel()
+
+	wantArt := artifact.Signed{
+		Values: map[string]artifact.EncryptedValue{
+			"DATABASE_URL": "ct1",
+			"API_TOKEN":    "ct2",
+		},
+		Byreis: artifact.Metadata{FormatVersion: "byreis.native.v1", ProjectID: "proj", File: "prod", Counter: 1},
+	}
+	dec := &stubDecryptor{out: map[string]string{
+		"DATABASE_URL": "postgres://ok",
+		"API_TOKEN":    "tok-BAD-value",
+	}}
+	g := &stubGit{sub: git.Submission{
+		Ref:           git.PRRef{Project: "proj", Number: 9},
+		Author:        "carol",
+		ArtifactBytes: []byte("byreis:\n"),
+		ArtifactSHA:   "pin-bulk",
+		Meta: git.SubmissionMeta{
+			SchemaVersion: 2,
+			SecretsPath:   "secrets/prod.yaml",
+			Keys: []git.KeyAction{
+				{Key: "DATABASE_URL", Action: "add"},
+				{Key: "API_TOKEN", Action: "replace"},
+			},
+		},
+	}}
+	id, _ := newTestIdentity(t)
+	val := &stubValueValidator{}
+
+	r, err := usecase.NewReviewer(usecase.ReviewDeps{
+		Git:           g,
+		Decryptor:     dec,
+		IDLoader:      &stubIDLoader{id: id},
+		ArtifactCodec: &stubCodec{signed: wantArt},
+		Mode:          modeGate{m: mode.ModeAdmin},
+		Validator:     val,
+	})
+	if err != nil {
+		t.Fatalf("NewReviewer: %v", err)
+	}
+
+	res, err := r.Review(context.Background(), usecase.ReviewInput{
+		Ref: git.PRRef{Project: "proj", Number: 9}, ExpectedProjectID: "proj", ExpectedFileName: "prod",
+	})
+	if err != nil {
+		t.Fatalf("Review: %v", err)
+	}
+
+	if len(res.PerKey) != 2 {
+		t.Fatalf("PerKey len = %d, want 2 (%+v)", len(res.PerKey), res.PerKey)
+	}
+	// File order preserved.
+	if res.PerKey[0].Key != "DATABASE_URL" || res.PerKey[1].Key != "API_TOKEN" {
+		t.Fatalf("PerKey order not preserved: %+v", res.PerKey)
+	}
+	// Per-key action.
+	if res.PerKey[0].Action != "add" || res.PerKey[1].Action != "replace" {
+		t.Fatalf("PerKey actions wrong: %+v", res.PerKey)
+	}
+	// Per-key validation: DATABASE_URL ok, API_TOKEN fails.
+	if !res.PerKey[0].ValidationOK {
+		t.Errorf("DATABASE_URL should validate OK")
+	}
+	if res.PerKey[1].ValidationOK {
+		t.Errorf("API_TOKEN should fail validation")
+	}
+	if res.PerKey[1].ValidationMsg == "" {
+		t.Errorf("a failed key must carry a validation message")
+	}
+	if val.calls != 2 {
+		t.Errorf("validator should run once per key, got %d", val.calls)
+	}
+	// The validation message must never leak the plaintext value.
+	for _, line := range res.PerKey {
+		if strings.Contains(line.ValidationMsg, "tok-BAD-value") || strings.Contains(line.ValidationMsg, "postgres://ok") {
+			t.Fatalf("validation message leaked plaintext: %q", line.ValidationMsg)
+		}
+	}
+}
+
+// A v1 single-key PR still produces a one-element PerKey view (back-compat),
+// and the legacy scalar Action/Key fields remain populated.
+func TestReview_V1_PerKeyView_OneElement(t *testing.T) {
+	t.Parallel()
+
+	wantArt := artifact.Signed{
+		Values: map[string]artifact.EncryptedValue{"API_KEY": "ct"},
+		Byreis: artifact.Metadata{FormatVersion: "byreis.native.v1", ProjectID: "proj", File: "prod", Counter: 1},
+	}
+	dec := &stubDecryptor{out: map[string]string{"API_KEY": "s3cr3t"}}
+	g := &stubGit{sub: git.Submission{
+		Ref:           git.PRRef{Project: "proj", Number: 3},
+		ArtifactBytes: []byte("byreis:\n"),
+		ArtifactSHA:   "pin",
+		Meta:          git.SubmissionMeta{SchemaVersion: 1, SecretsPath: "secrets/prod.yaml", Key: "API_KEY", Action: "add"}, //nolint:gosec // G101 false positive: key NAME
+	}}
+	id, _ := newTestIdentity(t)
+	r, _ := usecase.NewReviewer(usecase.ReviewDeps{
+		Git:           g,
+		Decryptor:     dec,
+		IDLoader:      &stubIDLoader{id: id},
+		ArtifactCodec: &stubCodec{signed: wantArt},
+		Mode:          modeGate{m: mode.ModeAdmin},
+	})
+	res, err := r.Review(context.Background(), usecase.ReviewInput{
+		Ref: git.PRRef{Project: "proj", Number: 3}, ExpectedProjectID: "proj", ExpectedFileName: "prod",
+	})
+	if err != nil {
+		t.Fatalf("Review: %v", err)
+	}
+	if len(res.PerKey) != 1 || res.PerKey[0].Key != "API_KEY" || res.PerKey[0].Action != "add" {
+		t.Fatalf("v1 PerKey = %+v, want one {API_KEY add}", res.PerKey)
+	}
+	// With no validator wired, a key is reported OK (not asserted).
+	if !res.PerKey[0].ValidationOK {
+		t.Errorf("with no validator wired, key should report OK")
+	}
+	// Legacy scalar fields remain populated for back-compat.
+	if res.Action != "add" || res.Key != "API_KEY" {
+		t.Errorf("legacy scalar fields: action=%q key=%q", res.Action, res.Key)
+	}
+}

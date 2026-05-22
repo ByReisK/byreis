@@ -1187,6 +1187,16 @@ func collapseLineBreaks(s string) string {
 	}, s)
 }
 
+// zeroizePlaintext replaces every plaintext value string in the map with zero
+// bytes before the map is discarded. Go strings are immutable, so this assigns
+// a new zero-filled string rather than zeroing the backing array. The caller
+// must not read from the map after calling this.
+func zeroizePlaintext(m map[string]string) {
+	for k := range m {
+		m[k] = strings.Repeat("\x00", len(m[k]))
+	}
+}
+
 // Ensure parsePRRef and related helpers are only used at the CLI boundary.
 // Compile-time import check: errors and strconv must be used.
 var _ = errors.New

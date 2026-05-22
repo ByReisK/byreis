@@ -13,7 +13,7 @@ LDFLAGS      := -X $(MODULE)/pkg/byreis.Version=$(VERSION)
 GOLANGCI     := golangci-lint
 GO_TEST_FLAGS := -race -timeout=120s
 
-.PHONY: build test test-testhook test-shipgate test-docgate lint install clean check-allowlist check-publish-boundary ci-parity ci-parity-windows-build
+.PHONY: build test test-testhook test-shipgate test-docgate test-composability lint install clean check-allowlist check-publish-boundary ci-parity ci-parity-windows-build
 
 ## build: compile the byreis binary to ./bin/byreis
 build:
@@ -40,6 +40,13 @@ test-shipgate:
 test-docgate:
 	go test $(GO_TEST_FLAGS) -tags docgate -run 'TestForwardSecrecyWarning_VerbatimMatch|TestForwardSecrecyWarning_RunbookPathReferenceIntact|TestReleaseWorkflow_DocgateGateWiringIntact' ./internal/core/usecase/rotate/
 	go test $(GO_TEST_FLAGS) -tags docgate -run 'TestV5R4aCLI_RotateRemoveDryRunEmitsVerbatimForwardSecrecyWarning|TestV5R4aCLI_RotateRemoveNonDryRunEmitsVerbatimForwardSecrecyWarning|TestDocGate_RequestAccessHelp_VerbatimHonestyContract|TestDocGate_RequestAccessAdminWarning_VerbatimEmitted|TestR4b_DoctorRotationHistory_VerbatimFixtureMatchesConstant|TestR4b_DoctorRotationHistoryEmitsVerbatimForwardSecrecyWarning|TestR4b_DoctorRotationHistoryNoRemovalsNoWarningExitZero|TestR4b_DoctorRotationHistoryPartialRotationDetected|TestR4b_DoctorRotationHistoryReachableInContributorMode' ./internal/cli/
+
+## test-composability: run the R-005.6 composability scenario (non-release-gating).
+## A red R-005.6 is a v0.2.1 fast-follow obligation and MUST NOT block the v0.2.0 tag.
+## This target is intentionally DISTINCT from test-shipgate and test-docgate and is
+## not included in either of those run sets.
+test-composability:
+	go test $(GO_TEST_FLAGS) -tags composability -run TestR005_6 ./internal/core/usecase/submit/
 
 ## lint: run golangci-lint (enforces Clean Architecture dependency rules)
 lint:

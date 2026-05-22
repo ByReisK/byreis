@@ -554,3 +554,341 @@ func TestSubmit_ContextCancelled(t *testing.T) {
 		t.Fatalf("cancelled context must produce an error")
 	}
 }
+
+// ============================================================================
+// Bulk (multi-pair .env) submit: the fan-in to one encrypt.Encrypt call.
+// ============================================================================
+
+func bulkInput(pairs ...submit.Pair) submit.BulkInput {
+	return submit.BulkInput{ //nolint:gosec // G101 false positive: SecretsPath is a path, not a credential
+		ProjectID:                "myorg/app",
+		LogicalFileName:          "prod",
+		Counter:                  5,
+		Justification:            "bulk import service config",
+		SecretsPath:              "secrets/prod.enc.yaml",
+		BaseFilePath:             "secrets/prod.enc.yaml",
+		Pairs:                    pairs,
+		IrreversibleAcknowledged: true,
+	}
+}
+
+// ---- happy path: N pairs fan into ONE PR / ONE encrypt / ONE branch ----
+
+func TestSubmitBulk_HappyPath_FansInToOnePR(t *testing.T) {
+	t.Parallel()
+	git := &fakeGit{}
+	res := &recordingResume{}
+	probe := &fakeKeyProbe{exists: false}
+	s := newSUT(t, submit.Deps{Git: git, Resume: res, KeyProbe: probe})
+
+	out, err := s.SubmitBulk(context.Background(), bulkInput(
+		submit.Pair{Key: "DATABASE_URL", Value: "postgres://localhost"},
+		submit.Pair{Key: "API_TOKEN", Value: "tok-abc"},
+	))
+	if err != nil {
+		t.Fatalf("SubmitBulk: %v", err)
+	}
+	if git.openCalls != 1 {
+		t.Fatalf("bulk must open exactly ONE PR, got %d", git.openCalls)
+	}
+	// One bulk branch, file-scoped (not key-scoped).
+	if !strings.HasPrefix(git.lastOpen.Branch, "byreis/bulk-2keys-") {
+		t.Fatalf("branch = %q, want byreis/bulk-2keys-<ts>", git.lastOpen.Branch)
+	}
+	// ONE artifact carries BOTH encrypted values.
+	if len(git.lastOpen.Artifact.Values) != 2 {
+		t.Fatalf("bulk artifact must carry both values, got %d", len(git.lastOpen.Artifact.Values))
+	}
+	// ONE resume record for the whole bulk submission.
+	res.mu.Lock()
+	nSaved := len(res.saved)
+	res.mu.Unlock()
+	if nSaved != 1 {
+		t.Fatalf("bulk must persist exactly ONE resume record, got %d", nSaved)
+	}
+	if len(out.PerKey) != 2 {
+		t.Fatalf("result PerKey len = %d, want 2", len(out.PerKey))
+	}
+	// File order preserved end to end.
+	if out.PerKey[0].Key != "DATABASE_URL" || out.PerKey[1].Key != "API_TOKEN" {
+		t.Fatalf("bulk result order not preserved: %+v", out.PerKey)
+	}
+}
+
+// ---- 1-pair --file takes the SAME bulk path (no single-key special case) ----
+
+func TestSubmitBulk_SinglePair_TakesBulkPath(t *testing.T) {
+	t.Parallel()
+	git := &fakeGit{}
+	s := newSUT(t, submit.Deps{Git: git})
+	out, err := s.SubmitBulk(context.Background(), bulkInput(
+		submit.Pair{Key: "ONLY_KEY", Value: "v"},
+	))
+	if err != nil {
+		t.Fatalf("SubmitBulk(1 pair): %v", err)
+	}
+	if !strings.HasPrefix(git.lastOpen.Branch, "byreis/bulk-1keys-") {
+		t.Fatalf("1-pair bulk branch = %q, want byreis/bulk-1keys-<ts>", git.lastOpen.Branch)
+	}
+	if len(out.PerKey) != 1 {
+		t.Fatalf("1-pair bulk PerKey len = %d, want 1", len(out.PerKey))
+	}
+}
+
+// ---- per-value AEAD freshness preserved on the bulk path ----
+
+func TestSubmitBulk_IdenticalPlaintexts_DistinctCiphertexts(t *testing.T) {
+	t.Parallel()
+	git := &fakeGit{}
+	s := newSUT(t, submit.Deps{Git: git})
+	const same = "identical-secret-value"
+	_, err := s.SubmitBulk(context.Background(), bulkInput(
+		submit.Pair{Key: "K1", Value: same},
+		submit.Pair{Key: "K2", Value: same},
+	))
+	if err != nil {
+		t.Fatalf("SubmitBulk: %v", err)
+	}
+	v1 := string(git.lastOpen.Artifact.Values["K1"])
+	v2 := string(git.lastOpen.Artifact.Values["K2"])
+	if v1 == "" || v2 == "" {
+		t.Fatalf("missing ciphertext: K1=%q K2=%q", v1, v2)
+	}
+	if v1 == v2 {
+		t.Fatalf("identical plaintexts must produce DISTINCT ciphertexts (fresh age.Encrypt per value)")
+	}
+}
+
+// ---- atomicity: ANY invalid pair refuses BEFORE any side effect ----
+
+func TestSubmitBulk_AnyInvalidPair_NoSideEffect(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		val  fakeValidator
+	}{
+		{"invalid value", fakeValidator{valErr: errors.New("bad value")}},
+		{"invalid key name", fakeValidator{keyErr: errors.New("bad key name")}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			git := &fakeGit{}
+			res := &recordingResume{}
+			s := newSUT(t, submit.Deps{Validator: tc.val, Git: git, Resume: res})
+
+			_, err := s.SubmitBulk(context.Background(), bulkInput(
+				submit.Pair{Key: "GOOD", Value: "ok"},
+				submit.Pair{Key: "BAD", Value: "boom"},
+			))
+			if !errors.Is(err, submit.ErrInvalidValue) {
+				t.Fatalf("err = %v, want ErrInvalidValue", err)
+			}
+			// Zero git side effect on refusal.
+			if git.openCalls != 0 || git.branchExists {
+				t.Fatalf("atomicity violated: a git side effect happened on an invalid bulk")
+			}
+			res.mu.Lock()
+			nSaved := len(res.saved)
+			res.mu.Unlock()
+			if nSaved != 0 {
+				t.Fatalf("atomicity violated: a resume record was persisted on an invalid bulk")
+			}
+		})
+	}
+}
+
+// ---- a per-pair validation failure refuses BEFORE the branch-exists probe ----
+
+type branchProbeRecorder struct {
+	fakeGit
+	branchChecks int
+}
+
+func (g *branchProbeRecorder) BranchExists(_ context.Context, _, _ string) (bool, error) {
+	g.branchChecks++
+	return false, nil
+}
+
+func TestSubmitBulk_ValidateAllBeforeBranchProbe(t *testing.T) {
+	t.Parallel()
+	git := &branchProbeRecorder{}
+	s := newSUT(t, submit.Deps{
+		Validator: fakeValidator{valErr: errors.New("bad")},
+		Git:       git,
+	})
+	_, err := s.SubmitBulk(context.Background(), bulkInput(
+		submit.Pair{Key: "K", Value: "v"},
+	))
+	if !errors.Is(err, submit.ErrInvalidValue) {
+		t.Fatalf("err = %v, want ErrInvalidValue", err)
+	}
+	if git.branchChecks != 0 {
+		t.Fatalf("BranchExists must NOT be probed when a pair fails validation (calls=%d)", git.branchChecks)
+	}
+}
+
+// ---- per-key ADD/REPLACE via the name-only probe; bulk may be mixed ----
+
+type perKeyProbe struct {
+	existing map[string]bool
+	calls    int
+}
+
+func (p *perKeyProbe) KeyExists(_ context.Context, _, _, key string) (bool, error) {
+	p.calls++
+	return p.existing[key], nil
+}
+
+func TestSubmitBulk_MixedAddReplace_NameOnly(t *testing.T) {
+	t.Parallel()
+	git := &fakeGit{}
+	probe := &perKeyProbe{existing: map[string]bool{"EXISTING": true}}
+	s := newSUT(t, submit.Deps{Git: git, KeyProbe: probe})
+
+	out, err := s.SubmitBulk(context.Background(), bulkInput(
+		submit.Pair{Key: "NEW_KEY", Value: "v1"},
+		submit.Pair{Key: "EXISTING", Value: "v2"},
+	))
+	if err != nil {
+		t.Fatalf("SubmitBulk: %v", err)
+	}
+	actionByKey := map[string]submit.SubmitAction{}
+	for _, line := range out.PerKey {
+		actionByKey[line.Key] = line.Action
+	}
+	if actionByKey["NEW_KEY"] != submit.ActionAdd {
+		t.Errorf("NEW_KEY action = %v, want add", actionByKey["NEW_KEY"])
+	}
+	if actionByKey["EXISTING"] != submit.ActionReplace {
+		t.Errorf("EXISTING action = %v, want replace", actionByKey["EXISTING"])
+	}
+	if probe.calls != 2 {
+		t.Errorf("name-only probe should run once per key, got %d", probe.calls)
+	}
+}
+
+// ---- bulk branch conflict REFUSES (reuses the conflict guard) ----
+
+func TestSubmitBulk_BranchConflict_Refuses(t *testing.T) {
+	t.Parallel()
+	git := &fakeGit{branchExists: true}
+	s := newSUT(t, submit.Deps{Git: git})
+	_, err := s.SubmitBulk(context.Background(), bulkInput(
+		submit.Pair{Key: "K", Value: "v"},
+	))
+	if !errors.Is(err, submit.ErrBranchConflict) {
+		t.Fatalf("err = %v, want ErrBranchConflict", err)
+	}
+	if git.openCalls != 0 {
+		t.Fatalf("must not open a PR when the bulk branch already exists")
+	}
+}
+
+// ---- empty bulk refuses with no side effect ----
+
+func TestSubmitBulk_NoPairs_Refuses(t *testing.T) {
+	t.Parallel()
+	git := &fakeGit{}
+	s := newSUT(t, submit.Deps{Git: git})
+	_, err := s.SubmitBulk(context.Background(), bulkInput())
+	if err == nil {
+		t.Fatalf("empty bulk must refuse")
+	}
+	if git.openCalls != 0 {
+		t.Fatalf("empty bulk must not open a PR")
+	}
+}
+
+// ---- BO-V9-2 / QA-C3 analogue: the bulk compose path reaches NO decrypt /
+// identity code. The Deps surface has no decryptor/identity port at all, and
+// the only value-bearing field persisted is the UNSIGNED encrypted artifact;
+// the companion allowlist_test.go proves crypto/identity & crypto/decrypt are
+// unreachable from this package's transitive set. ADD/REPLACE is name-only.
+func TestSubmitBulk_NoLiveWrite_NoDecrypt(t *testing.T) {
+	t.Parallel()
+	const s1 = "plaintext-one-never-persisted"
+	const s2 = "plaintext-two-never-persisted"
+	git := &fakeGit{}
+	res := &recordingResume{}
+	probe := &perKeyProbe{existing: map[string]bool{"REPLACED": true}}
+	s := newSUT(t, submit.Deps{Git: git, Resume: res, KeyProbe: probe})
+
+	if _, err := s.SubmitBulk(context.Background(), bulkInput(
+		submit.Pair{Key: "ADDED", Value: s1},
+		submit.Pair{Key: "REPLACED", Value: s2},
+	)); err != nil {
+		t.Fatalf("SubmitBulk: %v", err)
+	}
+
+	// The use-case has NO live-file writer and NO decryptor port: the only git
+	// operation is OpenSubmissionPR on a NEW bulk branch. A REPLACE is detected
+	// by NAME only and never decrypts the live value.
+	if git.openCalls != 1 {
+		t.Fatalf("bulk must open exactly one submission PR")
+	}
+	// Only the encrypted artifact is persisted; no plaintext leaks into it.
+	res.mu.Lock()
+	defer res.mu.Unlock()
+	if len(res.saved) != 1 {
+		t.Fatalf("want exactly one persisted record, got %d", len(res.saved))
+	}
+	for k, v := range res.saved[0].Artifact.Values {
+		if strings.Contains(string(v), s1) || strings.Contains(string(v), s2) {
+			t.Fatalf("plaintext leaked into persisted ciphertext for key %q", k)
+		}
+	}
+	// The persisted artifact is statically artifact.Unsigned (no signature
+	// field), and is handed to git as such.
+	assertUnsigned(git.lastOpen.Artifact)
+}
+
+// ---- duplicate key WITHIN one bulk refuses (defense-in-depth past the parser) ----
+
+func TestSubmitBulk_DuplicateKey_Refuses(t *testing.T) {
+	t.Parallel()
+	git := &fakeGit{}
+	s := newSUT(t, submit.Deps{Git: git})
+	_, err := s.SubmitBulk(context.Background(), bulkInput(
+		submit.Pair{Key: "DUP", Value: "a"},
+		submit.Pair{Key: "DUP", Value: "b"},
+	))
+	if err == nil {
+		t.Fatalf("a duplicate key within a bulk must refuse")
+	}
+	if git.openCalls != 0 {
+		t.Fatalf("duplicate-key bulk must not open a PR")
+	}
+}
+
+// ---- bulk ceiling: more than 100 pairs refuses with no side effect ----
+
+func TestSubmitBulk_OverCeiling_Refuses(t *testing.T) {
+	t.Parallel()
+	git := &fakeGit{}
+	s := newSUT(t, submit.Deps{Git: git})
+	pairs := make([]submit.Pair, 101)
+	for i := range pairs {
+		pairs[i] = submit.Pair{Key: "K" + itoa(i), Value: "v"}
+	}
+	in := bulkInput(pairs...)
+	_, err := s.SubmitBulk(context.Background(), in)
+	if err == nil {
+		t.Fatalf("over-ceiling bulk must refuse")
+	}
+	if git.openCalls != 0 {
+		t.Fatalf("over-ceiling bulk must not open a PR")
+	}
+}
+
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	var d []byte
+	for n > 0 {
+		d = append([]byte{byte('0' + n%10)}, d...)
+		n /= 10
+	}
+	return string(d)
+}

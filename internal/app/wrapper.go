@@ -193,10 +193,36 @@ func (s *SubmitGitPort) BranchExists(_ context.Context, _ string, _ string) (boo
 // delegates to the wrapped GitProvider. It maps github.ErrBranchConflict
 // (returned when the branch already exists on the remote) to
 // submit.ErrBranchTaken so the submit use-case's concurrency guard triggers.
+//
+// For a bulk submission (in.Keys non-nil and non-empty) the domain-layer
+// KeyAction slice is mapped to coregit.KeyAction and passed through; the
+// github adapter then emits schema_version 2 in the PR body. The PR title is
+// "[byreis] bulk: N keys" for a bulk submission and the legacy
+// "[byreis] add|replace: key" for a single-key submission.
 func (s *SubmitGitPort) OpenSubmissionPR(ctx context.Context, in submit.OpenPRInput) (submit.OpenedPR, error) {
 	b, err := s.encoder.EncodeUnsigned(in)
 	if err != nil {
 		return submit.OpenedPR{}, fmt.Errorf("encoding submission artifact: %w", err)
+	}
+
+	// Map submit.OpenPRKey → coregit.KeyAction for the bulk path; nil for
+	// single-key so the github adapter chooses the v1 schema.
+	var coreKeys []coregit.KeyAction
+	if len(in.Keys) > 0 {
+		coreKeys = make([]coregit.KeyAction, len(in.Keys))
+		for i, k := range in.Keys {
+			coreKeys[i] = coregit.KeyAction{
+				Key:    k.Key,
+				Action: k.Action.String(),
+			}
+		}
+	}
+
+	// Choose the PR title: bulk submissions name the count; single-key uses
+	// the legacy format the original v0.1 submission surface used.
+	title := fmt.Sprintf("[byreis] %s: %s", in.Action.String(), in.Key)
+	if len(coreKeys) > 0 {
+		title = fmt.Sprintf("[byreis] bulk: %d keys", len(coreKeys))
 	}
 
 	pr, err := s.provider.OpenSubmissionPR(ctx, coregit.OpenPRInput{
@@ -204,11 +230,12 @@ func (s *SubmitGitPort) OpenSubmissionPR(ctx context.Context, in submit.OpenPRIn
 		Branch:        in.Branch,
 		Key:           in.Key,
 		Action:        coregit.SubmitAction(in.Action),
+		Keys:          coreKeys,
 		SecretsPath:   in.SecretsPath,
 		BaseFilePath:  in.BaseFilePath,
 		Justification: in.Justification,
 		ArtifactBytes: b,
-		TitleTemplate: fmt.Sprintf("[byreis] %s: %s", in.Action.String(), in.Key),
+		TitleTemplate: title,
 	})
 	if err != nil {
 		// Map ErrBranchConflict → submit.ErrBranchTaken so the submit use-case's concurrency guard triggers.

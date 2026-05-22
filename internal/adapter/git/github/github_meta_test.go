@@ -479,3 +479,113 @@ func TestOpenSubmissionPR_WritesMetaBlock(t *testing.T) {
 		t.Errorf("meta.SchemaVersion: got %d, want 1", meta.SchemaVersion)
 	}
 }
+
+// TestOpenSubmissionPR_BulkKeysWritesV2Meta verifies that OpenSubmissionPR
+// emits a schema_version 2 block in the PR body when the input carries a
+// non-empty Keys slice (bulk submission). The emitted block must be parseable
+// by ParseSubmissionMeta as v2 and the round-trip must preserve key order and
+// per-key actions.
+func TestOpenSubmissionPR_BulkKeysWritesV2Meta(t *testing.T) {
+	t.Parallel()
+
+	mux := http.NewServeMux()
+	artifactBytes := fakeArtifactBytes()
+
+	mux.HandleFunc("/repos/myorg/my-secrets/git/ref/heads/main", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, ghsdk.Reference{
+			Ref:    ptr("refs/heads/main"),
+			Object: &ghsdk.GitObject{SHA: ptr("baseSHAbulk"), Type: ptr("commit")},
+		})
+	})
+	mux.HandleFunc("/repos/myorg/my-secrets/git/refs", func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		ref, _ := body["ref"].(string)
+		w.WriteHeader(http.StatusCreated)
+		writeJSON(w, ghsdk.Reference{Ref: &ref, Object: &ghsdk.GitObject{SHA: ptr("baseSHAbulk")}})
+	})
+	mux.HandleFunc("/repos/myorg/my-secrets/contents/", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			http.Error(w, "not found", http.StatusNotFound)
+		case http.MethodPut:
+			w.WriteHeader(http.StatusCreated)
+			writeJSON(w, ghsdk.RepositoryContentResponse{
+				Content: &ghsdk.RepositoryContent{SHA: ptr("fBulk"), Path: ptr("submissions/bulk-2keys-100.yaml")},
+				Commit:  ghsdk.Commit{SHA: ptr("cBulk")},
+			})
+		}
+	})
+
+	var capturedPRBody string
+	mux.HandleFunc("/repos/myorg/my-secrets/pulls", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Body string `json:"body"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		capturedPRBody = body.Body
+		w.WriteHeader(http.StatusCreated)
+		writeJSON(w, ghsdk.PullRequest{
+			Number:  ptr(99),
+			HTMLURL: ptr("https://github.com/myorg/my-secrets/pull/99"),
+			Head:    &ghsdk.PullRequestBranch{Ref: ptr("byreis/bulk-2keys-100")},
+		})
+	})
+
+	client := testSetupMeta(t, mux)
+	p, err := githubadapter.NewWithClient(client, "myorg/my-secrets", "main", "submissions")
+	if err != nil {
+		t.Fatalf("NewWithClient: %v", err)
+	}
+
+	_, prErr := p.OpenSubmissionPR(context.Background(), coregit.OpenPRInput{
+		Project:       "myorg/my-secrets",
+		Branch:        "byreis/bulk-2keys-100",
+		ArtifactBytes: artifactBytes,
+		TitleTemplate: "[byreis] bulk: 2 keys",
+		Justification: "bulk submission",
+		SecretsPath:   "secrets/prod.yaml",
+		Keys: []coregit.KeyAction{
+			{Key: "DB_HOST", Action: "add"},
+			{Key: "DB_PASS", Action: "replace"},
+		},
+	})
+	if prErr != nil {
+		t.Fatalf("OpenSubmissionPR with Keys (bulk v2): %v", prErr)
+	}
+
+	// The PR body must contain a parseable v2 byreis-submission block.
+	if !strings.Contains(capturedPRBody, "```byreis-submission") {
+		t.Errorf("PR body must contain byreis-submission block, got: %q", capturedPRBody)
+	}
+
+	meta, parseErr := coregit.ParseSubmissionMeta(capturedPRBody)
+	if parseErr != nil {
+		t.Fatalf("PR body contains unparseable meta block: %v\nbody: %q", parseErr, capturedPRBody)
+	}
+
+	// Verify schema_version 2 was emitted.
+	if meta.SchemaVersion != 2 {
+		t.Errorf("bulk submission must emit schema_version 2, got %d", meta.SchemaVersion)
+	}
+
+	// Verify NormalisedKeys round-trips correctly.
+	nk := meta.NormalisedKeys()
+	if len(nk) != 2 {
+		t.Fatalf("expected 2 normalised keys, got %d", len(nk))
+	}
+	if nk[0].Key != "DB_HOST" || nk[0].Action != "add" {
+		t.Errorf("nk[0]: got {%q %q}, want {DB_HOST add}", nk[0].Key, nk[0].Action)
+	}
+	if nk[1].Key != "DB_PASS" || nk[1].Action != "replace" {
+		t.Errorf("nk[1]: got {%q %q}, want {DB_PASS replace}", nk[1].Key, nk[1].Action)
+	}
+
+	// Verify scalar key/action fields are empty (v2 must not emit them).
+	if meta.Key != "" {
+		t.Errorf("v2 block must not carry scalar Key, got %q", meta.Key)
+	}
+	if meta.Action != "" {
+		t.Errorf("v2 block must not carry scalar Action, got %q", meta.Action)
+	}
+}

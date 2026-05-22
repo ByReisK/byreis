@@ -9,6 +9,7 @@ import (
 	"github.com/ByReisK/byreis/internal/core/mode"
 	"github.com/ByReisK/byreis/internal/core/usecase"
 	"github.com/ByReisK/byreis/internal/core/usecase/rotate"
+	"github.com/ByReisK/byreis/internal/core/usecase/submit"
 )
 
 // Deps bundles all injected use-case dependencies for the CLI command tree.
@@ -94,6 +95,16 @@ type Deps struct {
 	// It is wired at BuildProductionDeps when BYREIS_GITHUB_TOKEN is set.
 	// Tests inject a fake that returns canned RequestAccessFile + PRMetadata.
 	RequestAccessReader rotate.RequestAccessReader
+
+	// Submitter is the contributor Submit use-case. Narrow interface:
+	// submit.Submitter. May be nil when adapters are not yet wired; the submit
+	// command will return a "not configured" error in that case.
+	Submitter submit.Submitter
+
+	// Reviewer is the admin Review use-case. Narrow interface:
+	// usecase.Reviewer. May be nil when adapters are not yet wired; the review
+	// command will return a "not configured" error in that case.
+	Reviewer usecase.Reviewer
 
 	// AuditReader is the narrow read-only port the `admin audit show` command
 	// uses to fetch the registry audit log for one project. It is wired to

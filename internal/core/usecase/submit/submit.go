@@ -37,6 +37,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/ByReisK/byreis/internal/core/audit"
@@ -118,7 +119,32 @@ var (
 		"refusing to submit: a submission branch/PR for this key already " +
 			"exists from another in-flight submission — resolve or close it, " +
 			"then retry; byreis will not overwrite another submission's branch")
+
+	// ErrNoPairs is returned when a bulk submission carries zero key/value
+	// pairs. There is nothing to submit.
+	ErrNoPairs = errors.New(
+		"refusing to submit: the bulk submission contains no key/value pairs")
+
+	// ErrDuplicateKey is returned when the same key appears more than once in a
+	// single bulk submission. The whole submission is refused so a value is
+	// never silently dropped to a last-wins overwrite. This is a defense-in-depth
+	// guard at the use-case boundary; the file parser enforces the same rule.
+	ErrDuplicateKey = errors.New(
+		"refusing to submit: a key appears more than once in the bulk " +
+			"submission — resolve the duplicate so it is unambiguous which value " +
+			"to submit")
+
+	// ErrTooManyPairs is returned when a bulk submission exceeds the hard pair
+	// ceiling. The whole submission is refused.
+	ErrTooManyPairs = errors.New(
+		"refusing to submit: too many key/value pairs in one bulk submission")
 )
+
+// maxBulkPairs is the hard ceiling on the number of key/value pairs one bulk
+// submission may carry. It mirrors the file parser's ceiling and is re-enforced
+// here so the use-case never composes an unbounded artifact regardless of how
+// its caller assembled the pairs.
+const maxBulkPairs = 100
 
 // Recipients is a resolved, trust-tagged admin recipient set. It is produced
 // only by a RecipientSource backed by a signature-verified registry fetch.
@@ -176,13 +202,26 @@ type KeyExistenceProbe interface {
 type OpenPRInput struct {
 	ProjectID       string
 	LogicalFileName string
-	Key             string
-	Action          SubmitAction
-	Branch          string
-	SecretsPath     string
-	BaseFilePath    string
-	Justification   string
-	Artifact        artifact.Unsigned
+	// Key and Action describe a single-key submission. For a bulk submission
+	// they are empty/zero and Keys carries the per-key set instead.
+	Key    string
+	Action SubmitAction
+	// Keys is the ordered per-key set of a bulk submission, in file order. It is
+	// nil for a single-key submission. The git adapter encodes it as a
+	// schema_version 2 byreis-submission block; a single-key submission with a
+	// nil Keys uses the schema_version 1 scalar block.
+	Keys          []OpenPRKey
+	Branch        string
+	SecretsPath   string
+	BaseFilePath  string
+	Justification string
+	Artifact      artifact.Unsigned
+}
+
+// OpenPRKey is one key entry of a bulk OpenPRInput, in file order.
+type OpenPRKey struct {
+	Key    string
+	Action SubmitAction
 }
 
 // PRRef identifies the opened pull request.
@@ -225,12 +264,17 @@ var ErrBranchTaken = errors.New("submission branch already exists on remote")
 type PendingSubmission struct {
 	ProjectID       string
 	LogicalFileName string
-	Key             string
-	Action          SubmitAction
-	Branch          string
-	SecretsPath     string
-	BaseFilePath    string
-	Justification   string
+	// Key and Action describe a single-key pending submission. For a bulk
+	// pending submission they are empty/zero and Keys carries the per-key set.
+	Key    string
+	Action SubmitAction
+	// Keys is the ordered per-key set of a bulk pending submission, in file
+	// order; nil for a single-key submission.
+	Keys          []OpenPRKey
+	Branch        string
+	SecretsPath   string
+	BaseFilePath  string
+	Justification string
 	// Artifact is the UNSIGNED, already-encrypted artifact. There is no
 	// plaintext field on this type by construction.
 	Artifact artifact.Unsigned
@@ -321,6 +365,66 @@ type Result struct {
 	Action      SubmitAction
 }
 
+// Pair is one key/value entry of a bulk submission, in file order. Value is the
+// plaintext to encrypt; it is encrypted into its own independent ciphertext and
+// is never persisted in plaintext.
+type Pair struct {
+	Key   string
+	Value string
+}
+
+// BulkInput carries all inputs for a multi-pair (bulk) submission. The pairs
+// arrive already parsed (e.g. from a .env file) in file order; the single-pair
+// case takes this same path with a one-element Pairs slice. Recipients are
+// resolved internally from the RecipientSource (SourceVerified only); callers
+// never pass recipients in.
+type BulkInput struct {
+	// ProjectID and LogicalFileName are bound into the signed manifest so an
+	// artifact cannot be replayed under a different project or file identity.
+	ProjectID       string
+	LogicalFileName string
+
+	// Counter is the claimed counter. The registry is the acceptance authority.
+	Counter uint64
+
+	// Justification is included in the PR body. Never a secret value.
+	Justification string
+
+	// SecretsPath is the repo-relative target path of the signed file-of-record.
+	// A bulk submission targets ONE secrets_path for all of its keys.
+	SecretsPath  string
+	BaseFilePath string
+
+	// Pairs is the ordered set of key/value entries. Order is preserved end to
+	// end. The values are plaintext to encrypt.
+	Pairs []Pair
+
+	// IrreversibleAcknowledged records that the operator acknowledged the
+	// submission cannot be read back by a contributor. The bulk path takes its
+	// values from a file the operator supplied, so the CLI sets this from the
+	// invocation; it is required to be true before anything is sent.
+	IrreversibleAcknowledged bool
+}
+
+// BulkKeyResult is the per-key outcome of a bulk submission, in file order.
+type BulkKeyResult struct {
+	// Key is the submitted key name.
+	Key string
+	// Action is the name-only ADD vs REPLACE classification for this key.
+	Action SubmitAction
+}
+
+// BulkResult is returned by a successful SubmitBulk call. A single PR, branch,
+// and artifact carry all of the keys.
+type BulkResult struct {
+	PRRef       PRRef
+	PRURL       string
+	Branch      string
+	ArtifactSHA string
+	// PerKey is the ordered per-key outcome, in file order.
+	PerKey []BulkKeyResult
+}
+
 // Submitter is the consumer-defined interface for the Submit use-case. It lives
 // here, in the consumer sub-package, per the Clean Architecture
 // consumer-defines-interface rule.
@@ -331,6 +435,14 @@ type Submitter interface {
 	// and never touches identity material (enforced by the import allowlist
 	// gate on this package's transitive set).
 	Submit(ctx context.Context, in Input) (Result, error)
+
+	// SubmitBulk validates EVERY pair before any side effect, resolves the
+	// SourceVerified admin recipient set once, encrypts all values in ONE
+	// Encrypt call (one fresh ciphertext per value), classifies each key
+	// ADD-vs-REPLACE by NAME only, and opens ONE contributor PR on ONE bulk
+	// branch. It never decrypts and never touches identity material. The
+	// single-pair case takes this same path.
+	SubmitBulk(ctx context.Context, in BulkInput) (BulkResult, error)
 }
 
 // Deps bundles the injected ports. Constructor injection only — no globals.
@@ -375,6 +487,12 @@ func New(d Deps) (Submitter, error) {
 // branchName builds the submission branch: byreis/<add|replace>-<key>-<unix>.
 func branchName(action SubmitAction, key string, now time.Time) string {
 	return fmt.Sprintf("byreis/%s-%s-%d", action.String(), key, now.UTC().Unix())
+}
+
+// bulkBranchName builds the bulk submission branch: byreis/bulk-<N>keys-<unix>.
+// It is file-scoped (one branch for the whole submission), not key-scoped.
+func bulkBranchName(n int, now time.Time) string {
+	return fmt.Sprintf("byreis/bulk-%dkeys-%d", n, now.UTC().Unix())
 }
 
 // Submit is the keyless contributor spine. Ordering is security-critical:
@@ -547,6 +665,195 @@ func (s *submitUseCase) Submit(ctx context.Context, in Input) (Result, error) {
 		Branch:      opened.Branch,
 		ArtifactSHA: opened.ArtifactSHA,
 		Action:      action,
+	}, nil
+}
+
+// SubmitBulk is the keyless contributor spine for a multi-pair submission. It
+// is the SAME path for one pair or many; there is no single-key special case.
+// Ordering is security-critical and atomicity is mandatory:
+//
+//  1. Reject an empty set, a duplicate key, or an over-ceiling set up front.
+//  2. Validate EVERY pair's key name and value BEFORE any side effect. If ANY
+//     pair fails, refuse with ErrInvalidValue and create no branch, commit, or
+//     PR and persist no resume record (no git side effect on refusal).
+//  3. Require the irreversibility acknowledgement.
+//  4. Resolve the admin recipient set from a SourceVerified registry fetch
+//     ONLY; a stale/unverified set REFUSES (never falls back).
+//  5. Classify each key ADD vs REPLACE by NAME only (no decrypt, no identity).
+//  6. Encrypt ALL values in ONE Encrypt call (one fresh ciphertext per value).
+//  7. Persist ONE encrypted-at-rest resume record (never plaintext).
+//  8. Conflict-guard ONE bulk branch, then open ONE PR. A conflict REFUSES.
+//
+// No private key is ever touched or derived.
+func (s *submitUseCase) SubmitBulk(ctx context.Context, in BulkInput) (BulkResult, error) {
+	if err := ctx.Err(); err != nil {
+		return BulkResult{}, fmt.Errorf("submit cancelled: %w", err)
+	}
+
+	// (1) Structural guards on the pair set itself.
+	if len(in.Pairs) == 0 {
+		return BulkResult{}, ErrNoPairs
+	}
+	if len(in.Pairs) > maxBulkPairs {
+		return BulkResult{}, fmt.Errorf("%w: %d pairs exceeds the limit of %d — "+
+			"split into multiple submissions", ErrTooManyPairs, len(in.Pairs), maxBulkPairs)
+	}
+	seen := make(map[string]struct{}, len(in.Pairs))
+	for _, p := range in.Pairs {
+		if _, dup := seen[p.Key]; dup {
+			return BulkResult{}, fmt.Errorf("%w: key %q", ErrDuplicateKey, p.Key)
+		}
+		seen[p.Key] = struct{}{}
+	}
+
+	// (2) Validate EVERY pair BEFORE any side effect: a single bad pair refuses
+	// the WHOLE submission with nothing written (atomicity). This runs before
+	// recipient resolution, the name-only probe, the branch-exists probe, and
+	// any resume Save or PR open.
+	for _, p := range in.Pairs {
+		if err := s.d.Validator.ValidateKeyName(p.Key); err != nil {
+			return BulkResult{}, fmt.Errorf("%w: key name %q rejected: %v",
+				ErrInvalidValue, p.Key, err)
+		}
+		if err := s.d.Validator.ValidateValue(p.Value); err != nil {
+			return BulkResult{}, fmt.Errorf("%w: value for key %q rejected: %v",
+				ErrInvalidValue, p.Key, err)
+		}
+	}
+
+	// (3) The submission is irreversible for a contributor; require the ack.
+	if !in.IrreversibleAcknowledged {
+		return BulkResult{}, ErrIrreversibleNotAcknowledged
+	}
+
+	// (4) Resolve recipients ONLY from a SourceVerified registry fetch.
+	recips, err := s.d.Recipients.Recipients(ctx, in.ProjectID)
+	if err != nil {
+		return BulkResult{}, fmt.Errorf("resolving admin recipients failed: %w", err)
+	}
+	if len(recips.Set) == 0 {
+		return BulkResult{}, ErrNoRecipients
+	}
+	if !recips.SourceVerified || recips.Stale {
+		return BulkResult{}, ErrRecipientsNotVerified
+	}
+
+	// (5) Classify each key ADD vs REPLACE by NAME only (no decrypt). The bulk
+	// PR may be mixed. Build the encrypt values map at the same time.
+	perKey := make([]BulkKeyResult, 0, len(in.Pairs))
+	openKeys := make([]OpenPRKey, 0, len(in.Pairs))
+	values := make(map[string]string, len(in.Pairs))
+	for _, p := range in.Pairs {
+		exists, kErr := s.d.KeyProbe.KeyExists(ctx, in.ProjectID, in.LogicalFileName, p.Key)
+		if kErr != nil {
+			return BulkResult{}, fmt.Errorf("checking whether key %q already exists failed: %w", p.Key, kErr)
+		}
+		action := ActionAdd
+		if exists {
+			action = ActionReplace
+		}
+		perKey = append(perKey, BulkKeyResult{Key: p.Key, Action: action})
+		openKeys = append(openKeys, OpenPRKey{Key: p.Key, Action: action})
+		values[p.Key] = p.Value
+	}
+
+	// (6) Encrypt ALL values in ONE Encrypt call. The Encryptor produces one
+	// independent fresh age ciphertext per value (AEAD nonce freshness), so two
+	// identical plaintexts yield distinct ciphertexts. No private key is touched.
+	art, err := s.d.Encryptor.Encrypt(ctx, encrypt.EncryptInput{
+		ProjectID:       in.ProjectID,
+		LogicalFileName: in.LogicalFileName,
+		Counter:         in.Counter,
+		Recipients:      recips.Set,
+		Values:          values,
+	})
+	if err != nil {
+		return BulkResult{}, fmt.Errorf("encrypting bulk submission failed: %w", err)
+	}
+
+	branch := bulkBranchName(len(in.Pairs), s.d.Clock.Now())
+
+	// (7) Persist ONE encrypted-at-rest resume record for the whole submission.
+	pending := PendingSubmission{
+		ProjectID:       in.ProjectID,
+		LogicalFileName: in.LogicalFileName,
+		Keys:            openKeys,
+		Branch:          branch,
+		SecretsPath:     in.SecretsPath,
+		BaseFilePath:    in.BaseFilePath,
+		Justification:   in.Justification,
+		Artifact:        art,
+		SavedAt:         s.d.Clock.Now(),
+	}
+	if saveErr := s.d.Resume.Save(ctx, pending); saveErr != nil {
+		return BulkResult{}, fmt.Errorf("persisting resumable bulk submission failed: %w", saveErr)
+	}
+
+	// (8) Concurrent-submission guard on the single bulk branch, then open ONE
+	// PR. A branch conflict REFUSES; a secret is never silently dropped.
+	taken, err := s.d.Git.BranchExists(ctx, in.ProjectID, branch)
+	if err != nil {
+		return BulkResult{}, fmt.Errorf("checking bulk submission branch failed: %w", err)
+	}
+	if taken {
+		return BulkResult{}, ErrBranchConflict
+	}
+
+	opened, err := s.d.Git.OpenSubmissionPR(ctx, OpenPRInput{
+		ProjectID:       in.ProjectID,
+		LogicalFileName: in.LogicalFileName,
+		Keys:            openKeys,
+		Branch:          branch,
+		SecretsPath:     in.SecretsPath,
+		BaseFilePath:    in.BaseFilePath,
+		Justification:   in.Justification,
+		Artifact:        art,
+	})
+	if err != nil {
+		if errors.Is(err, ErrBranchTaken) {
+			return BulkResult{}, ErrBranchConflict
+		}
+		return BulkResult{}, fmt.Errorf("opening bulk submission PR failed: %w", err)
+	}
+
+	// Success: the encrypted resume record is no longer needed. Discard is keyed
+	// on the bulk branch so it does not collide with a single-key record.
+	if dErr := s.d.Resume.Discard(ctx, in.ProjectID, branch); dErr != nil {
+		s.d.Log.Log(ctx, logging.LevelWarn,
+			"bulk submission PR opened but resume record discard failed",
+			"project", in.ProjectID, "branch", branch, "error", dErr.Error())
+	}
+
+	// Audit the bulk submission (no secret material; key names + count only).
+	keyNames := make([]string, 0, len(perKey))
+	for _, k := range perKey {
+		keyNames = append(keyNames, k.Key)
+	}
+	auditErr := s.d.Audit.Append(ctx, audit.Event{
+		Kind:       audit.EventKindSubmit,
+		OccurredAt: s.d.Clock.Now(),
+		ProjectID:  in.ProjectID,
+		FileName:   in.LogicalFileName,
+		KeyName:    strings.Join(keyNames, ","),
+		PRRef:      fmt.Sprintf("%s#%d", opened.Ref.Project, opened.Ref.Number),
+		Outcome:    "ok",
+		Details: map[string]string{
+			"branch":    branch,
+			"key_count": fmt.Sprintf("%d", len(perKey)),
+		},
+	})
+	if auditErr != nil {
+		s.d.Log.Log(ctx, logging.LevelWarn,
+			"bulk submission PR opened but audit append failed",
+			"project", in.ProjectID, "branch", branch, "error", auditErr.Error())
+	}
+
+	return BulkResult{
+		PRRef:       opened.Ref,
+		PRURL:       opened.URL,
+		Branch:      opened.Branch,
+		ArtifactSHA: opened.ArtifactSHA,
+		PerKey:      perKey,
 	}, nil
 }
 

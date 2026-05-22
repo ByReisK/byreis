@@ -169,14 +169,28 @@ func (p *Provider) OpenSubmissionPR(ctx context.Context, in coregit.OpenPRInput)
 	artifactSHA := rawBytesSHA(in.ArtifactBytes)
 
 	// 5. Build the PR body: free-text justification + machine-parseable block.
-	meta := coregit.SubmissionMeta{
-		SchemaVersion: 1,
-		Project:       in.Project,
-		SecretsPath:   in.SecretsPath,
-		BaseFilePath:  in.BaseFilePath,
-		Key:           in.Key,
-		Action:        actionLabel(in.Action),
-		ArtifactSHA:   string(artifactSHA), // informational echo only
+	// Emit schema_version 2 (keys array) for a bulk submission (non-empty Keys);
+	// emit schema_version 1 (scalar key/action) for a single-key submission.
+	var meta coregit.SubmissionMeta
+	if len(in.Keys) > 0 {
+		meta = coregit.SubmissionMeta{
+			SchemaVersion: 2,
+			Project:       in.Project,
+			SecretsPath:   in.SecretsPath,
+			BaseFilePath:  in.BaseFilePath,
+			Keys:          in.Keys,
+			ArtifactSHA:   string(artifactSHA), // informational echo only
+		}
+	} else {
+		meta = coregit.SubmissionMeta{
+			SchemaVersion: 1,
+			Project:       in.Project,
+			SecretsPath:   in.SecretsPath,
+			BaseFilePath:  in.BaseFilePath,
+			Key:           in.Key,
+			Action:        actionLabel(in.Action),
+			ArtifactSHA:   string(artifactSHA), // informational echo only
+		}
 	}
 	prBody := buildPRBody(in.Justification, meta)
 

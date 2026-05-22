@@ -73,6 +73,15 @@ var allowedByreisPkgsSubmit = map[string]bool{
 	// forbidden.
 	module + "/internal/core/audit":   true,
 	module + "/internal/core/logging": true,
+	// AMENDMENT (bulk submit, explicit review): the .env bulk-submit parser is a
+	// pure tokeniser fed raw bytes. Its full transitive set is EXACTLY itself
+	// (stdlib-only; verified via `go list -deps`): zero third-party, zero other
+	// byreis package, and provably no crypto/ed25519, crypto/identity,
+	// crypto/decrypt, internal/core/registry, or registry/countertypes
+	// reachable. It produces only (key, value) pairs and judges no value
+	// content, so admitting it cannot reintroduce decrypt/identity material on
+	// the contributor path. The forbidden set is unchanged.
+	module + "/internal/core/usecase/submit/envparse": true,
 	// Note: module + "/internal/core/registry" is NOT here (it transitively
 	// reaches crypto/ed25519 via SignerKey/CounterStore).
 	// Note: module + "/internal/core/registry/countertypes" is NOT here
@@ -286,6 +295,31 @@ func TestAllowlist_Submit_NegativeTest_ForbiddenImportFails(t *testing.T) {
 			"Fix: ensure checkAllowlistSubmit rejects registry/countertypes.")
 	} else {
 		t.Logf("PASS (part C): checkAllowlistSubmit correctly rejected registry/countertypes\nviolations: %v", violations3)
+	}
+}
+
+// TestAllowlist_EnvParse_StdlibOnly pins, defense-in-depth, that the .env
+// bulk-submit parser's OWN transitive set is stdlib-only: it imports no
+// third-party package and no other byreis-module package, so admitting it to
+// the Submit allowlist cannot transitively reintroduce identity/decrypt/counter
+// material. This is the mechanical proof behind the allowlist amendment.
+func TestAllowlist_EnvParse_StdlibOnly(t *testing.T) {
+	pkg := module + "/internal/core/usecase/submit/envparse"
+	deps := goListDepsSubmit(t, pkg)
+	for _, dep := range deps {
+		if dep == pkg {
+			continue // the package itself
+		}
+		if strings.HasPrefix(dep, module+"/") {
+			t.Errorf("FAIL: envparse transitively imports byreis package %s — it must be stdlib-only", dep)
+			continue
+		}
+		if !isStdlibOrInternal(dep) {
+			t.Errorf("FAIL: envparse transitively imports non-stdlib package %s — it must be stdlib-only", dep)
+		}
+	}
+	if !t.Failed() {
+		t.Logf("PASS: envparse transitive set is stdlib-only (%d deps)", len(deps))
 	}
 }
 
