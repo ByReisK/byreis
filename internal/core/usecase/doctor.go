@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"sort"
 	"time"
 
 	"github.com/ByReisK/byreis/internal/core/mode"
@@ -69,6 +70,31 @@ type DoctorResult struct {
 	// was served from cache. An offline registry is reported as an INFO, not a
 	// FAIL.
 	OfflineCacheAge time.Duration
+	// RotationHistory holds the per-file rotation-epoch findings, populated only
+	// when rotation-history reporting was requested and a RotationEpochProbe was
+	// wired. It is empty/nil otherwise (including when the probe read fails).
+	RotationHistory []RotationHistoryFinding
+	// HasRotationHistory is true when at least one project file has a rotation
+	// epoch of 1 or greater, i.e. a rotation has occurred and the recipient
+	// history may include a removed recipient. The CLI uses this signal to
+	// decide whether to surface the verbatim forward-secrecy warning; core does
+	// not emit the warning string itself.
+	HasRotationHistory bool
+}
+
+// RotationHistoryFinding is the per-file rotation-epoch observation reported by
+// `byreis doctor --rotation-history`.
+type RotationHistoryFinding struct {
+	// File is the project-relative name of the encrypted secrets file.
+	File string
+	// Epoch is the rotation epoch recorded for the file. Zero means the file has
+	// never been rotated.
+	Epoch uint64
+	// PartialRotationDetected is true when the files within this project do not
+	// all share the same rotation epoch, indicating an incomplete rotation. The
+	// value is a project-level derivation and is therefore identical across all
+	// findings produced for the same project.
+	PartialRotationDetected bool
 }
 
 // HasFail reports whether any finding is SeverityFail (drives exit code).
@@ -113,6 +139,18 @@ type RegistryStatus struct {
 	BranchProtectionDetail string
 }
 
+// RotationEpochProbe is the consumer-defined port for reading the rotation
+// epoch of each encrypted file in a project. Implementations are expected to
+// honour the anti-rollback cache fallback; from the doctor use-case's point of
+// view a read failure is informational, not fatal.
+type RotationEpochProbe interface {
+	// FetchRotationEpochs returns a map of project-relative file name to its
+	// recorded rotation epoch. An error indicates the epochs could not be read
+	// (for example the registry is unreachable); the caller treats this as an
+	// informational condition rather than a hard failure.
+	FetchRotationEpochs(ctx context.Context, projectID string) (map[string]uint64, error)
+}
+
 // DoctorDeps bundles the injected ports for the Doctor use-case.
 type DoctorDeps struct {
 	// ModeDetector detects the current mode and its reason.
@@ -127,6 +165,14 @@ type DoctorDeps struct {
 	TrustFilePath string
 	// RegistryProbe provides the registry connectivity status.
 	RegistryProbe RegistryStatusProbe
+	// RotationEpochProbe provides per-file rotation epochs for the
+	// `--rotation-history` report. It may be nil when rotation-history
+	// reporting is not wired; doctor then skips the report gracefully.
+	RotationEpochProbe RotationEpochProbe
+	// RotationHistoryRequested is true when the caller asked for the
+	// `--rotation-history` report. The report is produced only when this is set
+	// and RotationEpochProbe is non-nil.
+	RotationHistoryRequested bool
 }
 
 // Doctor is the consumer-defined interface for the Doctor use-case.
@@ -201,8 +247,101 @@ func (doc *doctorUseCase) Diagnose(ctx context.Context) (DoctorResult, error) {
 		})
 	}
 
+	// (5) Rotation history (opt-in, read-only). Skipped gracefully when not
+	// requested or not wired. A probe read failure is informational, never a
+	// hard FAIL.
+	if doc.d.RotationHistoryRequested && doc.d.RotationEpochProbe != nil {
+		rhFindings, history, hasHistory := doc.checkRotationHistory(ctx)
+		findings = append(findings, rhFindings...)
+		result.RotationHistory = history
+		result.HasRotationHistory = hasHistory
+	}
+
 	result.Findings = findings
 	return result, nil
+}
+
+// checkRotationHistory reads per-file rotation epochs and derives the
+// partial-rotation state. It returns the doctor findings to append, the
+// per-file findings for the result, and whether any file has been rotated
+// (epoch >= 1). A probe error yields an INFO finding and no per-file data.
+func (doc *doctorUseCase) checkRotationHistory(ctx context.Context) ([]DoctorFinding, []RotationHistoryFinding, bool) {
+	epochs, err := doc.d.RotationEpochProbe.FetchRotationEpochs(ctx, doc.d.ProjectID)
+	if err != nil {
+		return []DoctorFinding{{
+			Check:    "rotation-history",
+			Severity: SeverityInfo,
+			Detail: fmt.Sprintf(
+				"rotation epochs could not be read: %v — "+
+					"this is informational; re-run when the registry is reachable", err),
+		}}, nil, false
+	}
+
+	if len(epochs) == 0 {
+		return nil, nil, false
+	}
+
+	partial := isPartialRotation(epochs)
+	hasHistory := maxEpoch(epochs) >= 1
+
+	history := make([]RotationHistoryFinding, 0, len(epochs))
+	for file, epoch := range epochs {
+		history = append(history, RotationHistoryFinding{
+			File:                    file,
+			Epoch:                   epoch,
+			PartialRotationDetected: partial,
+		})
+	}
+	sort.Slice(history, func(i, j int) bool { return history[i].File < history[j].File })
+
+	var findings []DoctorFinding
+	if partial {
+		findings = append(findings, DoctorFinding{
+			Check:    "rotation-history",
+			Severity: SeverityWarn,
+			Detail: "partial-rotation-detected: files in this project do not all share " +
+				"the same rotation epoch — re-run rotation to bring every file to the " +
+				"latest epoch",
+		})
+	} else {
+		findings = append(findings, DoctorFinding{
+			Check:    "rotation-history",
+			Severity: SeverityOK,
+			Detail: fmt.Sprintf(
+				"all %d project file(s) share rotation epoch %d", len(epochs), maxEpoch(epochs)),
+		})
+	}
+	return findings, history, hasHistory
+}
+
+// isPartialRotation reports whether the per-file epochs disagree, i.e. not all
+// files share the same rotation epoch. A single file (or none) can never be
+// partial.
+func isPartialRotation(epochs map[string]uint64) bool {
+	var first uint64
+	seen := false
+	for _, e := range epochs {
+		if !seen {
+			first = e
+			seen = true
+			continue
+		}
+		if e != first {
+			return true
+		}
+	}
+	return false
+}
+
+// maxEpoch returns the highest rotation epoch across the given files (0 if empty).
+func maxEpoch(epochs map[string]uint64) uint64 {
+	var max uint64
+	for _, e := range epochs {
+		if e > max {
+			max = e
+		}
+	}
+	return max
 }
 
 // checkConfigDir checks the config directory with TOCTOU-safe O_NOFOLLOW+fstat.

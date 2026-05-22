@@ -249,6 +249,23 @@ type FetchTransport interface {
 	// compatible default for v0.1-produced counter files). Implementations that
 	// do not maintain rotation epoch state return (0, nil).
 	ReadRotationEpoch(ctx context.Context, repoURL, headCommit, projectID, fileName string) (uint64, error)
+
+	// ReadAuditLog reads the raw audit/<projectID>.jsonl blob from the registry
+	// tree at the EXACT signature-verified headCommit SHA returned by FetchHead.
+	// headCommit MUST be the SHA from the immediately preceding verified FetchHead
+	// call on the same Client invocation; the implementation reads the blob at
+	// that pinned commit object and MUST NOT call FetchHead a second time and MUST
+	// NOT re-resolve any ref (no TOCTOU window — identical discipline to
+	// ReadRotationEpoch and ReadAdmins). projectID MUST pass
+	// fetchtransport.ValidateProjectID before any path composition at the I/O
+	// boundary; an invalid projectID is rejected before the audit blob path is
+	// ever constructed. An absent audit file returns (nil, nil) — the valid
+	// "no audit entries yet" outcome. The returned bytes are the raw JSONL; the
+	// *registry.Client maps them to []AuditEntryView (the typed reader returns
+	// bytes, not domain projections, mirroring the read-then-map shape of the
+	// other typed readers). The read is size-bounded per the dedicated
+	// maxAuditJSONLBytes constant in production_transport.go.
+	ReadAuditLog(ctx context.Context, repoURL, headCommit, projectID string) ([]byte, error)
 }
 
 // Client is the RegistryClient implementation.
@@ -278,6 +295,28 @@ type Client struct {
 	// diskHydrated tracks whether the in-memory maps have been hydrated from
 	// the on-disk cache for each (project, file) key. Protected by mu.
 	diskHydrated map[string]bool
+
+	// epochFloor holds the durable anti-rollback floor for the rotation epoch
+	// per (project+"/"+file) cache key. It is the highest rotation_epoch that
+	// was observed on a verified-HEAD fetch and written through to the on-disk
+	// epoch store. On an offline fallback, a cached epoch below this floor is
+	// treated as a rollback (ErrCacheTampered). Protected by mu.
+	//
+	// Backing-store posture: the epoch floor shares the epochs.json backing store
+	// with the cached epoch value and inherits the Alt-β posture (O_NOFOLLOW +
+	// fstat + checkOwner + 0o600 + per-registry path namespace; no HMAC). A
+	// same-uid disk attacker who can rewrite epochs.json can zero both the floor
+	// and the cached epoch, bypassing the anti-rollback check — identical
+	// limitation to the counter floor. If the counter floor migrates to HMAC or a
+	// separate isolated file, this epoch floor migrates in lockstep. See the
+	// package-level doc.go for the canonical recipe.
+	epochFloor map[string]uint64
+
+	// epochFloorHydrated tracks whether the epochFloor for a given cache key has
+	// been hydrated from the on-disk epoch store in this process lifetime. A key
+	// absent from this map means the disk has not been consulted yet — not that
+	// the floor is zero. Protected by mu.
+	epochFloorHydrated map[string]bool
 }
 
 // New constructs a Client with the given config. Returns an error if the
@@ -297,13 +336,15 @@ func New(cfg ClientConfig) (*Client, error) {
 		logger = logging.Discard
 	}
 	return &Client{
-		cfg:          cfg,
-		logger:       logger,
-		cache:        make(map[string]coreregistry.AdminSet),
-		headCache:    make(map[string]string),
-		counterCache: make(map[string]uint64),
-		pendingStore: make(map[string]*countertypes.PendingBump),
-		diskHydrated: make(map[string]bool),
+		cfg:                cfg,
+		logger:             logger,
+		cache:              make(map[string]coreregistry.AdminSet),
+		headCache:          make(map[string]string),
+		counterCache:       make(map[string]uint64),
+		pendingStore:       make(map[string]*countertypes.PendingBump),
+		diskHydrated:       make(map[string]bool),
+		epochFloor:         make(map[string]uint64),
+		epochFloorHydrated: make(map[string]bool),
 	}, nil
 }
 
@@ -838,33 +879,48 @@ type rotationCommitTransport interface {
 // Files whose counter file is absent or whose rotation_epoch field is missing
 // default to epoch 0 (backwards compatibility with v0.1-produced counter files).
 //
-// If FetchTransport is nil (offline mode) or FetchHead returns an error, the
-// method returns an empty map wrapped in ErrRegistryOffline. A nil map is never
-// returned; callers can always range over the result safely.
+// On the online verified-HEAD path the fetched epochs are written through to
+// the on-disk epoch store (StoreRotationEpoch) and the in-memory anti-rollback
+// floor is advanced so the offline fallback has a durable comparison value.
+//
+// If FetchTransport is nil (offline mode) or FetchHead returns a transport
+// error, the method falls back to offlineFetchRotationEpochs which enforces
+// the anti-rollback floor against the on-disk cached epochs. A nil map is
+// never returned; callers can always range over the result safely.
+//
+// A signature-verification failure (!verified) is a hard ErrUnsignedRegistry
+// error and does NOT fall through to the cache: cache fallback is reserved
+// strictly for transport-unavailable conditions.
 func (c *Client) FetchRotationEpochs(ctx context.Context, projectID string) (map[string]uint64, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("registry FetchRotationEpochs cancelled: %w", err)
 	}
 
+	// Offline path: no transport configured.
 	if c.cfg.FetchTransport == nil {
-		return map[string]uint64{}, fmt.Errorf("%w: no registry transport configured — "+
-			"run `byreis doctor` to diagnose", coreregistry.ErrRegistryOffline)
+		return c.offlineFetchRotationEpochs(ctx, projectID,
+			"no registry transport configured — run `byreis doctor` to diagnose")
 	}
 
 	headCommit, _, verified, fetchErr := c.cfg.FetchTransport.FetchHead(
 		ctx, c.cfg.RegistryURL, c.cfg.TrustAnchorKey)
 	if fetchErr != nil {
-		return map[string]uint64{}, fmt.Errorf("%w: registry fetch failed: %v — "+
-			"using empty epoch map; run `byreis doctor` to diagnose",
-			coreregistry.ErrRegistryOffline, fetchErr)
+		// Transport/network error: fall back to the anti-rollback-enforced cache.
+		return c.offlineFetchRotationEpochs(ctx, projectID,
+			fmt.Sprintf("registry fetch failed: %v — using cached epoch data", fetchErr))
 	}
+
+	// Signature-verification failure is a hard error. Cache fallback is
+	// NEVER reached on this branch: a !verified HEAD means we cannot
+	// trust any data from this fetch, and serving the old cache under a
+	// broken verification would open a downgrade window.
 	if !verified {
 		return map[string]uint64{}, fmt.Errorf("%w: registry HEAD is not signature-verified — "+
 			"FetchRotationEpochs requires a verified HEAD; run `byreis doctor` to diagnose",
 			coreregistry.ErrUnsignedRegistry)
 	}
 
-	// Collect file names from three sources.
+	// Collect file names from three sources (same-invocation provenance).
 	seen := make(map[string]struct{})
 	var fileNames []string
 	addFile := func(fn string) {
@@ -891,14 +947,8 @@ func (c *Client) FetchRotationEpochs(ctx context.Context, projectID string) (map
 	c.mu.Unlock()
 
 	// Source 2: ReadProjectConfig at the verified HEAD.
-	// This provides file discovery in the common case where no prior
-	// CounterAuthority call has been made for this project in this session.
 	// The headCommit passed here is the same verified SHA from FetchHead above
 	// (same-invocation provenance — no second FetchHead, no TOCTOU window).
-	// ReadProjectConfig does NOT consume a session from FetchHead on the
-	// FetchRotationEpochs path (the session pipeline is only active during
-	// FetchAdminSet which uses a different session queue). This is safe because
-	// ReadRotationEpoch is an independent read that does not require the session.
 	projCfg, cfgErr := c.cfg.FetchTransport.ReadProjectConfig(
 		ctx, c.cfg.RegistryURL, headCommit, projectID)
 	if cfgErr != nil {
@@ -912,8 +962,6 @@ func (c *Client) FetchRotationEpochs(ctx context.Context, projectID string) (map
 			addFile(logicalName)
 		}
 	}
-	// Config read failures are non-fatal for epoch discovery: if the project
-	// config is unreadable, we fall back to the in-memory sources above.
 
 	// Discard any counter session deposited by FetchHead on this path. The
 	// FetchRotationEpochs flow does not invoke ReadCounter or IsAncestor, so
@@ -932,9 +980,149 @@ func (c *Client) FetchRotationEpochs(ctx context.Context, projectID string) (map
 				projectID, fn, epochErr)
 		}
 		result[fn] = epoch
+
+		// Write-through the verified epoch to the on-disk store and advance the
+		// in-memory anti-rollback floor. Both writes happen after the verified
+		// read succeeds so the floor is always a value from a verified fetch.
+		cacheKey := projectID + "/" + fn
+		c.mu.Lock()
+		if floor, has := c.epochFloor[cacheKey]; !has || epoch > floor {
+			c.epochFloor[cacheKey] = epoch
+		}
+		c.epochFloorHydrated[cacheKey] = true
+		c.mu.Unlock()
+
+		if c.cfg.DiskCache != nil {
+			if storeErr := c.cfg.DiskCache.StoreRotationEpoch(ctx, projectID, fn, epoch); storeErr != nil {
+				// A disk write failure is non-fatal for the online path: the
+				// in-memory floor is already updated. Log and continue.
+				c.logger.Log(ctx, logging.LevelWarn,
+					"FetchRotationEpochs: write-through epoch to disk cache failed",
+					"projectID", projectID, "file", fn,
+					"epoch", fmt.Sprintf("%d", epoch),
+					"error", storeErr.Error(),
+				)
+			}
+		}
 	}
 
 	return result, nil
+}
+
+// offlineFetchRotationEpochs serves per-file rotation epochs from the on-disk
+// cache when the registry is unreachable. It enforces the anti-rollback epoch
+// floor: a cached epoch below the stored floor is treated as a tamper event
+// and surfaces ErrCacheTampered (the same sentinel as the counter anti-rollback,
+// reused here because the epoch dimension has structurally identical semantics).
+//
+// Callers must distinguish three outcomes:
+//
+//	(non-nil map, ErrRegistryOffline) — stale cache served; caller marks result
+//	  stale and still runs forward-secrecy / partial-rotation checks.
+//	(nil, ErrRegistryOffline)          — no durable floor record exists for
+//	  this project at all; fail closed.
+//	(nil, ErrCacheTampered)            — cached epoch regressed below floor;
+//	  hard rollback sentinel.
+func (c *Client) offlineFetchRotationEpochs(ctx context.Context, projectID, reason string) (map[string]uint64, error) {
+	// Collect known file names from in-memory sources only (no network available).
+	seen := make(map[string]struct{})
+	var fileNames []string
+	addFile := func(fn string) {
+		if _, already := seen[fn]; !already {
+			seen[fn] = struct{}{}
+			fileNames = append(fileNames, fn)
+		}
+	}
+
+	c.mu.Lock()
+	prefix := projectID + "/"
+	for k := range c.counterCache {
+		if len(k) > len(prefix) && k[:len(prefix)] == prefix {
+			addFile(k[len(prefix):])
+		}
+	}
+	if adminSet, hasCached := c.cache[projectID]; hasCached {
+		for logicalName := range adminSet.ConfiguredFiles {
+			addFile(logicalName)
+		}
+	}
+	c.mu.Unlock()
+
+	// If no file names are known at all we cannot serve any cache. Fail closed.
+	if len(fileNames) == 0 {
+		return nil, fmt.Errorf("%w: %s — "+
+			"no file names known offline; registry must be reachable to initialise epoch cache",
+			coreregistry.ErrRegistryOffline, reason)
+	}
+
+	result := make(map[string]uint64, len(fileNames))
+	for _, fn := range fileNames {
+		cacheKey := projectID + "/" + fn
+
+		// Hydrate the floor from the on-disk epoch store on first offline access
+		// for this (project, file) pair. This mirrors the counter-floor hydration
+		// pattern (CounterAuthority lines 600-612) to ensure a process restart
+		// restores the anti-rollback floor durably.
+		c.mu.Lock()
+		if c.cfg.DiskCache != nil && !c.epochFloorHydrated[cacheKey] {
+			c.epochFloorHydrated[cacheKey] = true
+			c.mu.Unlock()
+			diskEpoch, diskErr := c.cfg.DiskCache.LoadRotationEpoch(ctx, projectID, fn)
+			if diskErr == nil && diskEpoch > 0 {
+				c.mu.Lock()
+				if _, has := c.epochFloor[cacheKey]; !has {
+					c.epochFloor[cacheKey] = diskEpoch
+				}
+				c.mu.Unlock()
+			}
+			c.mu.Lock()
+		}
+		floor, hasFloor := c.epochFloor[cacheKey]
+		c.mu.Unlock()
+
+		// No durable floor record exists for this file (cold cache).
+		// Return ErrRegistryOffline (fail closed) rather than silently serving epoch-0.
+		if !hasFloor {
+			return nil, fmt.Errorf("%w: %s — "+
+				"no durable epoch floor for (%s,%s); "+
+				"registry must be reachable for the first epoch read: run `byreis doctor`",
+				coreregistry.ErrRegistryOffline, reason, projectID, fn)
+		}
+
+		// Read the cached epoch from the on-disk store.
+		var cachedEpoch uint64
+		if c.cfg.DiskCache != nil {
+			var diskErr error
+			cachedEpoch, diskErr = c.cfg.DiskCache.LoadRotationEpoch(ctx, projectID, fn)
+			if diskErr != nil {
+				return nil, fmt.Errorf(
+					"registry FetchRotationEpochs (offline): reading cached epoch for (%s,%s): %w — "+
+						"run `byreis doctor` to diagnose",
+					projectID, fn, diskErr)
+			}
+		}
+
+		// Anti-rollback assertion. A cached epoch below the floor is a rollback
+		// sentinel. ErrCacheTampered is reused here because the semantics are
+		// identical to the counter dimension: a value that regressed relative to
+		// the last verified observation.
+		if cachedEpoch < floor {
+			return nil, fmt.Errorf(
+				"%w: cached rotation_epoch %d for (%s,%s) is below the anti-rollback floor %d — "+
+					"possible rollback or cache tamper; "+
+					"delete the cache and re-fetch: rm -rf ~/.cache/byreis/registry",
+				coreregistry.ErrCacheTampered, cachedEpoch, projectID, fn, floor)
+		}
+
+		result[fn] = cachedEpoch
+	}
+
+	// Return the stale result with ErrRegistryOffline so the caller can mark it
+	// stale and still run the forward-secrecy / partial-rotation checks against
+	// the served epochs. Stale serve is not a skip path for those checks.
+	return result, fmt.Errorf("%w: %s — "+
+		"serving cached epoch data; re-run when the registry is reachable",
+		coreregistry.ErrRegistryOffline, reason)
 }
 
 // CommitRotation atomically advances last_accepted_counter for all N files,
@@ -1117,6 +1305,17 @@ func (c *Client) SeedHeadCacheForTest(projectID, headCommit string) {
 	c.headCache[projectID] = headCommit
 }
 
+// SetTransportForTest replaces the FetchTransport after construction. This is
+// a test-only hook that allows tests to transition a client from online to
+// offline (nil transport) or to swap in a different fake, without rebuilding
+// the client's in-memory state (floor caches, admin set caches, etc.).
+// Production code must never call this method.
+func (c *Client) SetTransportForTest(ft FetchTransport) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cfg.FetchTransport = ft
+}
+
 // offlineFallback serves a cached admin set with Stale=true, or returns
 // ErrRegistryOffline if nothing is cached.
 //
@@ -1270,6 +1469,10 @@ func (f *fakeAncestryTransport) ReadRotationEpoch(_ context.Context, _, _, _, _ 
 	return 0, nil
 }
 
+func (f *fakeAncestryTransport) ReadAuditLog(_ context.Context, _, _, _ string) ([]byte, error) {
+	return nil, nil
+}
+
 // fakeUnsignedHeadTransport simulates a registry whose HEAD is not
 // signature-verified (unsigned commit).
 type fakeUnsignedHeadTransport struct{}
@@ -1306,4 +1509,8 @@ func (f *fakeUnsignedHeadTransport) DiscardCounterSession(_ context.Context, _ s
 
 func (f *fakeUnsignedHeadTransport) ReadRotationEpoch(_ context.Context, _, _, _, _ string) (uint64, error) {
 	return 0, nil
+}
+
+func (f *fakeUnsignedHeadTransport) ReadAuditLog(_ context.Context, _, _, _ string) ([]byte, error) {
+	return nil, nil
 }

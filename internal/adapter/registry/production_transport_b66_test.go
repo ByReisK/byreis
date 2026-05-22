@@ -1524,6 +1524,9 @@ func (c *counterTransportForCacheTests) DiscardCounterSession(_ context.Context,
 func (c *counterTransportForCacheTests) ReadRotationEpoch(_ context.Context, _, _, _, _ string) (uint64, error) {
 	return 0, nil
 }
+func (c *counterTransportForCacheTests) ReadAuditLog(_ context.Context, _, _, _ string) ([]byte, error) {
+	return nil, nil
+}
 
 // TestCounterAuthority_WarmCache_NonAncestor_RejectsRollback verifies that
 // when headCache is populated and the new HEAD is not an ancestor of the
@@ -1745,6 +1748,9 @@ func (f *fetchHeadErrorTransport) DiscardCounterSession(_ context.Context, _ str
 func (f *fetchHeadErrorTransport) ReadRotationEpoch(_ context.Context, _, _, _, _ string) (uint64, error) {
 	return 0, nil
 }
+func (f *fetchHeadErrorTransport) ReadAuditLog(_ context.Context, _, _, _ string) ([]byte, error) {
+	return nil, nil
+}
 
 // readCounterErrorTransport is a transport where ReadCounter returns an error.
 type readCounterErrorTransport struct {
@@ -1776,6 +1782,9 @@ func (r *readCounterErrorTransport) ReadAdmins(_ context.Context, _, _, _ string
 func (r *readCounterErrorTransport) DiscardCounterSession(_ context.Context, _ string) {}
 func (r *readCounterErrorTransport) ReadRotationEpoch(_ context.Context, _, _, _, _ string) (uint64, error) {
 	return 0, nil
+}
+func (r *readCounterErrorTransport) ReadAuditLog(_ context.Context, _, _, _ string) ([]byte, error) {
+	return nil, nil
 }
 
 // ---- helpers -----------------------------------------------------------------

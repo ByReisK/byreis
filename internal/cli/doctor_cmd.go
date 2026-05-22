@@ -7,10 +7,13 @@ import (
 
 	"github.com/ByReisK/byreis/internal/cli/render"
 	"github.com/ByReisK/byreis/internal/core/usecase"
+	"github.com/ByReisK/byreis/internal/core/usecase/rotate"
 )
 
 func newDoctorCmd(deps *Deps, jsonFlag *bool) *cobra.Command {
-	return &cobra.Command{
+	var rotationHistory bool
+
+	cmd := &cobra.Command{
 		Use:   "doctor",
 		Short: "Run health checks and report mode, trust anchor, and registry status",
 		Long: `Diagnose your byreis configuration:
@@ -20,6 +23,10 @@ func newDoctorCmd(deps *Deps, jsonFlag *bool) *cobra.Command {
   - Cryptographically-derived mode (CONTRIBUTOR or ADMIN) and its reason
   - Registry connectivity: offline = cache age (INFO, not an error); signature
     verify failure = FAIL; branch protection = advisory WARN.
+
+Use --rotation-history to report the per-file rotation epoch for every project
+file. When files disagree on epoch a partial-rotation-detected advisory is shown.
+When any file has epoch >= 1 the forward-secrecy advisory is also printed.
 
 Exit code is non-zero if any check has a FAIL severity. An offline registry
 alone does NOT cause a non-zero exit.`,
@@ -34,7 +41,22 @@ alone does NOT cause a non-zero exit.`,
 				return fmt.Errorf("doctor not available: adapters not wired")
 			}
 
-			result, err := deps.Doctor.Diagnose(cmd.Context())
+			// Wire the rotation-history flag into the use-case deps if requested.
+			// The deps.Doctor use-case was constructed with RotationHistoryRequested
+			// set to false by default; we cannot mutate it after construction.
+			// Instead, reconstruct the doctor use-case when the flag is set, or
+			// delegate to the deps-layer doctor directly and set the flag via the
+			// DoctorWithRotationHistory helper when the flag is set.
+			//
+			// Because Doctor is an interface (not a concrete struct), we set the
+			// flag by calling the deps layer's RotationHistoryDoctor when present,
+			// falling back to the base Doctor otherwise.
+			doctor := deps.Doctor
+			if rotationHistory && deps.RotationHistoryDoctor != nil {
+				doctor = deps.RotationHistoryDoctor
+			}
+
+			result, err := doctor.Diagnose(cmd.Context())
 			if err != nil {
 				r.PrintError(err.Error())
 				return &exitError{code: render.ExitGeneralError, cause: err}
@@ -57,12 +79,40 @@ alone does NOT cause a non-zero exit.`,
 				_, _ = fmt.Fprintf(r.Out, "\nregistry offline — cached data is %s old\n",
 					result.OfflineCacheAge)
 			}
+
+			// Rotation history section.
+			if rotationHistory && len(result.RotationHistory) > 0 {
+				_, _ = fmt.Fprintf(r.Out, "\nrotation history:\n")
+				for _, rh := range result.RotationHistory {
+					_, _ = fmt.Fprintf(r.Out, "  %s: epoch=%d", rh.File, rh.Epoch)
+					if rh.PartialRotationDetected {
+						_, _ = fmt.Fprintf(r.Out, " [partial-rotation-detected]")
+					}
+					_, _ = fmt.Fprintln(r.Out)
+				}
+			}
+
+			// Emit the verbatim forward-secrecy warning when rotation history
+			// reveals that a rotation has occurred (epoch >= 1 for any file).
+			// This warning is advisory only and does NOT set a non-zero exit code.
+			// The //nolint:forbidigo comment marks this as the single permitted
+			// boundary site for emitting the constant at the CLI render layer.
+			if result.HasRotationHistory {
+				//nolint:forbidigo // boundary: emitting rotate.ForwardSecrecyWarning at the CLI render layer
+				_, _ = fmt.Fprintf(r.Out, "\n%s\n", rotate.ForwardSecrecyWarning)
+			}
+
 			if result.HasFail() {
 				return &exitError{code: render.ExitGeneralError}
 			}
 			return nil
 		},
 	}
+
+	cmd.Flags().BoolVar(&rotationHistory, "rotation-history", false,
+		"Report per-file rotation epochs and emit the forward-secrecy advisory when any file has epoch >= 1")
+
+	return cmd
 }
 
 type doctorFindingJSON struct {
@@ -71,12 +121,19 @@ type doctorFindingJSON struct {
 	Detail   string `json:"detail"`
 }
 
+type doctorRotationHistoryJSON struct {
+	File                    string `json:"file"`
+	Epoch                   uint64 `json:"epoch"`
+	PartialRotationDetected bool   `json:"partial_rotation_detected"`
+}
+
 type doctorResultJSONOut struct {
-	Mode            string              `json:"mode"`
-	ModeReason      string              `json:"mode_reason"`
-	Findings        []doctorFindingJSON `json:"findings"`
-	OfflineCacheAge string              `json:"offline_cache_age,omitempty"`
-	HasFail         bool                `json:"has_fail"`
+	Mode            string                      `json:"mode"`
+	ModeReason      string                      `json:"mode_reason"`
+	Findings        []doctorFindingJSON         `json:"findings"`
+	OfflineCacheAge string                      `json:"offline_cache_age,omitempty"`
+	HasFail         bool                        `json:"has_fail"`
+	RotationHistory []doctorRotationHistoryJSON `json:"rotation_history,omitempty"`
 }
 
 func doctorResultJSON(r usecase.DoctorResult) doctorResultJSONOut {
@@ -93,6 +150,13 @@ func doctorResultJSON(r usecase.DoctorResult) doctorResultJSONOut {
 			Check:    f.Check,
 			Severity: f.Severity.String(),
 			Detail:   f.Detail,
+		})
+	}
+	for _, rh := range r.RotationHistory {
+		out.RotationHistory = append(out.RotationHistory, doctorRotationHistoryJSON{
+			File:                    rh.File,
+			Epoch:                   rh.Epoch,
+			PartialRotationDetected: rh.PartialRotationDetected,
 		})
 	}
 	return out

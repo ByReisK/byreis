@@ -477,6 +477,48 @@ type OpenRequestSummary struct {
 	HeadSHA     string    // PR HEAD at list time (advisory; absorb-time re-pins)
 }
 
+// AuditEntryView is the read-only display projection of one registry audit
+// entry surfaced by `byreis admin audit show`. It is a closed allowlist: it
+// carries ONLY the registry-canonical fields that are safe to surface to an
+// operator. It deliberately omits the recipient pubkey-set, any per-file
+// content SHA, and any secret or high-entropy value. The adapter maps an
+// audit.Event to an AuditEntryView at the registry boundary (the pure
+// ProjectAuditEvent helper applies the same partition); raw audit.Event JSON
+// never crosses into the use-case or CLI.
+//
+// Every rendered string field is adversarial input — an actor with
+// registry-write capability but no trusted-signer key can shape the
+// unvalidated fields (Actor, Outcome, Project, OccurredAt, Kind). The render
+// layer therefore passes every field through the terminal sanitiser before any
+// write to a TTY; the narrowing here is defense-in-depth, not a substitute for
+// that sanitiser.
+type AuditEntryView struct {
+	// Kind is the audit event kind string, constrained to the accepted
+	// event-class set on read. An unrecognised kind sets Unknown=true and is
+	// surfaced as a warning row, never dropped and never a crash.
+	Kind string
+	// OccurredAt is the event timestamp in RFC3339 (advisory display).
+	OccurredAt string
+	// Actor is the admin identity string that performed the action; may be
+	// empty for system events. Never a key or pubkey.
+	Actor string
+	// Project is the canonical project identifier the entry belongs to.
+	Project string
+	// Outcome is the event outcome, one of "ok", "reverted", or "error: <hint>".
+	Outcome string
+	// SafeDetails is the positive-allowlisted subset of the event's Details map,
+	// keyed by the same canonical key names the producer emits. Anything not on
+	// the allowlist is dropped (fail-closed by omission). The per-index removed
+	// recipient pubkeys are never copied here; their count is surfaced as the
+	// synthetic key removed_recipients_count instead.
+	SafeDetails map[string]string
+	// Unknown is true when Kind fell outside the accepted set on read. The
+	// render layer prints a forward-compat warning row rather than a typed
+	// entry, so a newer client that wrote a future event class does not crash
+	// an admin's audit display.
+	Unknown bool
+}
+
 // RequestAccessReader is the consumer-defined port the admin-side `--from-request`
 // orchestration uses to fetch the contributor's PR payload and the canonical
 // GitHub metadata required for the BO-3 PR-author-vs-YAML check. The real
@@ -535,6 +577,26 @@ type RequestAccessReader interface {
 	// to triage"); a backend failure returns a non-nil error so the caller never
 	// mistakes a fetch failure for an empty queue.
 	ListOpenRequests(ctx context.Context) ([]OpenRequestSummary, error)
+}
+
+// AuditReader is the consumer-defined port the `byreis admin audit show`
+// orchestration uses to fetch the registry audit log for one project. It is
+// read-only: it acquires no signer, no registry-write credential, and no
+// trust-path capability.
+type AuditReader interface {
+	// FetchAuditLog returns the audit entries recorded for projectID, read from
+	// the registry audit/<projectID>.jsonl file at a signature-verified
+	// registry HEAD. Implementations MUST fail closed:
+	//   - read ONLY from a HEAD verified at the same fetch that pinned it;
+	//   - return the unsigned-registry sentinel when the HEAD is not
+	//     signature-verified;
+	//   - return the registry-offline sentinel when the registry is unreachable
+	//     and no integrity-checked cache is available;
+	//   - NEVER return entries sourced from an unverified HEAD or an unverified
+	//     cache (no best-effort display path).
+	// The result is bounded (per-project scope, count cap, and size cap). An
+	// empty slice with a nil error is the valid "no audit entries yet" outcome.
+	FetchAuditLog(ctx context.Context, projectID string) ([]AuditEntryView, error)
 }
 
 // RegistryReadTokenProvider is a NEW consumer-defined port introduced at V6

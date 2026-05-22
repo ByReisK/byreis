@@ -121,6 +121,14 @@ const (
 	// verb makes no registry write and reaches no trust decision; it is a triage
 	// convenience over the same read port the `--from-request` lift consumes.
 	CommandRequestList Command = "request-list"
+	// CommandAuditShow is the admin-side read-only verb that displays
+	// signature-verified audit entries from the registry audit log. It is
+	// admin-only (mirrors CommandRequestList): the verb reaches no trust
+	// decision and performs no registry write, but it is grouped with the other
+	// admin-tree read surfaces. Contributors with a legitimate need read the
+	// audit log out-of-band via `git show audit/<project>.jsonl` followed by
+	// `git verify-commit` against the registry's signed HEAD.
+	CommandAuditShow Command = "audit-show"
 )
 
 // ErrKeyPermissions is a hard error returned when the private key file exists
@@ -319,6 +327,9 @@ var matrix = map[Command]map[Mode]bool{
 	// Admin-only read-only triage verb (inverse of CommandRequestAccess):
 	// CONTRIBUTOR is denied, ADMIN/SUPER may list open request-access PRs.
 	CommandRequestList: {ModeAdmin: true, ModeSuper: true},
+	// Admin-only read-only verb: CONTRIBUTOR is denied, ADMIN/SUPER may display
+	// signature-verified audit entries from the registry audit log.
+	CommandAuditShow: {ModeAdmin: true, ModeSuper: true},
 }
 
 // Allow returns nil if cmd is permitted in mode m, or an error wrapping

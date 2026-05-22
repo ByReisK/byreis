@@ -29,6 +29,7 @@ import (
 	"github.com/ByReisK/byreis/internal/cli/render"
 	"github.com/ByReisK/byreis/internal/core/git"
 	"github.com/ByReisK/byreis/internal/core/mode"
+	coreregistry "github.com/ByReisK/byreis/internal/core/registry"
 	"github.com/ByReisK/byreis/internal/core/usecase"
 	"github.com/ByReisK/byreis/internal/core/usecase/rotate"
 )
@@ -417,7 +418,8 @@ leaves the live file byte-identical.`,
 }
 
 // newAdminCmd constructs the `admin` parent command and registers its
-// sub-commands (currently: `admin merge`, `admin rotation reconcile`).
+// sub-commands (currently: `admin merge`, `admin rotation reconcile`,
+// `admin request`, `admin audit`).
 func newAdminCmd(deps *Deps, jsonFlag *bool) *cobra.Command {
 	admin := &cobra.Command{
 		Use:   "admin",
@@ -430,7 +432,239 @@ Commands under 'admin' are gated by mode policy and denied-by-policy
 	admin.AddCommand(newAdminMergeCmd(deps, jsonFlag))
 	admin.AddCommand(newAdminRotationCmd(deps, jsonFlag))
 	admin.AddCommand(newAdminRequestCmd(deps, jsonFlag))
+	admin.AddCommand(newAdminAuditCmd(deps, jsonFlag))
 	return admin
+}
+
+// newAdminAuditCmd constructs the `admin audit` parent command.
+func newAdminAuditCmd(deps *Deps, jsonFlag *bool) *cobra.Command {
+	audit := &cobra.Command{
+		Use:   "audit",
+		Short: "Admin audit log operations",
+		Long: `Admin-only audit log operations.
+
+Commands under 'admin audit' are gated by mode policy and denied-by-policy
+when running as CONTRIBUTOR. Contributors can read the audit log directly via
+git: git show audit/<project>.jsonl (and verify with git verify-commit).`,
+	}
+	audit.AddCommand(newAdminAuditShowCmd(deps, jsonFlag))
+	return audit
+}
+
+// newAdminAuditShowCmd constructs the `admin audit show` command.
+//
+// Mode gate is FIRST: checkPolicy fires before any network or port touch.
+// A CONTRIBUTOR invocation is denied-not-attempted: FetchAuditLog is never
+// reached. The denial hint names the git transport alternative.
+//
+// Bounded read: the AuditReader implementation enforces total blob size,
+// per-line byte cap, decode-depth bound, and result-count cap; this command
+// receives only the already-bounded []rotate.AuditEntryView slice.
+//
+// Full-field sanitise: every rendered string field (Kind, OccurredAt, Actor,
+// Project, Outcome, and every SafeDetails value) passes
+// collapseLineBreaks(render.SanitizeForTerminal(...)) on the table path.
+// The --json path emits raw fields; encoding/json escapes control bytes.
+func newAdminAuditShowCmd(deps *Deps, jsonFlag *bool) *cobra.Command {
+	var project string
+
+	cmd := &cobra.Command{
+		Use:   "show",
+		Short: "Display the registry audit log for a project (admin only)",
+		Long: `Display the verified-HEAD audit log for a project.
+
+Requires ADMIN mode: denied-by-policy before any network touch.
+
+The registry HEAD must be signature-verified; an unverified HEAD returns an
+error. The registry must be reachable; there is no stale-cache fallback for
+audit-read.
+
+Contributors can read the audit log directly via git:
+  git show audit/<project>.jsonl
+  git verify-commit <HEAD>
+
+Output is sorted in chronological (append) order. Entries whose event class
+is not recognised by this version are shown as warning rows; the log is not
+truncated on forward-compat unknowns.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			r := render.New(*jsonFlag)
+			r.Out = cmd.OutOrStdout()
+			r.Err = cmd.ErrOrStderr()
+
+			// Mode gate FIRST — denied-not-attempted before any network touch.
+			// The denial output names the git transport alternative per the BA
+			// ruling: contributors read via git directly.
+			if pErr := checkAuditShowPolicy(deps, r); pErr != nil {
+				return pErr
+			}
+
+			if deps.AuditReader == nil {
+				err := fmt.Errorf(
+					"admin audit show not available: the AuditReader is not wired — " +
+						"set BYREIS_REGISTRY and run `byreis doctor`")
+				r.PrintErrorClass("general-error", err.Error(),
+					"set BYREIS_REGISTRY and run `byreis doctor`")
+				return &exitError{code: render.ExitGeneralError, cause: err}
+			}
+
+			ctx := cmd.Context()
+			entries, err := deps.AuditReader.FetchAuditLog(ctx, project)
+			if err != nil {
+				code := auditFetchExitCode(err)
+				r.PrintErrorClass(auditExitClass(code), err.Error(),
+					auditFetchHint(code))
+				return &exitError{code: code, cause: err}
+			}
+
+			if *jsonFlag {
+				type jsonEntry struct {
+					Kind        string            `json:"kind"`
+					OccurredAt  string            `json:"occurred_at"`
+					Actor       string            `json:"actor"`
+					Project     string            `json:"project"`
+					Outcome     string            `json:"outcome"`
+					SafeDetails map[string]string `json:"safe_details,omitempty"`
+					Unknown     bool              `json:"unknown,omitempty"`
+				}
+				rows := make([]jsonEntry, len(entries))
+				for i, e := range entries {
+					rows[i] = jsonEntry{
+						Kind:        e.Kind,
+						OccurredAt:  e.OccurredAt,
+						Actor:       e.Actor,
+						Project:     e.Project,
+						Outcome:     e.Outcome,
+						SafeDetails: e.SafeDetails,
+						Unknown:     e.Unknown,
+					}
+				}
+				_ = render.EncodeJSON(r.Out, map[string]any{"entries": rows})
+				return nil
+			}
+
+			// Human table output.
+			if len(entries) == 0 {
+				_, _ = fmt.Fprintf(r.Out, "no audit entries for project %q\n", project)
+				return nil
+			}
+
+			// Header row.
+			_, _ = fmt.Fprintf(r.Out, "%-25s  %-22s  %-20s  %-10s  %s\n",
+				"KIND", "OCCURRED_AT", "ACTOR", "OUTCOME", "DETAILS")
+			_, _ = fmt.Fprintf(r.Out, "%-25s  %-22s  %-20s  %-10s  %s\n",
+				strings.Repeat("-", 25), strings.Repeat("-", 22),
+				strings.Repeat("-", 20), strings.Repeat("-", 10), strings.Repeat("-", 20))
+
+			for _, e := range entries {
+				// Every rendered field — including Kind on an Unknown=true
+				// warning row — passes collapseLineBreaks(SanitizeForTerminal).
+				// Mandatory terminal sanitiser: applied unconditionally to every
+				// rendered field, not only when a value looks suspicious.
+				kind := collapseLineBreaks(render.SanitizeForTerminal(e.Kind))
+				if e.Unknown {
+					kind = "WARN: " + kind
+				}
+				occurredAt := collapseLineBreaks(render.SanitizeForTerminal(e.OccurredAt))
+				actor := collapseLineBreaks(render.SanitizeForTerminal(e.Actor))
+				outcome := collapseLineBreaks(render.SanitizeForTerminal(e.Outcome))
+
+				// Build a compact SafeDetails summary for the table cell.
+				var detailParts []string
+				for k, v := range e.SafeDetails {
+					sk := collapseLineBreaks(render.SanitizeForTerminal(k))
+					sv := collapseLineBreaks(render.SanitizeForTerminal(v))
+					detailParts = append(detailParts, sk+"="+sv)
+				}
+				sort.Strings(detailParts)
+				detailStr := strings.Join(detailParts, " ")
+
+				_, _ = fmt.Fprintf(r.Out, "%-25s  %-22s  %-20s  %-10s  %s\n",
+					kind, occurredAt, actor, outcome, detailStr)
+			}
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVar(&project, "project", "", "project ID (required)")
+	_ = cmd.MarkFlagRequired("project")
+
+	return cmd
+}
+
+// checkAuditShowPolicy enforces the ADMIN-only mode gate for `admin audit show`.
+// It mirrors checkPolicy but includes the git transport alternative in the
+// denial message, per the BA ruling that contributors should be directed to
+// read the audit log directly via git.
+func checkAuditShowPolicy(deps *Deps, r *render.Renderer) error {
+	const gitHint = "contributors can read the audit log directly via git: " +
+		"git show audit/<project>.jsonl && git verify-commit <HEAD>"
+	if deps.Policy != nil {
+		if err := deps.Policy.Allow(deps.CurrentMode, mode.CommandAuditShow); err != nil {
+			msg := err.Error() + " — " + gitHint
+			r.PrintErrorClass("permission-denied", msg,
+				"admin audit show requires ADMIN mode — "+gitHint)
+			return &exitError{code: render.ExitPermissionDenied, cause: err}
+		}
+		return nil
+	}
+	err := fmt.Errorf("%w: admin audit show requires ADMIN mode — "+
+		"no admin key found or mode policy not configured; "+
+		"see `byreis doctor` for your current mode",
+		mode.ErrPermissionDenied)
+	msg := err.Error() + " — " + gitHint
+	r.PrintErrorClass("permission-denied", msg,
+		"admin audit show requires ADMIN mode — "+gitHint)
+	return &exitError{code: render.ExitPermissionDenied, cause: err}
+}
+
+// auditFetchExitCode maps a FetchAuditLog error to the appropriate exit code.
+// ErrUnsignedRegistry → ExitTrustError; ErrRegistryOffline → ExitVerifyFailure;
+// ErrPermissionDenied → ExitPermissionDenied; all others → ExitGeneralError.
+func auditFetchExitCode(err error) render.ExitCode {
+	if errors.Is(err, mode.ErrPermissionDenied) {
+		return render.ExitPermissionDenied
+	}
+	if errors.Is(err, coreregistry.ErrUnsignedRegistry) {
+		return render.ExitTrustError
+	}
+	if errors.Is(err, coreregistry.ErrRegistryOffline) {
+		return render.ExitVerifyFailure
+	}
+	return render.ExitGeneralError
+}
+
+// auditExitClass returns the stable exit class string for the given exit code.
+func auditExitClass(code render.ExitCode) string {
+	switch code {
+	case render.ExitPermissionDenied:
+		return "permission-denied"
+	case render.ExitTrustError:
+		return "trust-error"
+	case render.ExitVerifyFailure:
+		return "verify-failure"
+	default:
+		return "general-error"
+	}
+}
+
+// auditFetchHint returns an actionable hint for the given audit fetch exit code.
+func auditFetchHint(code render.ExitCode) string {
+	switch code {
+	case render.ExitPermissionDenied:
+		return "run `byreis doctor` to verify your admin mode; " +
+			"contributors read via: git show audit/<project>.jsonl && git verify-commit <HEAD>"
+	case render.ExitTrustError:
+		return "registry HEAD is not signature-verified — " +
+			"run `byreis doctor` and verify the registry trust configuration; " +
+			"read audit log directly with: git show audit/<project>.jsonl && git verify-commit <HEAD>"
+	case render.ExitVerifyFailure:
+		return "registry is unreachable — " +
+			"read audit log directly with: git show audit/<project>.jsonl && git verify-commit <HEAD>"
+	default:
+		return "run `byreis doctor` for diagnostics; " +
+			"read audit log directly with: git show audit/<project>.jsonl && git verify-commit <HEAD>"
+	}
 }
 
 // newAdminRotationCmd constructs the `admin rotation` parent command.

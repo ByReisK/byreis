@@ -122,6 +122,12 @@ linters:
         - name: error-return
           disabled: false
 
+    exhaustive:
+      # A switch containing a default case is treated as exhaustive even if not
+      # all enum values are listed explicitly. This matches the standard Go idiom
+      # of using default to handle unforeseen future enum additions gracefully.
+      default-signifies-exhaustive: true
+
     godot:
       scope: declarations
       period: true

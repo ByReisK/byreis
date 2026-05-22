@@ -248,21 +248,109 @@ func BuildProductionDeps(ctx context.Context) (*cli.Deps, error) {
 		}
 	}
 
+	// Build the Doctor use-case and the rotation-history variant.
+	registryURL := os.Getenv("BYREIS_REGISTRY")
+	doctor, rotationHistoryDoctor := buildDoctorProd(
+		det, projectIDFromEnvProd(), registryURL, configDir, regClient,
+	)
+
+	// Wire the AuditReader. The concrete *registry.Client implements
+	// rotate.AuditReader via its FetchAuditLog method; the coreregistry.RegistryClient
+	// interface does not embed the method (it is a read-side addition not visible
+	// to core). Type-assert to the narrow AuditReader port; when the assertion
+	// fails (test double or future alternate client) the field stays nil and the
+	// CLI surfaces a "not configured" error at command time.
+	var auditReader rotate.AuditReader
+	if regClient != nil {
+		if ar, ok := regClient.(rotate.AuditReader); ok {
+			auditReader = ar
+		}
+	}
+
 	return &cli.Deps{
-		Policy:              pol,
-		CurrentMode:         currentMode,
-		ConfigDir:           configDir,
-		Getter:              getter,
-		Decryptor:           decryptor,
-		Editor:              editorUC,
-		Merger:              merger,
-		MergeExitCode:       mergeExitCode,
-		Rotator:             rotator,
-		Reconciler:          reconciler,
-		RotateExitCode:      rotateExitCode,
-		RotatePreFlight:     rotatePreflight,
-		RequestAccessReader: requestAccessReader,
+		Policy:                pol,
+		CurrentMode:           currentMode,
+		ConfigDir:             configDir,
+		Getter:                getter,
+		Decryptor:             decryptor,
+		Editor:                editorUC,
+		Merger:                merger,
+		MergeExitCode:         mergeExitCode,
+		Rotator:               rotator,
+		Reconciler:            reconciler,
+		RotateExitCode:        rotateExitCode,
+		RotatePreFlight:       rotatePreflight,
+		RequestAccessReader:   requestAccessReader,
+		AuditReader:           auditReader,
+		Doctor:                doctor,
+		RotationHistoryDoctor: rotationHistoryDoctor,
 	}, nil
+}
+
+// buildDoctorProd constructs the Doctor use-case and a rotation-history variant.
+// Both are nil-safe: when the required ports cannot be constructed the function
+// returns (nil, nil) and the CLI surfaces "not configured" at command time.
+func buildDoctorProd(
+	det *mode.Detector,
+	projectID, registryURL, configDir string,
+	regClient coreregistry.RegistryClient,
+) (usecase.Doctor, usecase.Doctor) {
+	if det == nil {
+		return nil, nil
+	}
+
+	trustFilePath := ""
+	if configDir != "" {
+		trustFilePath = filepath.Join(configDir, "trust.yaml")
+	}
+
+	// Build the registry status probe (wraps the registry client).
+	var registryProbe usecase.RegistryStatusProbe
+	if regClient != nil && registryURL != "" {
+		registryProbe = &prodRegistryStatusProbe{client: regClient}
+	}
+
+	// Build the base Doctor (no rotation-history probe).
+	baseDeps := usecase.DoctorDeps{
+		ModeDetector:  det,
+		ProjectID:     projectID,
+		RegistryURL:   registryURL,
+		ConfigDir:     configDir,
+		TrustFilePath: trustFilePath,
+		RegistryProbe: registryProbe,
+	}
+	baseDoc, err := usecase.NewDoctor(baseDeps)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "byreis: warning: cannot construct doctor use-case: %v\n", err)
+		return nil, nil
+	}
+
+	// Build the rotation-history Doctor. It is identical to the base Doctor
+	// except RotationHistoryRequested=true and RotationEpochProbe is wired.
+	// When the registry client is unavailable, the probe is nil and the
+	// rotation-history report is silently skipped (probe errors are informational).
+	var epochProbe usecase.RotationEpochProbe
+	if regClient != nil {
+		epochProbe = &prodRotationEpochProbe{client: regClient}
+	}
+
+	rhDeps := usecase.DoctorDeps{
+		ModeDetector:             det,
+		ProjectID:                projectID,
+		RegistryURL:              registryURL,
+		ConfigDir:                configDir,
+		TrustFilePath:            trustFilePath,
+		RegistryProbe:            registryProbe,
+		RotationEpochProbe:       epochProbe,
+		RotationHistoryRequested: true,
+	}
+	rhDoc, rhErr := usecase.NewDoctor(rhDeps)
+	if rhErr != nil {
+		// Rotation-history variant failed to construct; return only the base doctor.
+		return baseDoc, nil
+	}
+
+	return baseDoc, rhDoc
 }
 
 // ghClientProd constructs a *github.Client authenticated with the given token.
@@ -1849,6 +1937,78 @@ func buildRotatePreFlightProd(
 	}
 }
 
+// ─── doctor adapter bridges ───────────────────────────────────────────────────
+
+// prodRegistryStatusProbe adapts a coreregistry.RegistryClient to the
+// usecase.RegistryStatusProbe port consumed by the Doctor use-case. It performs
+// a FetchAdminSet call to determine registry connectivity and signature state,
+// mapping the result to the domain-typed usecase.RegistryStatus struct. No
+// SDK or transport types cross this boundary.
+type prodRegistryStatusProbe struct {
+	client coreregistry.RegistryClient
+}
+
+// RegistryStatus probes the registry and returns the doctor-layer status.
+// An offline registry (ErrRegistryOffline) is reported as Offline=true with
+// the cache age from the stale AdminSet, not as an error. Only unexpected
+// failures return a non-nil error.
+func (p *prodRegistryStatusProbe) RegistryStatus(ctx context.Context, registryURL string) (usecase.RegistryStatus, error) {
+	if err := ctx.Err(); err != nil {
+		return usecase.RegistryStatus{}, fmt.Errorf("registry status probe cancelled: %w", err)
+	}
+
+	set, fetchErr := p.client.FetchAdminSet(ctx, registryURL)
+
+	// Transport/network failure or offline-with-cache.
+	if fetchErr != nil {
+		if errors.Is(fetchErr, coreregistry.ErrRegistryOffline) {
+			var age time.Duration
+			if !set.FetchedAt.IsZero() {
+				age = time.Since(set.FetchedAt)
+			}
+			return usecase.RegistryStatus{
+				Offline:     true,
+				Reachable:   false,
+				CacheAge:    age,
+				StaleReason: set.StaleReason,
+			}, nil
+		}
+		if errors.Is(fetchErr, coreregistry.ErrUnsignedRegistry) {
+			return usecase.RegistryStatus{
+				Reachable:         true,
+				SignatureVerified: false,
+				Offline:           false,
+			}, nil
+		}
+		// Other errors: propagate with a hint.
+		return usecase.RegistryStatus{}, fmt.Errorf(
+			"registry status check failed: %w — run `byreis doctor` to diagnose", fetchErr)
+	}
+
+	return usecase.RegistryStatus{
+		Reachable:         true,
+		SignatureVerified: set.SourceVerified,
+		Offline:           false,
+	}, nil
+}
+
+// prodRotationEpochProbe adapts a coreregistry.RegistryClient to the
+// usecase.RotationEpochProbe port. It delegates to FetchRotationEpochs.
+// When the result wraps ErrRegistryOffline, the stale epoch map is still
+// returned so the doctor use-case can evaluate forward-secrecy and
+// partial-rotation findings against the cached data.
+type prodRotationEpochProbe struct {
+	client coreregistry.RegistryClient
+}
+
+// FetchRotationEpochs delegates to the registry client. When the result wraps
+// ErrRegistryOffline (stale-serve), both the map and the error are returned so
+// the doctor use-case can distinguish "served from cache" from "no data at all".
+// The doctor use-case treats any non-nil error as informational, not fatal.
+func (p *prodRotationEpochProbe) FetchRotationEpochs(ctx context.Context, projectID string) (map[string]uint64, error) {
+	return p.client.FetchRotationEpochs(ctx, projectID)
+}
+
 // ─── compile-time assertions ─────────────────────────────────────────────────
 
 var (
@@ -1860,4 +2020,6 @@ var (
 	_ rotate.RotationStateReverser               = (*registryadapter.RotationReverserAdapter)(nil)
 	_ rotate.RotationStateProbe                  = (*registryadapter.RotationReverserAdapter)(nil)
 	_ cli.RotatePreFlightReader                  = (*prodRotatePreFlight)(nil)
+	_ usecase.RegistryStatusProbe                = (*prodRegistryStatusProbe)(nil)
+	_ usecase.RotationEpochProbe                 = (*prodRotationEpochProbe)(nil)
 )

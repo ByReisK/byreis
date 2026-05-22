@@ -39,7 +39,7 @@ test-shipgate:
 ## binary (asserted structurally by shipped_surface_test.go and by the CI release-build-clean check).
 test-docgate:
 	go test $(GO_TEST_FLAGS) -tags docgate -run 'TestForwardSecrecyWarning_VerbatimMatch|TestForwardSecrecyWarning_RunbookPathReferenceIntact|TestReleaseWorkflow_DocgateGateWiringIntact' ./internal/core/usecase/rotate/
-	go test $(GO_TEST_FLAGS) -tags docgate -run 'TestV5R4aCLI_RotateRemoveDryRunEmitsVerbatimForwardSecrecyWarning|TestV5R4aCLI_RotateRemoveNonDryRunEmitsVerbatimForwardSecrecyWarning|TestDocGate_RequestAccessHelp_VerbatimHonestyContract|TestDocGate_RequestAccessAdminWarning_VerbatimEmitted' ./internal/cli/
+	go test $(GO_TEST_FLAGS) -tags docgate -run 'TestV5R4aCLI_RotateRemoveDryRunEmitsVerbatimForwardSecrecyWarning|TestV5R4aCLI_RotateRemoveNonDryRunEmitsVerbatimForwardSecrecyWarning|TestDocGate_RequestAccessHelp_VerbatimHonestyContract|TestDocGate_RequestAccessAdminWarning_VerbatimEmitted|TestR4b_DoctorRotationHistory_VerbatimFixtureMatchesConstant|TestR4b_DoctorRotationHistoryEmitsVerbatimForwardSecrecyWarning|TestR4b_DoctorRotationHistoryNoRemovalsNoWarningExitZero|TestR4b_DoctorRotationHistoryPartialRotationDetected|TestR4b_DoctorRotationHistoryReachableInContributorMode' ./internal/cli/
 
 ## lint: run golangci-lint (enforces Clean Architecture dependency rules)
 lint:

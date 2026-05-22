@@ -1203,6 +1203,9 @@ func (s *rotationConcurrentWriteSpy) DiscardCounterSession(_ context.Context, _ 
 func (s *rotationConcurrentWriteSpy) ReadRotationEpoch(_ context.Context, _, _, _, _ string) (uint64, error) {
 	return 0, nil
 }
+func (s *rotationConcurrentWriteSpy) ReadAuditLog(_ context.Context, _, _, _ string) ([]byte, error) {
+	return nil, nil
+}
 func (s *rotationConcurrentWriteSpy) CommitRotationTransport(_ context.Context, _ string, _ coreregistry.CommitRotationInput) error {
 	return s.commitRotationErr
 }
@@ -1237,6 +1240,9 @@ func (s *rotationAuditSpy) ReadAdmins(_ context.Context, _, _, _ string) (regist
 func (s *rotationAuditSpy) DiscardCounterSession(_ context.Context, _ string) {}
 func (s *rotationAuditSpy) ReadRotationEpoch(_ context.Context, _, _, _, _ string) (uint64, error) {
 	return 0, nil
+}
+func (s *rotationAuditSpy) ReadAuditLog(_ context.Context, _, _, _ string) ([]byte, error) {
+	return nil, nil
 }
 func (s *rotationAuditSpy) CommitRotationTransport(_ context.Context, _ string, in coreregistry.CommitRotationInput) error {
 	s.calls++
@@ -1276,6 +1282,9 @@ func (s *rotationFailSpy) DiscardCounterSession(_ context.Context, _ string) {}
 func (s *rotationFailSpy) ReadRotationEpoch(_ context.Context, _, _, _, _ string) (uint64, error) {
 	return 0, nil
 }
+func (s *rotationFailSpy) ReadAuditLog(_ context.Context, _, _, _ string) ([]byte, error) {
+	return nil, nil
+}
 func (s *rotationFailSpy) CommitRotationTransport(_ context.Context, _ string, _ coreregistry.CommitRotationInput) error {
 	s.calls++
 	// Error: simulate a push failure. No audit entry is committed.
@@ -1313,6 +1322,9 @@ func (s *contributorModeRotationSpy) ReadAdmins(_ context.Context, _, _, _ strin
 func (s *contributorModeRotationSpy) DiscardCounterSession(_ context.Context, _ string) {}
 func (s *contributorModeRotationSpy) ReadRotationEpoch(_ context.Context, _, _, _, _ string) (uint64, error) {
 	return 0, nil
+}
+func (s *contributorModeRotationSpy) ReadAuditLog(_ context.Context, _, _, _ string) ([]byte, error) {
+	return nil, nil
 }
 func (s *contributorModeRotationSpy) CommitRotationTransport(_ context.Context, _ string, _ coreregistry.CommitRotationInput) error {
 	// CONTRIBUTOR mode: refuse immediately, no git clone.
@@ -1352,6 +1364,9 @@ func (s *rotationSignCountSpy) DiscardCounterSession(_ context.Context, _ string
 func (s *rotationSignCountSpy) ReadRotationEpoch(_ context.Context, _, _, _, _ string) (uint64, error) {
 	return 0, nil
 }
+func (s *rotationSignCountSpy) ReadAuditLog(_ context.Context, _, _, _ string) ([]byte, error) {
+	return nil, nil
+}
 func (s *rotationSignCountSpy) CommitRotationTransport(_ context.Context, _ string, _ coreregistry.CommitRotationInput) error {
 	// Empty PerFile should prevent reaching here.
 	if s.onSign != nil {
@@ -1390,6 +1405,9 @@ func (s *rotationCallCountSpy) DiscardCounterSession(_ context.Context, _ string
 func (s *rotationCallCountSpy) ReadRotationEpoch(_ context.Context, _, _, _, _ string) (uint64, error) {
 	return 0, nil
 }
+func (s *rotationCallCountSpy) ReadAuditLog(_ context.Context, _, _, _ string) ([]byte, error) {
+	return nil, nil
+}
 func (s *rotationCallCountSpy) CommitRotationTransport(_ context.Context, _ string, _ coreregistry.CommitRotationInput) error {
 	s.calls++
 	return nil
@@ -1424,6 +1442,9 @@ func (s *rotationParentSHASpy) ReadAdmins(_ context.Context, _, _, _ string) (re
 func (s *rotationParentSHASpy) DiscardCounterSession(_ context.Context, _ string) {}
 func (s *rotationParentSHASpy) ReadRotationEpoch(_ context.Context, _, _, _, _ string) (uint64, error) {
 	return 0, nil
+}
+func (s *rotationParentSHASpy) ReadAuditLog(_ context.Context, _, _, _ string) ([]byte, error) {
+	return nil, nil
 }
 func (s *rotationParentSHASpy) CommitRotationTransport(_ context.Context, _ string, in coreregistry.CommitRotationInput) error {
 	s.receivedParentSHA = in.RegistryParentSHA
@@ -1465,6 +1486,9 @@ func (s *perFileCASLeaseSpy) ReadAdmins(_ context.Context, _, _, _ string) (regi
 func (s *perFileCASLeaseSpy) DiscardCounterSession(_ context.Context, _ string) {}
 func (s *perFileCASLeaseSpy) ReadRotationEpoch(_ context.Context, _, _, _, _ string) (uint64, error) {
 	return 0, nil
+}
+func (s *perFileCASLeaseSpy) ReadAuditLog(_ context.Context, _, _, _ string) ([]byte, error) {
+	return nil, nil
 }
 func (s *perFileCASLeaseSpy) CommitRotationTransport(_ context.Context, _ string, _ coreregistry.CommitRotationInput) error {
 	return nil

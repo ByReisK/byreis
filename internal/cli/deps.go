@@ -27,6 +27,13 @@ type Deps struct {
 	// Doctor is the Doctor use-case. May be nil when adapters are not yet wired.
 	Doctor usecase.Doctor
 
+	// RotationHistoryDoctor is a Doctor instance pre-configured with
+	// RotationHistoryRequested=true and a wired RotationEpochProbe. When the
+	// --rotation-history flag is set and this field is non-nil, the doctor command
+	// uses this instance instead of Doctor. When nil the flag is silently ignored
+	// (no epoch probe is wired). May be nil when the registry is unavailable.
+	RotationHistoryDoctor usecase.Doctor
+
 	// Policy is the mode permission gate used for submit/review/merge/get/
 	// decrypt/edit commands. When non-nil it is called with CurrentMode + the
 	// command verb to decide whether to allow or deny.
@@ -87,6 +94,12 @@ type Deps struct {
 	// It is wired at BuildProductionDeps when BYREIS_GITHUB_TOKEN is set.
 	// Tests inject a fake that returns canned RequestAccessFile + PRMetadata.
 	RequestAccessReader rotate.RequestAccessReader
+
+	// AuditReader is the narrow read-only port the `admin audit show` command
+	// uses to fetch the registry audit log for one project. It is wired to
+	// *registry.Client.FetchAuditLog at BuildProductionDeps when the registry
+	// client is available. When nil the command returns a "not configured" error.
+	AuditReader rotate.AuditReader
 
 	// RotatePreFlight is the narrow read-only port the rotate command uses to
 	// perform the two pre-flight checks required before invoking Rotator.Rotate:

@@ -894,6 +894,9 @@ func (f *fakeCommitAtomicTransport) DiscardCounterSession(_ context.Context, _ s
 func (f *fakeCommitAtomicTransport) ReadRotationEpoch(_ context.Context, _, _, _, _ string) (uint64, error) {
 	return 0, nil
 }
+func (f *fakeCommitAtomicTransport) ReadAuditLog(_ context.Context, _, _, _ string) ([]byte, error) {
+	return nil, nil
+}
 
 // fakeConcurrentWriteTransport simulates a WriteCounter that fails with
 // ErrRegistryConcurrentWrite, as if another admin pushed first.
@@ -923,6 +926,9 @@ func (f *fakeConcurrentWriteTransport) ReadAdmins(_ context.Context, _, _, _ str
 func (f *fakeConcurrentWriteTransport) DiscardCounterSession(_ context.Context, _ string) {}
 func (f *fakeConcurrentWriteTransport) ReadRotationEpoch(_ context.Context, _, _, _, _ string) (uint64, error) {
 	return 0, nil
+}
+func (f *fakeConcurrentWriteTransport) ReadAuditLog(_ context.Context, _, _, _ string) ([]byte, error) {
+	return nil, nil
 }
 
 // fakeIdempotentTransport captures WriteCounter calls for idempotency testing.
@@ -956,6 +962,9 @@ func (f *fakeIdempotentTransport) ReadAdmins(_ context.Context, _, _, _ string) 
 func (f *fakeIdempotentTransport) DiscardCounterSession(_ context.Context, _ string) {}
 func (f *fakeIdempotentTransport) ReadRotationEpoch(_ context.Context, _, _, _, _ string) (uint64, error) {
 	return 0, nil
+}
+func (f *fakeIdempotentTransport) ReadAuditLog(_ context.Context, _, _, _ string) ([]byte, error) {
+	return nil, nil
 }
 
 // cwNopSigner is a no-op RegistryWriteSigner for tests that don't need signing.

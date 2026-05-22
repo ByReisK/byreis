@@ -554,6 +554,10 @@ func (f *fetchErrorTransport) ReadRotationEpoch(_ context.Context, _, _ string, 
 	return 0, nil
 }
 
+func (f *fetchErrorTransport) ReadAuditLog(_ context.Context, _, _, _ string) ([]byte, error) {
+	return nil, nil
+}
+
 // ---- V2.D4.2 — read-only caller does NOT reach CommitRotation ----------------
 
 // TestV2_D4_2_ReadOnlyCaller_DoesNotReachCommitRotation proves that a read-only
@@ -669,6 +673,10 @@ func (f *v2RotationEpochFakeTransport) ReadRotationEpoch(_ context.Context, _, _
 	return 0, nil
 }
 
+func (f *v2RotationEpochFakeTransport) ReadAuditLog(_ context.Context, _, _, _ string) ([]byte, error) {
+	return nil, nil
+}
+
 // commitRotationSpy is a FetchTransport that records CommitRotation calls and
 // can serve synthetic epoch maps for FetchRotationEpochs.
 type commitRotationSpy struct {
@@ -735,6 +743,10 @@ func (s *commitRotationSpy) ReadRotationEpoch(_ context.Context, _, _ string, _,
 	return 0, nil
 }
 
+func (s *commitRotationSpy) ReadAuditLog(_ context.Context, _, _, _ string) ([]byte, error) {
+	return nil, nil
+}
+
 // commitBumpSpy is a FetchTransport for V2.D5.4 that verifies CommitBump does
 // not modify rotation_epoch.
 type commitBumpSpy struct {
@@ -788,6 +800,10 @@ func (s *commitBumpSpy) ReadRotationEpoch(_ context.Context, _, _ string, _, fil
 		return parseRotationEpochFromBlob(s.counterBlob)
 	}
 	return 0, nil
+}
+
+func (s *commitBumpSpy) ReadAuditLog(_ context.Context, _, _, _ string) ([]byte, error) {
+	return nil, nil
 }
 
 // ---- Fix4: FetchRotationEpochs partial-source warn --------------------------
@@ -868,6 +884,10 @@ func (t *configErrorTransport) DiscardCounterSession(_ context.Context, _ string
 
 func (t *configErrorTransport) ReadRotationEpoch(_ context.Context, _, _ string, _, _ string) (uint64, error) {
 	return 0, nil
+}
+
+func (t *configErrorTransport) ReadAuditLog(_ context.Context, _, _, _ string) ([]byte, error) {
+	return nil, nil
 }
 
 // TestFetchRotationEpochs_PartialSource_WarnFires proves that when

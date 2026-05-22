@@ -290,6 +290,9 @@ func (p *pluggableTransport) DiscardCounterSession(_ context.Context, _ string) 
 func (p *pluggableTransport) ReadRotationEpoch(_ context.Context, _, _, _, _ string) (uint64, error) {
 	return 0, nil
 }
+func (p *pluggableTransport) ReadAuditLog(_ context.Context, _, _, _ string) ([]byte, error) {
+	return nil, nil
+}
 
 // newVerifiedTransport returns a pluggableTransport with verified=true and the
 // given readAdminsFn. headCommit defaults to a well-formed test SHA.

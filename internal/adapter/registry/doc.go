@@ -63,6 +63,25 @@
 // cache_windows.go (//go:build windows) — typed sentinel, every method fails.
 // cache.go (no build tag)             — Store struct, constructor, port types.
 //
+// # Rotation-epoch anti-rollback floor: backing-store posture
+//
+// The rotation-epoch anti-rollback floor (epochFloor / epochFloorHydrated in
+// registry.Client, persisted via CounterCacheStore.StoreRotationEpoch /
+// LoadRotationEpoch) shares the same epochs.json backing store as the cached
+// rotation_epoch value for each (project, file) pair, and inherits the same
+// Alt-β posture described above.
+//
+// Forgery resistance relies on the identical O_NOFOLLOW + fstat-on-fd +
+// checkOwner + checkFileMode (0o600) + per-registry path-namespacing discipline
+// used for the counter floor. There is no HMAC over the epochs.json content.
+// A same-uid disk attacker who can rewrite epochs.json can zero both the floor
+// and the stored epoch value, bypassing the anti-rollback check. This
+// limitation is accepted, and is identical to the counter floor limitation.
+//
+// If the counter floor is ever hardened to use a separate HMAC-protected file,
+// the epoch floor MUST migrate in lockstep — the two stores must share the
+// same integrity posture at all times.
+//
 // # Future implementers
 //
 // Do NOT default to a novel keyed MAC. The Alt-β posture per ADR-0014 is

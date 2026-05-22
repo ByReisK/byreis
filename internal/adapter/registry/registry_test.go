@@ -496,6 +496,10 @@ func (s *stubCounterTransport) ReadRotationEpoch(_ context.Context, _, _, _, _ s
 	return 0, nil
 }
 
+func (s *stubCounterTransport) ReadAuditLog(_ context.Context, _, _, _ string) ([]byte, error) {
+	return nil, nil
+}
+
 // ----- E1: ConfiguredFiles populated from SourceVerified fetch ---------------
 
 // stubVerifiedTransportWithConfig is a FetchTransport that returns a verified
@@ -546,6 +550,10 @@ func (s *stubVerifiedTransportWithConfig) ReadAdmins(_ context.Context, _, headC
 func (s *stubVerifiedTransportWithConfig) DiscardCounterSession(_ context.Context, _ string) {}
 func (s *stubVerifiedTransportWithConfig) ReadRotationEpoch(_ context.Context, _, _, _, _ string) (uint64, error) {
 	return 0, nil
+}
+
+func (s *stubVerifiedTransportWithConfig) ReadAuditLog(_ context.Context, _, _, _ string) ([]byte, error) {
+	return nil, nil
 }
 
 // TestE1_ConfiguredFiles_PopulatedFromSourceVerifiedFetch is the E1 positive

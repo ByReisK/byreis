@@ -2485,5 +2485,116 @@ func (t *productionFetchTransport) ReadRotationEpoch(ctx context.Context, repoUR
 	return cf.RotationEpoch, nil
 }
 
+// maxAuditJSONLBytes is the pre-decode size cap for the audit JSONL file.
+// Audit logs are append-only and can legitimately grow larger than a single
+// counter JSON object, so a generous ceiling is appropriate. The per-line cap
+// (maxAuditLineBytes) and the result-count cap are the real ceilings for OOM
+// safety; this total cap is the outermost defence against a pathologically large
+// or maliciously inflated blob.
+const maxAuditJSONLBytes = 8 * 1024 * 1024 // 8 MiB
+
+// maxAuditLineBytes is the per-JSONL-line byte cap applied via
+// bufio.Scanner.Buffer. A single audit event should never be remotely close to
+// this limit; setting it explicitly (rather than relying on the Scanner default)
+// makes the bound structural and testable.
+const maxAuditLineBytes = 256 * 1024 // 256 KiB
+
+// ReadAuditLog reads the raw audit/<projectID>.jsonl blob from the registry
+// tree at the exact verified headCommit. It mirrors ReadRotationEpoch in its
+// clone discipline: one temporary workspace, bounded subprocess timeout,
+// ValidateProjectID before path composition, IsBlobNotFound absent handling, and
+// a size ceiling before returning the raw bytes to the caller.
+//
+// headCommit MUST be the SHA from the caller's single preceding verified
+// FetchHead call (same-invocation provenance — no second FetchHead, no TOCTOU
+// window). An absent audit file returns (nil, nil); a blob exceeding
+// maxAuditJSONLBytes returns a typed bounded-read error.
+func (t *productionFetchTransport) ReadAuditLog(ctx context.Context, repoURL, headCommit, projectID string) ([]byte, error) {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, fmt.Errorf(
+			"ReadAuditLog: context already cancelled: %w — run `byreis doctor`", ctxErr)
+	}
+
+	if err := fetchtransport.ValidateProjectID(projectID); err != nil {
+		return nil, fmt.Errorf(
+			"%w: ReadAuditLog: invalid projectID: %v — run `byreis doctor`",
+			coreregistry.ErrCounterStoreUnreadable, err)
+	}
+	if !fetchtransport.IsValidSHA(headCommit) {
+		return nil, fmt.Errorf(
+			"%w: ReadAuditLog: headCommit %q is not a valid SHA — "+
+				"internal invariant violated; run `byreis doctor`",
+			coreregistry.ErrCounterStoreUnreadable, headCommit)
+	}
+
+	tmpDir, mkErr := os.MkdirTemp("", "byreis-audit-read-*")
+	if mkErr != nil {
+		return nil, fmt.Errorf("ReadAuditLog: cannot create temp workspace: %w — "+
+			"check filesystem permissions: run `byreis doctor`", mkErr)
+	}
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+
+	if chErr := os.Chmod(tmpDir, 0o700); chErr != nil { //nolint:gosec // 0700 on dir is intentional: owner-only scratch workspace
+		return nil, fmt.Errorf("ReadAuditLog: cannot chmod temp workspace to 0700: %w — "+
+			"check filesystem permissions: run `byreis doctor`", chErr)
+	}
+
+	cloneDir := filepath.Join(tmpDir, "repo")
+
+	hardenedEnv := func() []string {
+		base := fetchtransport.CleanGitEnv()
+		return append(base,
+			"GIT_CONFIG_NOSYSTEM=1",
+			"HOME="+tmpDir,
+			"GIT_TERMINAL_PROMPT=0",
+			"GIT_ALLOW_PROTOCOL=file:https:ssh",
+			"GIT_CONFIG_COUNT=2",
+			"GIT_CONFIG_KEY_0=core.hooksPath",
+			"GIT_CONFIG_VALUE_0=/dev/null",
+			"GIT_CONFIG_KEY_1=core.fsmonitor",
+			"GIT_CONFIG_VALUE_1=",
+		)
+	}
+
+	cloneCtx, cloneCancel := fetchtransport.WithBoundedDeadline(ctx, 30*time.Second)
+	defer cloneCancel()
+
+	_, cloneStderr, cloneExit, cloneErr := t.verifier.RunSubprocess(
+		cloneCtx, tmpDir, hardenedEnv(),
+		"git", "clone", "--depth=1", "--no-local", "--", repoURL, cloneDir,
+	)
+	if cloneErr != nil {
+		return nil, fmt.Errorf("ReadAuditLog: git clone exec error: %w — "+
+			"run `byreis doctor`", cloneErr)
+	}
+	if cloneExit != 0 {
+		return nil, fmt.Errorf("%w: ReadAuditLog: git clone exited %d: %s — "+
+			"run `byreis doctor`",
+			coreregistry.ErrCounterStoreUnreadable, cloneExit,
+			fetchtransport.SanitizeOutput(cloneStderr))
+	}
+
+	// Compose the audit blob path AFTER ValidateProjectID passes.
+	blobPath := "audit/" + projectID + ".jsonl"
+	raw, readErr := t.verifier.ReadBlobAtSHA(ctx, cloneDir, headCommit, blobPath)
+	if readErr != nil {
+		if fetchtransport.IsBlobNotFound(readErr) {
+			return nil, nil // absent audit file: valid "no entries yet" outcome
+		}
+		return nil, fmt.Errorf(
+			"%w: ReadAuditLog: reading %q at %q: %v — run `byreis doctor`",
+			coreregistry.ErrCounterStoreUnreadable, blobPath, headCommit, readErr)
+	}
+
+	if len(raw) > maxAuditJSONLBytes {
+		return nil, fmt.Errorf(
+			"%w: ReadAuditLog: audit blob %q at %q exceeds max size %d bytes — "+
+				"run `byreis doctor`",
+			coreregistry.ErrCounterStoreUnreadable, blobPath, headCommit, maxAuditJSONLBytes)
+	}
+
+	return raw, nil
+}
+
 // Compile-time assertion: productionFetchTransport satisfies FetchTransport.
 var _ FetchTransport = (*productionFetchTransport)(nil)

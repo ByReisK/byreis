@@ -33,6 +33,12 @@ func TestPolicy_CommandModeMatrix(t *testing.T) {
 	//   request-list : admin-only read-only triage verb listing OPEN
 	//     request-access PRs. The inverse of request-access: ADMIN and SUPER
 	//     allowed, CONTRIBUTOR denied.
+	//
+	// v0.2 V8 addition:
+	//   audit-show : admin-only read-only verb displaying signature-verified
+	//     audit entries. Mirrors request-list: ADMIN and SUPER allowed,
+	//     CONTRIBUTOR denied. Contributors read the audit log out-of-band via
+	//     `git show audit/<project>.jsonl` + `git verify-commit`.
 	allow := map[mode.Command]map[mode.Mode]bool{
 		mode.CommandVersion:           {mode.ModeContributor: true, mode.ModeAdmin: true, mode.ModeSuper: true},
 		mode.CommandInit:              {mode.ModeContributor: true, mode.ModeAdmin: true, mode.ModeSuper: true},
@@ -47,6 +53,7 @@ func TestPolicy_CommandModeMatrix(t *testing.T) {
 		mode.CommandRotationReconcile: {mode.ModeContributor: false, mode.ModeAdmin: true, mode.ModeSuper: true},
 		mode.CommandRequestAccess:     {mode.ModeContributor: true, mode.ModeAdmin: false, mode.ModeSuper: false},
 		mode.CommandRequestList:       {mode.ModeContributor: false, mode.ModeAdmin: true, mode.ModeSuper: true},
+		mode.CommandAuditShow:         {mode.ModeContributor: false, mode.ModeAdmin: true, mode.ModeSuper: true},
 	}
 
 	allModes := []mode.Mode{mode.ModeContributor, mode.ModeAdmin, mode.ModeSuper}
@@ -54,7 +61,7 @@ func TestPolicy_CommandModeMatrix(t *testing.T) {
 		mode.CommandVersion, mode.CommandInit, mode.CommandDoctor, mode.CommandSubmit,
 		mode.CommandReview, mode.CommandMerge, mode.CommandGet, mode.CommandDecrypt,
 		mode.CommandEdit, mode.CommandRotate, mode.CommandRotationReconcile,
-		mode.CommandRequestAccess, mode.CommandRequestList,
+		mode.CommandRequestAccess, mode.CommandRequestList, mode.CommandAuditShow,
 	}
 
 	// Guard: the expectation grid must cover the full cross-product so a missing
