@@ -995,7 +995,7 @@ func (t *productionFetchTransport) doCounterWrite(
 	fullMessage := commitMsgBody + "\n\nbyreis-signer: " + signerID + "\nbyreis-sig: " + fmt.Sprintf("%x", sig) + "\n"
 
 	// Step 9: write commit message to a temp file so the byreis-sig: footer
-	// never appears in the git subprocess argv (BO-V5b-4).
+	// never appears in the git subprocess argv.
 	msgFile := filepath.Join(tmpDir, "commitmsg-counter.txt")
 	if wErr := os.WriteFile(msgFile, []byte(fullMessage), 0o600); wErr != nil { //nolint:gosec
 		return fmt.Errorf("doCounterWrite: writing commit message file: %w", wErr)
@@ -1471,12 +1471,12 @@ func (t *productionFetchTransport) doCommitRotation(
 			"check admin identity configuration: run `byreis doctor`", signErr)
 	}
 
-	// byreis-sig: bytes are written to a temp file; they NEVER appear in argv (BO-V5b-4).
+	// byreis-sig: bytes are written to a temp file; they NEVER appear in argv.
 	fullMessage := commitMsgBody + "\n\nbyreis-signer: " + signerID +
 		"\nbyreis-sig: " + fmt.Sprintf("%x", sig) + "\n"
 
 	// Write commit message to a temp file so the byreis-sig: footer
-	// never appears in the git subprocess argv (BO-V5b-4).
+	// never appears in the git subprocess argv.
 	rotMsgFile := filepath.Join(tmpDir, "commitmsg-rotation.txt")
 	if wErr := os.WriteFile(rotMsgFile, []byte(fullMessage), 0o600); wErr != nil { //nolint:gosec
 		return fmt.Errorf("doCommitRotation: writing commit message file: %w", wErr)
@@ -2058,7 +2058,7 @@ type counterPendingJSON struct {
 // DisallowUnknownFields IS used in decodeCounterFile: truly unknown keys are
 // rejected (ErrCounterStoreUnreadable). The RotationEpoch field was added in
 // v0.2 and is declared here, so v0.2 files are accepted by DisallowUnknownFields.
-// V0.1 writes omit rotation_epoch; the omitempty tag means v0.2 also omits it
+// Writes from byreis v0.1 omit rotation_epoch; the omitempty tag means v0.2 also omits it
 // when epoch == 0, preserving wire compatibility for the counter-zero case.
 //
 // Note: a strict-decoder reader that rejects unknown JSON keys cannot parse

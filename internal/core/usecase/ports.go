@@ -130,8 +130,8 @@ type ManifestSigner interface {
 // surfaces rotate.ErrCommitBumpRejectedRotationInFlight before any write.
 //
 // The concrete implementation delegates to RegistryClient.RotationInFlight.
-// The guard is optional in MergeDeps: when nil, the check is skipped (V0.1
-// production deployments without the rotation adapter wired remain unblocked).
+// The guard is optional in MergeDeps: when nil, the PR-author check is
+// skipped (legacy merge path that predates author verification).
 // Fail-closed contract: on any uncertainty (network error, source-verified
 // failure) the guard reports in-flight=true so callers refuse the CommitBump
 // rather than risk corrupting a partial rotation.

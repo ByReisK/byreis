@@ -5,9 +5,9 @@
 //
 // This package (via its countercache sub-package) defines the canonical
 // integrity posture for all future on-disk caches in byreis. The binding
-// posture is Alt-β per ADR-0014: no HMAC, no novel MAC construction. The
-// rationale is documented in ADR-0014 — in brief, the threat model is
-// "local attacker with the process owner's privileges", against which an
+// posture is Alt-β: no HMAC, no novel MAC construction. The rationale is
+// that the threat model is "local attacker with the process owner's
+// privileges", against which an
 // HMAC keyed by public bytes adds performative protection only. The
 // file-system discipline below provides the actual security property.
 //
@@ -84,8 +84,8 @@
 //
 // # Future implementers
 //
-// Do NOT default to a novel keyed MAC. The Alt-β posture per ADR-0014 is
-// binding. If a future slice has a genuine need for a MAC (e.g. protecting
+// Do NOT default to a novel keyed MAC. The Alt-β posture is binding. If a
+// future slice has a genuine need for a MAC (e.g. protecting
 // a cache artefact that escapes the O_NOFOLLOW + 0o600 boundary), escalate
 // to the crypto reviewer before implementing — do not self-certify a new
 // cryptographic construction.

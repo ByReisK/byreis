@@ -11,7 +11,7 @@ package registry
 //     encode → write (ciphertext only) → commit via -F temp-file (never -m).
 //   - Pushes the rotation branch.
 //   - Per-file RecordPendingBump; file-K's CAS = registry HEAD after (K-1)'s
-//     bump (BO-V5b-6). Captures RegistryParentSHA after all N bumps land.
+//     bump. Captures RegistryParentSHA after all N bumps land.
 //
 // Phase-2 runs the TERMINAL leg:
 //   - CAS fast-forward push: --force-with-lease=refs/heads/main:<ProjectParentSHA>.
@@ -19,12 +19,12 @@ package registry
 //   - Returns Phase2Result (MergedSHA from branch HEAD before the push).
 //
 // Security invariants:
-//   - Plaintext zeroed in defer after re-encrypt (BO-V5b-9).
+//   - Plaintext zeroed in defer after re-encrypt.
 //   - Plaintext never touches disk; only ciphertext written.
 //   - NO plaintext in errors, logs, or argv.
-//   - Commit message written to temp file; git commit -F (never -m, BO-V5b-4).
+//   - Commit message written to temp file; git commit -F (never -m).
 //   - NO bare --force. NO rebase. CAS rejection surfaces clean sentinel.
-//   - NO auto-rollback (BO-V5b-3); errors surface ErrRotationReconcile.
+//   - NO auto-rollback; errors surface ErrRotationReconcile.
 
 import (
 	"context"
@@ -349,7 +349,7 @@ func (a *rotationPhase1Adapter) Execute(ctx context.Context, plan rotate.Rotatio
 		}
 	}
 
-	// Step 3 (BO-V5b-5): capture ProjectParentSHA BEFORE branch creation.
+	// Step 3: capture ProjectParentSHA BEFORE branch creation.
 	revCtx, revCancel := fetchtransport.WithBoundedDeadline(ctx, 10*time.Second)
 	defer revCancel()
 
@@ -432,7 +432,7 @@ func (a *rotationPhase1Adapter) Execute(ctx context.Context, plan rotate.Rotatio
 		Number:  0,
 	}
 
-	// Step 7 (BO-V5b-6): per-file RecordPendingBump with per-file CAS leases.
+	// Step 7: per-file RecordPendingBump with per-file CAS leases.
 	// RecordPendingBump → WriteCounter → CAS push advances the registry HEAD
 	// by one commit each call. File-K's CAS is managed internally by the
 	// RegistryClient's WriteCounter which re-fetches HEAD before each push.
@@ -485,7 +485,7 @@ func (a *rotationPhase1Adapter) Execute(ctx context.Context, plan rotate.Rotatio
 // processOneFile handles the per-file loop body: decrypt → re-encrypt to R' →
 // sign → encode → write (ciphertext only, never plaintext) → commit via -F.
 //
-// Plaintext is zeroed in a defer after all uses complete (BO-V5b-9).
+// Plaintext is zeroed in a defer after all uses complete.
 func (a *rotationPhase1Adapter) processOneFile(
 	ctx context.Context,
 	tmpDir, cloneDir string,
@@ -507,7 +507,7 @@ func (a *rotationPhase1Adapter) processOneFile(
 				"run `byreis auth login` or check your admin key",
 			snapshot.LogicalName, decErr)
 	}
-	// Plaintext zeroization on scope exit (BO-V5b-9). Best-effort: Go strings
+	// Plaintext zeroization on scope exit. Best-effort: Go strings
 	// are immutable, but we overwrite the backing slice where we can access it.
 	defer func() {
 		for k := range plaintext {
@@ -608,7 +608,7 @@ func (a *rotationPhase1Adapter) processOneFile(
 			snapshot.LogicalName, addExit, fetchtransport.SanitizeOutput(addStderr))
 	}
 
-	// 5k (BO-V5b-4): write the full commit message to a temp file so the
+	// 5k: write the full commit message to a temp file so the
 	// byreis-sig: footer NEVER appears in argv.
 	commitMsgBody := fmt.Sprintf(
 		"byreis: rotation re-encrypt\n\n"+

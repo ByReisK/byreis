@@ -261,9 +261,9 @@ type RotationStateProbe interface {
 	// in the observation; a stale or unverified fetch is itself dangerous
 	// for reconcile and the probe surfaces ErrRotationRequiresFreshRegistry.
 	//
-	// Probe reuses RegistryWriteToken for read access at V5b; FL-V6-CRYPTO-3
-	// introduces a distinct RegistryReadTokenProvider at V6; the WriteToken's
-	// load-site CONTRIBUTOR-refusal is honored throughout the V5b call chain.
+	// The probe reuses the registry write-token for read access; a distinct
+	// read-token provider is planned. The write-token's load-site
+	// CONTRIBUTOR-refusal is honored throughout this call chain.
 	FetchPartialState(ctx context.Context, projectID string) (PartialStateObservation, error)
 }
 
@@ -393,7 +393,7 @@ type RequestAccessFile struct {
 // GitHub-controlled attributes that participate in a trust decision appear here,
 // so the use-case has no API surface to mis-key against (e.g. PR body / title).
 //
-// The struct is populated by the adapter at the github seam (V6.2). Every
+// The struct is populated by the adapter at the github seam. Every
 // validation decision against PRMetadata is byte-equal or enumerated; no field
 // is regex-parsed out of free text.
 type PRMetadata struct {
@@ -521,8 +521,8 @@ type AuditEntryView struct {
 
 // RequestAccessReader is the consumer-defined port the admin-side `--from-request`
 // orchestration uses to fetch the contributor's PR payload and the canonical
-// GitHub metadata required for the BO-3 PR-author-vs-YAML check. The real
-// adapter (V6.2) sits on the github SDK; this port keeps the use-case spine
+// GitHub metadata required for the PR-author-vs-YAML check. The github-SDK
+// adapter implements this port; this port keeps the use-case spine
 // independent of any SDK type.
 //
 // The adapter implementation MUST fail closed across the following failure

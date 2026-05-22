@@ -11,7 +11,7 @@ package registry
 //     plan stored by Phase-1 (via the planMu-guarded lastPlan field).
 //   - Returns Phase2Result with MergedSHA and CommitRotationSHA.
 //
-// Error handling: errors NEVER trigger auto-rollback (BO-V5b-3). A mid-flight
+// Error handling: errors NEVER trigger auto-rollback. A mid-flight
 // failure is classified as PHASE_2_MIDFLIGHT by the reconciler and surfaces
 // ErrRotationReconcile to the operator.
 

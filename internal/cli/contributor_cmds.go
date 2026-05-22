@@ -64,8 +64,8 @@ func newRequestAccessCmd(deps *Deps, jsonFlag *bool) *cobra.Command {
 Operator-honesty contract: ` + rotate.RequestAccessHonestyContract + `.
 
 Requires CONTRIBUTOR mode: denied-by-policy for ADMIN/SUPER operators before
-any GitHub auth or network contact. This verb does NOT consume the §7 trust-path
-verb ceiling and does NOT acquire a registry-write credential.
+any GitHub auth or network contact. This verb does NOT consume the trust-path verb ceiling
+and does NOT acquire a registry-write credential.
 
 The PR deposits a ` + "`requests/<handle>.yaml`" + ` file containing your age public key
 and justification. An admin reviews the PR and may absorb it via

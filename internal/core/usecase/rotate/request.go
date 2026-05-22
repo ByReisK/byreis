@@ -25,9 +25,9 @@ import (
 //     PR-author-vs-YAML state machine refusing each of the 9 documented
 //     impersonation/race modes plus the fork-ownership-change race.
 //
-// The adapter-side fetch (GitHub SDK client + path scope check + HEAD-SHA
-// pinning) lives in V6.2; this file owns the domain layer and is exercised
-// via in-memory fixtures only — no real network, fs, clock, or SDK contact.
+// The adapter owns the github-side fetch (GitHub SDK client + path scope check
+// + HEAD-SHA pinning); this file owns the domain layer and is exercised via
+// in-memory fixtures only — no real network, fs, clock, or SDK contact.
 
 // requestAccessSchemaVersionRE matches the canonical schema_version family.
 // v0.2 accepts any non-negative integer suffix in the request_access family;

@@ -213,7 +213,7 @@ func BuildProductionDeps(ctx context.Context) (*cli.Deps, error) {
 	)
 
 	// Build the rotation use-cases. The Rotator now wires the production
-	// Phase-1/Phase-2 executors (V5b). Both are nil-safe: the CLI surfaces a
+	// Phase-1/Phase-2 executors. Both are nil-safe: the CLI surfaces a
 	// "not configured" error at command time when the Rotator is nil. The
 	// Reconciler is wired via RotationReverserAdapter for both probe and reverser.
 	rotator, rotateExitCode := buildRotatorProd(
