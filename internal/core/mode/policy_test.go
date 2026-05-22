@@ -28,6 +28,11 @@ func TestPolicy_CommandModeMatrix(t *testing.T) {
 	//   request-access : contributor-only (permission inversion vs rotate);
 	//     ADMIN and SUPER are DENIED (the admin path to add an admin is the
 	//     out-of-band registry admin-add flow, not request-access).
+	//
+	// v0.2 V7 addition:
+	//   request-list : admin-only read-only triage verb listing OPEN
+	//     request-access PRs. The inverse of request-access: ADMIN and SUPER
+	//     allowed, CONTRIBUTOR denied.
 	allow := map[mode.Command]map[mode.Mode]bool{
 		mode.CommandVersion:           {mode.ModeContributor: true, mode.ModeAdmin: true, mode.ModeSuper: true},
 		mode.CommandInit:              {mode.ModeContributor: true, mode.ModeAdmin: true, mode.ModeSuper: true},
@@ -41,6 +46,7 @@ func TestPolicy_CommandModeMatrix(t *testing.T) {
 		mode.CommandRotate:            {mode.ModeContributor: false, mode.ModeAdmin: true, mode.ModeSuper: true},
 		mode.CommandRotationReconcile: {mode.ModeContributor: false, mode.ModeAdmin: true, mode.ModeSuper: true},
 		mode.CommandRequestAccess:     {mode.ModeContributor: true, mode.ModeAdmin: false, mode.ModeSuper: false},
+		mode.CommandRequestList:       {mode.ModeContributor: false, mode.ModeAdmin: true, mode.ModeSuper: true},
 	}
 
 	allModes := []mode.Mode{mode.ModeContributor, mode.ModeAdmin, mode.ModeSuper}
@@ -48,7 +54,7 @@ func TestPolicy_CommandModeMatrix(t *testing.T) {
 		mode.CommandVersion, mode.CommandInit, mode.CommandDoctor, mode.CommandSubmit,
 		mode.CommandReview, mode.CommandMerge, mode.CommandGet, mode.CommandDecrypt,
 		mode.CommandEdit, mode.CommandRotate, mode.CommandRotationReconcile,
-		mode.CommandRequestAccess,
+		mode.CommandRequestAccess, mode.CommandRequestList,
 	}
 
 	// Guard: the expectation grid must cover the full cross-product so a missing

@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -428,6 +429,7 @@ Commands under 'admin' are gated by mode policy and denied-by-policy
 	}
 	admin.AddCommand(newAdminMergeCmd(deps, jsonFlag))
 	admin.AddCommand(newAdminRotationCmd(deps, jsonFlag))
+	admin.AddCommand(newAdminRequestCmd(deps, jsonFlag))
 	return admin
 }
 
@@ -573,6 +575,151 @@ phase-1-only. All other classifications exit without any keychain access.`,
 	cmd.Flags().StringVar(&project, "project", "", "project ID (required)")
 	_ = cmd.MarkFlagRequired("project")
 
+	return cmd
+}
+
+// newAdminRequestCmd constructs the `admin request` parent command. Currently
+// provides only the `list` subverb. There is deliberately no `approve`,
+// `reject`, or `close` subverb here; request rejection must go through
+// `gh pr close` on the registry repo, and request promotion goes through
+// `byreis rotate --add --from-request <PR>`.
+func newAdminRequestCmd(deps *Deps, jsonFlag *bool) *cobra.Command {
+	req := &cobra.Command{
+		Use:   "request",
+		Short: "Admin request-access operations",
+		Long: `Admin-only operations on contributor request-access pull requests.
+
+Commands under 'admin request' are gated by mode policy and denied-by-policy
+when running as CONTRIBUTOR.
+
+To approve a request: byreis rotate --add --from-request <owner/repo#N>
+To reject a request:  gh pr close <N> --repo <owner/repo>`,
+	}
+	req.AddCommand(newAdminRequestListCmd(deps, jsonFlag))
+	return req
+}
+
+// newAdminRequestListCmd constructs the `admin request list` command. It lists
+// every OPEN request-access pull request in the admin registry repo so an
+// admin can triage and then act with `byreis rotate --add --from-request <PR>`.
+//
+// The command is read-only: it performs no trust decision, no YAML decode, and
+// no ValidateRequestAccess call. It contacts GitHub once (paginated PR list)
+// and renders a summary table or JSON.
+//
+// Mode gate is enforced first. A CONTRIBUTOR invocation is denied-not-attempted:
+// the ListOpenRequests call is never reached.
+func newAdminRequestListCmd(deps *Deps, jsonFlag *bool) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "list",
+		Short: "List open contributor request-access PRs (admin only)",
+		Long: `List every OPEN request-access pull request in the admin registry repo.
+
+Requires ADMIN mode: denied-by-policy before any network touch.
+
+This command is read-only: it performs no trust decision, no ValidateRequestAccess
+call, and no registry write. Each row shows the PR reference, the contributor's
+GitHub login, the creation date, and the PR title.
+
+To act on a listed request:
+  Approve: byreis rotate --add --from-request <owner/repo#N>
+  Reject:  gh pr close <N> --repo <owner/repo>
+
+There is no 'approve' or 'reject' subverb here by design: all trust decisions
+go through the rotate --from-request path or the registry branch-protection rules.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			r := render.New(*jsonFlag)
+			r.Out = cmd.OutOrStdout()
+			r.Err = cmd.ErrOrStderr()
+
+			// Mode gate FIRST — denied-not-attempted before any network touch.
+			if pErr := checkPolicy(deps, r, mode.CommandRequestList, "admin request list"); pErr != nil {
+				return pErr
+			}
+
+			if deps.RequestAccessReader == nil {
+				err := fmt.Errorf(
+					"admin request list not available: the RequestAccessReader is not wired — " +
+						"set BYREIS_GITHUB_TOKEN and BYREIS_REGISTRY and run `byreis doctor`")
+				r.PrintErrorClass("general-error", err.Error(),
+					"set BYREIS_GITHUB_TOKEN and BYREIS_REGISTRY and run `byreis doctor`")
+				return &exitError{code: render.ExitGeneralError, cause: err}
+			}
+
+			ctx := cmd.Context()
+			summaries, err := deps.RequestAccessReader.ListOpenRequests(ctx)
+			if err != nil {
+				r.PrintErrorClass("general-error", err.Error(),
+					"check BYREIS_REGISTRY and BYREIS_GITHUB_TOKEN; "+
+						"run `byreis auth login` if auth expired")
+				return &exitError{code: render.ExitGeneralError, cause: err}
+			}
+
+			// Deterministic sort: newest-first by CreatedAt (descending), with
+			// ascending PR number as a tie-breaker for reproducible output.
+			sorted := make([]rotate.OpenRequestSummary, len(summaries))
+			copy(sorted, summaries)
+			sort.Slice(sorted, func(i, j int) bool {
+				if sorted[i].CreatedAt != sorted[j].CreatedAt {
+					// Lexicographic reverse of RFC3339 timestamps is
+					// chronologically correct because RFC3339 is ISO 8601
+					// with the ordering property: a later timestamp is
+					// lexicographically greater.
+					return sorted[i].CreatedAt > sorted[j].CreatedAt
+				}
+				return sorted[i].PRRef.Number < sorted[j].PRRef.Number
+			})
+
+			if *jsonFlag {
+				type jsonRow struct {
+					PR        string `json:"pr"`
+					Author    string `json:"author"`
+					Title     string `json:"title"`
+					CreatedAt string `json:"created_at"`
+					HeadSHA   string `json:"head_sha"`
+				}
+				rows := make([]jsonRow, len(sorted))
+				for i, s := range sorted {
+					rows[i] = jsonRow{
+						PR:        fmt.Sprintf("%s#%d", s.PRRef.Project, s.PRRef.Number),
+						Author:    s.AuthorLogin,
+						Title:     s.Title, // JSON carries raw title for machine output
+						CreatedAt: s.CreatedAt,
+						HeadSHA:   s.HeadSHA,
+					}
+				}
+				_ = render.EncodeJSON(r.Out, map[string]any{"requests": rows})
+				return nil
+			}
+
+			// Human table output.
+			if len(sorted) == 0 {
+				_, _ = fmt.Fprintln(r.Out, "no open access requests")
+				return nil
+			}
+
+			// Header row.
+			_, _ = fmt.Fprintf(r.Out, "%-40s  %-20s  %-25s  %s\n",
+				"PR", "AUTHOR", "CREATED", "TITLE")
+			_, _ = fmt.Fprintf(r.Out, "%-40s  %-20s  %-25s  %s\n",
+				strings.Repeat("-", 40), strings.Repeat("-", 20),
+				strings.Repeat("-", 25), strings.Repeat("-", 30))
+
+			for _, s := range sorted {
+				prStr := fmt.Sprintf("%s#%d", s.PRRef.Project, s.PRRef.Number)
+				// Title passes through SanitizeForTerminal (strips ANSI, C0, bidi)
+				// and then through collapseLineBreaks so that a contributor-controlled
+				// newline or tab cannot inject a fake second row into the table.
+				// collapseLineBreaks is applied only here (the single-line table sink);
+				// the --json path carries the raw title through encoding/json untouched.
+				safeTitle := collapseLineBreaks(render.SanitizeForTerminal(s.Title))
+				_, _ = fmt.Fprintf(r.Out, "%-40s  %-20s  %-25s  %s\n",
+					prStr, s.AuthorLogin, s.CreatedAt, safeTitle)
+			}
+			return nil
+		},
+	}
 	return cmd
 }
 
@@ -789,6 +936,21 @@ func reconcileHintFor(code render.ExitCode, err error) string {
 		return "run `byreis doctor` for diagnostics"
 	}
 	return "run `byreis doctor` for diagnostics"
+}
+
+// collapseLineBreaks replaces newline (\n), carriage return (\r), and tab (\t)
+// characters with a single space. It is applied to PR titles in the human/table
+// render path only — after SanitizeForTerminal — so that a contributor-controlled
+// multi-line title cannot inject a fake extra row into the single-line-per-row
+// table. The --json path is unaffected: encoding/json escapes control bytes
+// without this transform, preserving the raw value for machine consumers.
+func collapseLineBreaks(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\r' || r == '\t' {
+			return ' '
+		}
+		return r
+	}, s)
 }
 
 // Ensure parsePRRef and related helpers are only used at the CLI boundary.

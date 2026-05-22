@@ -505,3 +505,15 @@ func (r *sgV6FakeRequestAccessReader) FetchPRHeadSHA(
 	// SHA drift set headSHA != meta.HeadSHA; ownerLogin is kept stable here.
 	return r.headSHA, r.meta.HeadRepoOwnerLogin, nil
 }
+
+// ListOpenRequests is not exercised by the V6 shipgate fixtures (the gate
+// drives the --from-request lift, not the V7 triage list); it is present only
+// so the fake continues to satisfy the RequestAccessReader port.
+func (r *sgV6FakeRequestAccessReader) ListOpenRequests(
+	ctx context.Context,
+) ([]rotate.OpenRequestSummary, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, errors.New("sgV6FakeRequestAccessReader: context cancelled")
+	}
+	return nil, nil
+}

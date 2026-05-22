@@ -238,6 +238,14 @@ func (*docgateFakeRequestAccessReader) FetchPRHeadSHA(
 	return docgateRequestAccessHeadSHA, docgateRequestAccessHandle, nil
 }
 
+// ListOpenRequests is not exercised by the docgate --from-request fixtures; it
+// satisfies the RequestAccessReader port so the fake still compiles.
+func (*docgateFakeRequestAccessReader) ListOpenRequests(
+	_ context.Context,
+) ([]rotate.OpenRequestSummary, error) {
+	return nil, nil
+}
+
 // docgateFakeRotatorFromRequest accepts the rotation input the CLI hands it
 // after --from-request validation completes and returns a completed result.
 // HasRemovals=false because --from-request is an additive --add path; the

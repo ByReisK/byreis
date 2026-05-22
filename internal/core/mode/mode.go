@@ -115,6 +115,12 @@ const (
 	// contributor's own GitHub identity (the same v0.1 submit transport) and
 	// introduces no new registry-write keychain credential.
 	CommandRequestAccess Command = "request-access"
+	// CommandRequestList is the admin-side read-only verb that lists OPEN
+	// contributor request-access PRs in the admin registry repo. Permission
+	// inversion vs CommandRequestAccess: admin-only, denied for CONTRIBUTOR. The
+	// verb makes no registry write and reaches no trust decision; it is a triage
+	// convenience over the same read port the `--from-request` lift consumes.
+	CommandRequestList Command = "request-list"
 )
 
 // ErrKeyPermissions is a hard error returned when the private key file exists
@@ -310,6 +316,9 @@ var matrix = map[Command]map[Mode]bool{
 	// invocation is denied — an admin who wants to add themselves goes
 	// through the out-of-band registry admin-add flow instead.
 	CommandRequestAccess: {ModeContributor: true},
+	// Admin-only read-only triage verb (inverse of CommandRequestAccess):
+	// CONTRIBUTOR is denied, ADMIN/SUPER may list open request-access PRs.
+	CommandRequestList: {ModeAdmin: true, ModeSuper: true},
 }
 
 // Allow returns nil if cmd is permitted in mode m, or an error wrapping

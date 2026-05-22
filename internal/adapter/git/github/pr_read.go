@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"time"
 
 	ghsdk "github.com/google/go-github/v72/github"
 
@@ -257,6 +258,57 @@ func (r *RequestAccessReader) ListOpenRequestAccessPRs(
 		opts.Page = resp.NextPage
 	}
 	return count, nil
+}
+
+// ListOpenRequests returns the read-only triage projection of every open PR on
+// the registry repo. It performs no trust decision and fetches no per-PR fork
+// content: each summary carries only the GitHub-canonical metadata available on
+// the list response (PR number, author login, title, created-at, head SHA). An
+// empty registry yields an empty slice and a nil error.
+//
+// The richer per-PR validation (path-scope, HEAD-SHA pinning, the PR-author
+// state machine) is intentionally NOT performed here; that is the absorb-time
+// concern of FetchRequestAccessYAML / FetchPRHeadSHA, which the `--from-request`
+// lift re-runs against the chosen PR.
+func (r *RequestAccessReader) ListOpenRequests(
+	ctx context.Context,
+) ([]rotate.OpenRequestSummary, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("ListOpenRequests cancelled: %w", err)
+	}
+
+	var out []rotate.OpenRequestSummary
+	opts := &ghsdk.PullRequestListOptions{
+		State:       "open",
+		ListOptions: ghsdk.ListOptions{PerPage: 100},
+	}
+	for {
+		prs, resp, err := r.client.PullRequests.List(ctx, r.owner, r.repo, opts)
+		if err != nil {
+			return nil, r.wrapReadErr("ListOpenRequests/List", err)
+		}
+		for _, pr := range prs {
+			var authorLogin string
+			if pr.GetUser() != nil {
+				authorLogin = strings.ToLower(pr.GetUser().GetLogin())
+			}
+			out = append(out, rotate.OpenRequestSummary{
+				PRRef: coregit.PRRef{
+					Project: r.owner + "/" + r.repo,
+					Number:  pr.GetNumber(),
+				},
+				AuthorLogin: authorLogin,
+				Title:       pr.GetTitle(),
+				CreatedAt:   pr.GetCreatedAt().Format(time.RFC3339),
+				HeadSHA:     pr.GetHead().GetSHA(),
+			})
+		}
+		if resp == nil || resp.NextPage == 0 {
+			break
+		}
+		opts.Page = resp.NextPage
+	}
+	return out, nil
 }
 
 // ─── internal helpers ────────────────────────────────────────────────────────

@@ -466,6 +466,17 @@ type FromRequestPRMeta struct {
 	ValidatedAuthorLogin string
 }
 
+// OpenRequestSummary is the read-only triage projection of one open
+// request-access PR. Carries ONLY GitHub-canonical metadata; it is NOT a
+// trust input and is NEVER fed to the request-access validation state machine.
+type OpenRequestSummary struct {
+	PRRef       git.PRRef // registry <owner>/<repo>#<number> — the ref `rotate --add --from-request` consumes
+	AuthorLogin string    // pull_request.user.login, lowercase-normalised (advisory)
+	Title       string    // pull_request.title — DISPLAY ONLY, sanitized at the render layer
+	CreatedAt   string    // RFC3339 advisory age field
+	HeadSHA     string    // PR HEAD at list time (advisory; absorb-time re-pins)
+}
+
 // RequestAccessReader is the consumer-defined port the admin-side `--from-request`
 // orchestration uses to fetch the contributor's PR payload and the canonical
 // GitHub metadata required for the BO-3 PR-author-vs-YAML check. The real
@@ -516,6 +527,14 @@ type RequestAccessReader interface {
 	// race; ownerLogin drift means the fork was transferred between plan and
 	// execute. Both conditions fail closed before Phase-1 starts.
 	FetchPRHeadSHA(ctx context.Context, prRef git.PRRef) (sha string, ownerLogin string, err error)
+	// ListOpenRequests returns the read-only triage projection of every OPEN
+	// request-access PR in the registry repo. It performs no trust decision and
+	// fetches no per-PR fork content: each summary carries only GitHub-canonical
+	// metadata for operator display, never the contributor-authored age_pubkey
+	// or justification. An empty result is a valid, non-error outcome ("nothing
+	// to triage"); a backend failure returns a non-nil error so the caller never
+	// mistakes a fetch failure for an empty queue.
+	ListOpenRequests(ctx context.Context) ([]OpenRequestSummary, error)
 }
 
 // RegistryReadTokenProvider is a NEW consumer-defined port introduced at V6
