@@ -191,7 +191,7 @@ func unmarshalEnvelope[T any](data []byte, registryURL string) (T, error) {
 
 // ---- Compile-time interface assertion ---------------------------------------
 
-// Ensure Store satisfies the CounterCacheStore port including the V2 rotation
+// Ensure Store satisfies the CounterCacheStore port including the rotation
 // epoch methods.
 var _ coreregistry.CounterCacheStore = (*Store)(nil)
 

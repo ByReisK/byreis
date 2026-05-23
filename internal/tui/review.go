@@ -246,7 +246,7 @@ func (m reviewModel) doReview(prRef string) tea.Cmd {
 		// and sufficient enforcement. No decrypted value is ever copied into the
 		// detail struct or the bubbletea message. The ReviewResult local (res)
 		// exits scope when this closure returns; the GC reclaims it.
-		// The §2 AST guard mechanically enforces that no .Plaintext selector
+		// The AST guard mechanically enforces that no .Plaintext selector
 		// appears anywhere in the TUI source.
 
 		if err != nil {

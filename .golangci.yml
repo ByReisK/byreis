@@ -124,7 +124,7 @@ linters:
         - pattern: 'rotate\.ForwardSecrecyWarning'
           msg: "rotate.ForwardSecrecyWarning may only be referenced at byte-equality assertion sites against an independent verbatim fixture; any other reference defeats the forward-secrecy three-way equality check. If this is a legitimate boundary assertion, mark the line with //nolint:forbidigo // boundary: equality assertion only OR //nolint:forbidigo // boundary: CLI R4a output."
         - pattern: 'rotate\.RequestAccessAdminWarning'
-          msg: "rotate.RequestAccessAdminWarning may only be referenced at the sole legitimate CLI emission site (rotate --add --from-request handler) and at the V6 docgate byte-equality assertion site. Any other reference defeats the single-source-of-truth contract. If this is a legitimate boundary assertion, mark the line with //nolint:forbidigo // boundary: CLI BO-3 warning OR //nolint:forbidigo // boundary: equality assertion only."
+          msg: "rotate.RequestAccessAdminWarning may only be referenced at the sole legitimate CLI emission site (rotate --add --from-request handler) and at the docgate byte-equality assertion site. Any other reference defeats the single-source-of-truth contract. If this is a legitimate boundary assertion, mark the line with //nolint:forbidigo // boundary: CLI admin-warning OR //nolint:forbidigo // boundary: equality assertion only."
       analyze-types: false
 
     govet:

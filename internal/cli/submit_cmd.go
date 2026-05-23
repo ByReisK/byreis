@@ -695,51 +695,6 @@ func renderReviewResult(r *render.Renderer, result usecase.ReviewResult, jsonMod
 	return nil
 }
 
-// newMergeCmd constructs the `byreis merge` command (admin-only, stubbed).
-func newMergeCmd(deps *Deps, jsonFlag *bool) *cobra.Command {
-	var prNumber int
-
-	cmd := &cobra.Command{
-		Use:   "merge",
-		Short: "Merge a verified submission (admin only)",
-		Long: `Merge a reviewed and signed submission into the secrets file.
-
-Requires ADMIN mode. The submission must have been reviewed and signed before
-merge. The merge path enforces the anti-replay counter and the file-path
-cross-check against the signed registry configuration.`,
-		Args: cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			r := render.New(*jsonFlag)
-			r.Out = cmd.OutOrStdout()
-			r.Err = cmd.ErrOrStderr()
-
-			if deps.Policy != nil {
-				if err := deps.Policy.Allow(deps.CurrentMode, mode.CommandMerge); err != nil {
-					r.PrintError(err.Error())
-					return &exitError{code: render.ExitPermissionDenied, cause: err}
-				}
-			} else {
-				// No policy wired: default-deny for admin-only commands.
-				err := fmt.Errorf("%w: merge requires ADMIN mode — "+
-					"no admin key found or mode policy not configured; "+
-					"see `byreis doctor` for your current mode",
-					mode.ErrPermissionDenied)
-				r.PrintError(err.Error())
-				return &exitError{code: render.ExitPermissionDenied, cause: err}
-			}
-
-			r.PrintError(fmt.Sprintf(
-				"merge --pr %d: not yet implemented — adapters not yet wired", prNumber))
-			return fmt.Errorf("merge not available: adapters not wired")
-		},
-	}
-
-	cmd.Flags().IntVar(&prNumber, "pr", 0, "PR number to merge (required)")
-	_ = cmd.MarkFlagRequired("pr")
-
-	return cmd
-}
-
 // readEnvFileBounded opens filePath and reads at most maxEnvFileBytes bytes.
 // If the file's reported size already exceeds the ceiling, the file is refused
 // before any read is attempted (stat-then-refuse). If the file is within the

@@ -107,9 +107,10 @@ func BuildRotationAuditEvent(plan RotationPlan, projectID string, when time.Time
 //     audit consumers diff event Details across reversal events and a
 //     non-deterministic index assignment would make those diffs noisy and
 //     untrustworthy.
-//   - reversal_reason: pinned at "phase-1-only-classification" for V5. Future
-//     reversal triggers (post-V5) would extend this enumeration; the value
-//     pin makes V5 reversal events distinguishable from future ones.
+//   - reversal_reason: pinned at "phase-1-only-classification" for the
+//     current rotation phase. Future reversal triggers would extend this
+//     enumeration; the value pin makes phase-1 reversal events
+//     distinguishable from future ones.
 //
 // Absence contract:
 //

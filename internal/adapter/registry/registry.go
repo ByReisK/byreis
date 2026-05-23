@@ -856,8 +856,8 @@ func (c *Client) CommitBump(ctx context.Context, in coreregistry.CommitBumpInput
 // Client.CommitRotation to return ErrCommitRotationNotImplemented.
 //
 // The method is not part of the FetchTransport interface because the full
-// rotation transport is shipped in a later release; V2 declares the port but
-// the transport wiring lands in V3.
+// rotation transport is shipped in a later release; the port is declared
+// ahead of the transport wiring to allow the interface to stabilise first.
 type rotationCommitTransport interface {
 	// CommitRotationTransport atomically advances last_accepted_counter for all
 	// N files, clears pending, and records the new rotation_epoch in a single
@@ -1129,10 +1129,10 @@ func (c *Client) offlineFetchRotationEpochs(ctx context.Context, projectID, reas
 // clears all N pending records, and increments rotation_epoch to in.NewEpoch
 // in one signed registry commit.
 //
-// V2 note: the full transport wiring lands in V3. In V2, the method delegates
-// to the transport only when it implements the optional rotationCommitTransport
-// extension. Otherwise it returns ErrCommitRotationNotImplemented so callers
-// receive the actionable hint: "rotation transport not available in this build".
+// The method delegates to the transport only when it implements the optional
+// rotationCommitTransport extension. Otherwise it returns
+// ErrCommitRotationNotImplemented so callers receive the actionable hint:
+// "rotation transport not available in this build".
 func (c *Client) CommitRotation(ctx context.Context, in coreregistry.CommitRotationInput) (coreregistry.CommitRotationResult, error) {
 	if err := ctx.Err(); err != nil {
 		return coreregistry.CommitRotationResult{}, fmt.Errorf(
@@ -1160,7 +1160,8 @@ func (c *Client) CommitRotation(ctx context.Context, in coreregistry.CommitRotat
 		}, nil
 	}
 
-	// Transport does not implement CommitRotation — V3 wires the full transport.
+	// Transport does not implement CommitRotation; upgrade to a build with the
+	// full rotation transport wired.
 	return coreregistry.CommitRotationResult{}, fmt.Errorf(
 		"%w: transport does not implement CommitRotation — "+
 			"upgrade to a build with full rotation support",

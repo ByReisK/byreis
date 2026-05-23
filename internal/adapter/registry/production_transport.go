@@ -1192,10 +1192,10 @@ func buildCounterCommitMessageBody(
 }
 
 // CommitRotationTransport implements the optional rotationCommitTransport
-// extension interface. It is the V3 realisation of CommitRotation: one signed
-// registry commit that atomically advances last_accepted_counter for all N files,
-// clears all N pending records, updates the rotation_epoch for all N files, and
-// appends one audit/<project>.jsonl entry.
+// extension interface. It is the production realisation of CommitRotation: one
+// signed registry commit that atomically advances last_accepted_counter for all
+// N files, clears all N pending records, updates the rotation_epoch for all N
+// files, and appends one audit/<project>.jsonl entry.
 //
 // The push uses --force-with-lease=refs/heads/main:<in.RegistryParentSHA>. The
 // RegistryParentSHA MUST be the post-Phase-1 registry tip (the registry HEAD

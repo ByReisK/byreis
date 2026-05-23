@@ -12,9 +12,9 @@ import (
 
 // TestPolicyGate_ContributorMode_AdminCommandsDenied exercises the production
 // wiring path: a populated Deps with CurrentMode=ModeContributor and a non-nil
-// Policy must deny review/merge/get/decrypt/edit with ErrPermissionDenied and
-// ExitPermissionDenied. This verifies the denied-not-attempted property through
-// the shipped entry point, not only injected fakes.
+// Policy must deny review/admin merge/get/decrypt/edit with ErrPermissionDenied
+// and ExitPermissionDenied. This verifies the denied-not-attempted property
+// through the shipped entry point, not only injected fakes.
 func TestPolicyGate_ContributorMode_AdminCommandsDenied(t *testing.T) {
 	t.Parallel()
 
@@ -32,7 +32,7 @@ func TestPolicyGate_ContributorMode_AdminCommandsDenied(t *testing.T) {
 		cmdName string
 	}{
 		{[]string{"review", "--pr", "1"}, "review"},
-		{[]string{"merge", "--pr", "1"}, "merge"},
+		{[]string{"admin", "merge", "--project", "proj", "--file", "prod", "--pr", "proj/repo#1"}, "admin merge"},
 		{[]string{"get", "--key", "mykey", "--project", "proj", "--file", "prod"}, "get"},
 		{[]string{"decrypt", "--project", "proj", "--file", "prod"}, "decrypt"},
 		{[]string{"edit", "--project", "proj", "--file", "prod"}, "edit"},
@@ -71,15 +71,15 @@ func TestPolicyGate_ContributorMode_AdminCommandsDenied(t *testing.T) {
 }
 
 // TestPolicyGate_NilPolicy_AdminCommandsDenied verifies that when Policy is
-// nil (the nil-skip is absent), admin-only commands (review/merge/get/decrypt/
-// edit) still produce ErrPermissionDenied via the default-deny else branch.
-// This is the belt-and-suspenders guard: even without a wired Policy, no
-// admin command silently succeeds.
+// nil (the nil-skip is absent), admin-only commands (review/admin merge/get/
+// decrypt/edit) still produce ErrPermissionDenied via the default-deny else
+// branch. This is the belt-and-suspenders guard: even without a wired Policy,
+// no admin command silently succeeds.
 func TestPolicyGate_NilPolicy_AdminCommandsDenied(t *testing.T) {
 	t.Parallel()
 
-	// Nil Policy — exercises the default-deny else branch added to review/merge
-	// and the existing else branches in get/decrypt/edit.
+	// Nil Policy — exercises the default-deny else branch in checkPolicy and
+	// the existing else branches in get/decrypt/edit.
 	deps := &cli.Deps{
 		Policy:      nil,
 		CurrentMode: mode.ModeContributor,
@@ -90,7 +90,7 @@ func TestPolicyGate_NilPolicy_AdminCommandsDenied(t *testing.T) {
 		cmdName string
 	}{
 		{[]string{"review", "--pr", "1"}, "review"},
-		{[]string{"merge", "--pr", "1"}, "merge"},
+		{[]string{"admin", "merge", "--project", "proj", "--file", "prod", "--pr", "proj/repo#1"}, "admin merge"},
 		{[]string{"get", "--key", "mykey", "--project", "proj", "--file", "prod"}, "get"},
 		{[]string{"decrypt", "--project", "proj", "--file", "prod"}, "decrypt"},
 		{[]string{"edit", "--project", "proj", "--file", "prod"}, "edit"},

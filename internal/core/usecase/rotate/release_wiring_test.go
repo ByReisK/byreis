@@ -88,7 +88,7 @@ func TestReleaseWorkflow_DocgateGateWiringIntact(t *testing.T) {
 			workflowPath, err)
 	}
 	var doc releaseWorkflowYAML
-	if err := yaml.Unmarshal(raw, &doc); err != nil {
+	if err = yaml.Unmarshal(raw, &doc); err != nil {
 		t.Fatalf("WIRING GATE FAIL: cannot parse %s as YAML: %v.\n"+
 			"raw content head: %q",
 			workflowPath, err, headSample(raw))

@@ -66,6 +66,10 @@ and the release notes state the limits as plainly as the features.
   darwin; on Windows byreis is buildable and the full CLI works, but the TUI is
   not a Windows target. Windows users get the CLI experience.
 
+## Changes
+
+- The unimplemented top-level `byreis merge` command is removed; use `byreis admin merge`.
+
 ## Known limitations / deferred to v0.4
 
 - A browsable submission-PR queue in the TUI (enumerate and select across all

@@ -14,10 +14,11 @@
 //   - The test asserts stdout contains every character of the constant.
 //
 // This is a three-way cross-check at the CLI boundary:
-//   (a) rotate.ForwardSecrecyWarning (the constant, proven by the rotate-level
-//       docgate in rotate/forward_secrecy_doc_gate_test.go), AND
-//   (b) the CLI's printRotationPlan/printRotationResult output channel,
-//       proven here.
+//
+//	(a) rotate.ForwardSecrecyWarning (the constant, proven by the rotate-level
+//	    docgate in rotate/forward_secrecy_doc_gate_test.go), AND
+//	(b) the CLI's printRotationPlan/printRotationResult output channel,
+//	    proven here.
 //
 // Build constraint: //go:build docgate ONLY. This tag is a sibling lane to
 // shipgate; it is non-default, never compiled into a shipped binary.
@@ -355,4 +356,3 @@ func TestDocGate_RequestAccessAdminWarning_VerbatimEmitted(t *testing.T) {
 		"RequestAccessAdminWarning (%d chars) with trailing boundary intact",
 		len(want))
 }
-

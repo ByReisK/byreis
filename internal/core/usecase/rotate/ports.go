@@ -178,8 +178,8 @@ type Phase2Result struct {
 //
 // The interface is intentionally narrow: the spine hands a fully validated
 // RotationPlan and receives a Phase1Result. Real adapters wire the existing
-// v0.1 ports (GitProvider, RegistryClient, usecase.ManifestSigner, etc.); the
-// V1 tests exercise this port via fakes only.
+// ports (GitProvider, RegistryClient, usecase.ManifestSigner, etc.); tests
+// exercise this port via fakes only.
 type Phase1Executor interface {
 	Execute(ctx context.Context, plan RotationPlan) (Phase1Result, error)
 }
@@ -251,8 +251,8 @@ type ReconcileResult struct {
 }
 
 // RotationStateProbe is the consumer-defined port the reconciler uses to
-// observe the partial-state shape on the registry and project sides. The
-// V1 tests inject a fake; the real adapter wiring lands in V5.
+// observe the partial-state shape on the registry and project sides.
+// Tests inject a fake; the real adapter wiring is in the adapter layer.
 type RotationStateProbe interface {
 	// FetchPartialState reads the per-(project,file) counter store entries
 	// for the rotation-tagged pendings AND the project repo's rotation
@@ -307,7 +307,7 @@ type PendingObservation struct {
 // RotationStateReverser is the consumer-defined port the reconciler invokes
 // to act on a PHASE_1_ONLY classification: clear the pendings (signed
 // registry commit) and delete the unmerged rotation branch. Real adapters
-// wire RegistryWriteSigner + GitProvider; V1 tests inject a fake.
+// wire RegistryWriteSigner + GitProvider; tests inject a fake.
 type RotationStateReverser interface {
 	// ClearPendings clears every per-file rotation-tagged pending for the
 	// project AND appends the supplied rotation-reversal audit event in a
@@ -328,8 +328,8 @@ type RotationStateReverser interface {
 // RotationReconciler is the consumer-defined port the
 // `byreis admin rotation reconcile` CLI verb wraps. The port itself does NOT
 // check mode (separation of concerns — ADMIN gating is enforced at the verb
-// wrapper level per V02_PORTS.md). Classify is read-only; Reconcile acts on
-// the classification with bounded retries.
+// wrapper level). Classify is read-only; Reconcile acts on the classification
+// with bounded retries.
 type RotationReconciler interface {
 	// Classify inspects the partial state and returns the classification.
 	// Pure read; no writes. A stale or unverified registry fetch surfaces
@@ -663,9 +663,9 @@ type AuditReader interface {
 	FetchAuditLog(ctx context.Context, projectID string) ([]AuditEntryView, error)
 }
 
-// RegistryReadTokenProvider is a NEW consumer-defined port introduced at V6
-// for the read-only registry surfaces the admin side opens (the
-// request-access PR fetch path, principally). It is structurally distinct
+// RegistryReadTokenProvider is the consumer-defined port for the read-only
+// registry surfaces the admin side opens (the request-access PR fetch path,
+// principally). It is structurally distinct
 // from auth.RegistryWriteTokenStore so a read-only caller cannot accidentally
 // acquire the write capability via port-reuse.
 //

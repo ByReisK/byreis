@@ -215,9 +215,9 @@ type CommitBumpInput struct {
 }
 
 // ErrCommitRotationNotImplemented is returned by CommitRotation when the full
-// rotation transport has not yet been wired (V3 ships the implementation).
-// Callers must treat this as a typed not-implemented sentinel and surface an
-// actionable hint: "rotation transport not available in this build".
+// rotation transport has not yet been wired. Callers must treat this as a
+// typed not-implemented sentinel and surface an actionable hint:
+// "rotation transport not available in this build".
 var ErrCommitRotationNotImplemented = errors.New(
 	"CommitRotation transport is not yet available in this build — " +
 		"full rotation support lands in the next release")
@@ -344,9 +344,9 @@ type RegistryClient interface {
 	// rotation_epoch for all N files to in.NewEpoch. Returns the commit SHA on
 	// success. CAS rejection returns ErrRegistryConcurrentWrite.
 	//
-	// V2 note: the full transport implementation lands in V3. V2 declares the
-	// method signature and the adapter returns ErrCommitRotationNotImplemented
-	// until V3 wires the transport.
+	// The full transport implementation is wired in a later release. Until then
+	// the adapter returns ErrCommitRotationNotImplemented so callers receive
+	// an actionable hint rather than a silent failure.
 	CommitRotation(ctx context.Context, in CommitRotationInput) (CommitRotationResult, error)
 
 	// RotationInFlight reports whether a rotation transaction is currently

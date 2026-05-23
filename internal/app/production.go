@@ -2190,6 +2190,13 @@ func buildSubmitterProd(
 		}
 		keyProbe = probe
 	} else {
+		// File-of-record source is not configured: the key-existence probe
+		// cannot distinguish ADD from REPLACE, so every submission is treated
+		// as a new key. Operators who see unexpected ADD actions when they
+		// expected REPLACE should verify that the file-of-record source is
+		// wired in their registry configuration.
+		fmt.Fprintln(os.Stderr, "byreis: warning: file-of-record source not configured; "+
+			"submit cannot detect existing keys (all submissions treated as new)")
 		keyProbe = &prodNoopKeyProbe{}
 	}
 
@@ -2253,6 +2260,13 @@ func buildRunTUISubmitProd(
 		}
 	}
 	if keyProbeForTUI == nil {
+		// File-of-record source is not configured or the probe could not be
+		// constructed: the TUI submit path cannot detect existing keys and will
+		// classify every submission as new. Operators who see unexpected ADD
+		// actions should verify their registry configuration includes a
+		// file-of-record source.
+		fmt.Fprintln(os.Stderr, "byreis: warning: file-of-record source not configured; "+
+			"submit cannot detect existing keys (all submissions treated as new)")
 		keyProbeForTUI = &prodNoopKeyProbe{}
 	}
 

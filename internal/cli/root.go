@@ -42,7 +42,6 @@ hold only public keys.`,
 	root.AddCommand(newDoctorCmd(deps, &jsonFlag))
 	root.AddCommand(newSubmitCmd(deps, &jsonFlag))
 	root.AddCommand(newReviewCmd(deps, &jsonFlag))
-	root.AddCommand(newMergeCmd(deps, &jsonFlag))
 	root.AddCommand(newGetCmd(deps, &jsonFlag))
 	root.AddCommand(newDecryptCmd(deps, &jsonFlag))
 	root.AddCommand(newEditCmd(deps, &jsonFlag))
