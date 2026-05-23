@@ -632,12 +632,14 @@ A branch re-push between review and merge invalidates the pin and merge fails.`,
 // NEVER rendered.
 func renderReviewResult(r *render.Renderer, result usecase.ReviewResult, jsonMode bool, cmd *cobra.Command) error {
 	if jsonMode {
-		// JSON output: structured per-key array. No plaintext. Key names and
-		// validation messages are emitted as-is (caller controls the channel).
+		// JSON output: structured per-key array. No plaintext.
+		// Key names are contributor-authored; sanitize before JSON to strip
+		// control characters and ANSI sequences that could inject into
+		// downstream consumers that parse text, consistent with the submit path.
 		perKey := make([]map[string]any, len(result.PerKey))
 		for i, kl := range result.PerKey {
 			perKey[i] = map[string]any{
-				"key":            kl.Key,
+				"key":            render.SanitizeForTerminal(kl.Key),
 				"action":         kl.Action,
 				"validation_ok":  kl.ValidationOK,
 				"validation_msg": kl.ValidationMsg,

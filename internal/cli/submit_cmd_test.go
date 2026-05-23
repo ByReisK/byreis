@@ -660,3 +660,137 @@ func (r *recordingReviewer) Review(_ context.Context, _ usecase.ReviewInput) (us
 	*r.invoked = true
 	return usecase.ReviewResult{}, fmt.Errorf("recordingReviewer.Review must not be called in this test")
 }
+
+// adversarialKeyReviewer returns a ReviewResult whose key names contain control
+// characters and ANSI escape sequences. Used to assert V-8 sanitization.
+type adversarialKeyReviewer struct{}
+
+func (a *adversarialKeyReviewer) Review(_ context.Context, in usecase.ReviewInput) (usecase.ReviewResult, error) {
+	return usecase.ReviewResult{
+		Ref:           in.Ref,
+		Author:        "alice",
+		Justification: "sanitize test",
+		SecretsPath:   "secrets/prod.enc.yaml",
+		PinnedSHA:     "sha256:sanitize",
+		KeyNames:      []string{"DB_HOST"},
+		PerKey: []usecase.KeyReviewLine{
+			// Key name with embedded ANSI escape and control character.
+			{Key: "DB_HOST\x1b[31mINJECTED\x1b[0m\x01", Action: "add", ValidationOK: true},
+		},
+		Plaintext: map[string]string{
+			"DB_HOST\x1b[31mINJECTED\x1b[0m\x01": "should-never-appear",
+		},
+	}, nil
+}
+
+// TestReviewCmd_JSON_KeyNamesSanitized asserts that review --json sanitizes
+// contributor-authored key names consistently with the submit --json path
+// (control characters and ANSI sequences stripped), and that no plaintext
+// value appears in any output channel.
+//
+// The existing golden fixtures use clean key names (DB_HOST, DB_PASS) and
+// must remain byte-identical; this test covers the adversarial case that the
+// goldens deliberately exclude.
+func TestReviewCmd_JSON_KeyNamesSanitized(t *testing.T) {
+	t.Parallel()
+
+	deps := &cli.Deps{
+		Policy:      &mode.Policy{},
+		CurrentMode: mode.ModeAdmin,
+		Reviewer:    &adversarialKeyReviewer{},
+	}
+
+	root := cli.NewRootCmdWithDeps(deps)
+	var outBuf, errBuf bytes.Buffer
+	root.SetOut(&outBuf)
+	root.SetErr(&errBuf)
+	root.SetArgs([]string{"--json", "review", "--pr", "testorg/secrets#99"})
+
+	if err := root.Execute(); err != nil {
+		t.Fatalf("unexpected error: %v; stderr: %s", err, errBuf.String())
+	}
+
+	outStr := outBuf.String()
+
+	// The ANSI escape byte and the control character must be stripped from the
+	// JSON key name. SanitizeForTerminal removes ESC (\x1b) and C0 controls
+	// (\x01). The visible text between the escape sequences (INJECTED) is
+	// preserved as printable ASCII — this is expected: the sanitizer removes
+	// terminal-control bytes, not arbitrary text content.
+	if strings.Contains(outStr, "\x1b") {
+		t.Errorf("review --json output must not contain ANSI ESC byte (\\x1b); got: %q", outStr)
+	}
+	if strings.Contains(outStr, "\x01") {
+		t.Errorf("review --json output must not contain control character \\x01; got: %q", outStr)
+	}
+	// The raw bracketed ANSI CSI sequence \x1b[31m must not appear.
+	// After sanitization the sequence is removed; confirm by checking the bracket-m pattern.
+	if strings.Contains(outStr, "[31m") {
+		t.Errorf("review --json output must not contain ANSI CSI colour code [31m; got: %q", outStr)
+	}
+	// Plaintext value must never appear.
+	if strings.Contains(outStr, "should-never-appear") {
+		t.Errorf("review --json output must not contain plaintext value; got: %q", outStr)
+	}
+	// The output must be non-empty.
+	if len(strings.TrimSpace(outStr)) == 0 {
+		t.Error("review --json output must not be empty")
+	}
+}
+
+// TestReviewCmd_JSON_CleanKeyNames_Unchanged asserts that clean key names
+// (no control chars, no ANSI) pass through sanitization unchanged. This
+// confirms the golden fixtures (DB_HOST, DB_PASS) are byte-identical after
+// the V-8 sanitization is applied.
+func TestReviewCmd_JSON_CleanKeyNames_Unchanged(t *testing.T) {
+	t.Parallel()
+
+	// A reviewer that returns the same clean names as the golden fixtures.
+	clean := &fixedCleanReviewer{}
+	deps := &cli.Deps{
+		Policy:      &mode.Policy{},
+		CurrentMode: mode.ModeAdmin,
+		Reviewer:    clean,
+	}
+
+	root := cli.NewRootCmdWithDeps(deps)
+	var outBuf bytes.Buffer
+	root.SetOut(&outBuf)
+	root.SetErr(&bytes.Buffer{})
+	root.SetArgs([]string{"--json", "review", "--pr", "testorg/secrets#42"})
+
+	if err := root.Execute(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	outStr := outBuf.String()
+	// DB_HOST and DB_PASS must survive sanitization unchanged.
+	if !strings.Contains(outStr, `"DB_HOST"`) {
+		t.Errorf("clean key DB_HOST must be present unchanged after sanitization; got: %q", outStr)
+	}
+	if !strings.Contains(outStr, `"DB_PASS"`) {
+		t.Errorf("clean key DB_PASS must be present unchanged after sanitization; got: %q", outStr)
+	}
+}
+
+// fixedCleanReviewer returns the same clean result as the golden fixtures.
+type fixedCleanReviewer struct{}
+
+func (f *fixedCleanReviewer) Review(_ context.Context, in usecase.ReviewInput) (usecase.ReviewResult, error) {
+	return usecase.ReviewResult{
+		Ref:           in.Ref,
+		Author:        "alice",
+		Justification: "add prod DB creds",
+		SecretsPath:   "secrets/prod.enc.yaml",
+		PinnedSHA:     "sha256:deadbeef",
+		KeyNames:      []string{"DB_HOST", "DB_PASS"},
+		PerKey: []usecase.KeyReviewLine{
+			{Key: "DB_HOST", Action: "add", ValidationOK: true},
+			{Key: "DB_PASS", Action: "replace", ValidationOK: true},
+		},
+		Plaintext: map[string]string{
+			"DB_HOST": "prod.db.example.com",
+			"DB_PASS": "s3cr3t",
+		},
+	}, nil
+}
