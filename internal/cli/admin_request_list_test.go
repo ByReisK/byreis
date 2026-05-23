@@ -47,6 +47,11 @@ func (f *fakeRequestAccessReader) ListOpenRequests(_ context.Context) ([]rotate.
 	return f.summaries, f.listErr
 }
 
+func (f *fakeRequestAccessReader) ListOpenRequestsBounded(_ context.Context) ([]rotate.OpenRequestSummary, bool, error) {
+	f.listCalls.Add(1)
+	return f.summaries, false, f.listErr
+}
+
 func (f *fakeRequestAccessReader) FetchRequestAccessYAML(
 	_ context.Context, _ coregit.PRRef,
 ) (rotate.RequestAccessFile, rotate.PRMetadata, error) {
@@ -65,6 +70,10 @@ type panicRequestAccessReader struct{}
 
 func (*panicRequestAccessReader) ListOpenRequests(_ context.Context) ([]rotate.OpenRequestSummary, error) {
 	panic("ListOpenRequests called but must not be reached: policy gate violated")
+}
+
+func (*panicRequestAccessReader) ListOpenRequestsBounded(_ context.Context) ([]rotate.OpenRequestSummary, bool, error) {
+	panic("ListOpenRequestsBounded called but must not be reached: policy gate violated")
 }
 
 func (*panicRequestAccessReader) FetchRequestAccessYAML(

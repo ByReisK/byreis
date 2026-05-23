@@ -517,3 +517,14 @@ func (r *sgV6FakeRequestAccessReader) ListOpenRequests(
 	}
 	return nil, nil
 }
+
+// ListOpenRequestsBounded is not exercised by the V6 shipgate fixtures. Present
+// to satisfy the extended RequestAccessReader port.
+func (r *sgV6FakeRequestAccessReader) ListOpenRequestsBounded(
+	ctx context.Context,
+) ([]rotate.OpenRequestSummary, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, false, errors.New("sgV6FakeRequestAccessReader: context cancelled")
+	}
+	return nil, false, nil
+}

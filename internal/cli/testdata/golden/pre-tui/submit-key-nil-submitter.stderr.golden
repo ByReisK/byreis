@@ -1,0 +1,7 @@
+{
+  "error": {
+    "code": "general-error",
+    "hint": "run `byreis init` or check your configuration",
+    "message": "submit adapters not configured — run `byreis init` to configure your project, or check your BYREIS_* environment variables"
+  }
+}

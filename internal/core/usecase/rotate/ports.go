@@ -519,6 +519,58 @@ type AuditEntryView struct {
 	Unknown bool
 }
 
+// RequestAccessInput carries the contributor-authored intent for opening a
+// request-access PR. All fields are validated by the adapter before any network
+// write. The adapter performs no trust decision; the PR is reviewed by an admin.
+type RequestAccessInput struct {
+	// Registry is the "owner/repo" registry project, already normalised by the
+	// caller (lowercase, no URL prefix, no .git suffix).
+	Registry string
+	// Handle is the contributor's GitHub login, lowercased. When empty the
+	// adapter derives it from the token identity via ResolveHandle.
+	Handle string
+	// AgePubkey is the age1... recipient string. Validated before the YAML is
+	// pushed so the admin receives a structurally correct payload.
+	AgePubkey string
+	// Justification is the contributor's free-text rationale. Sanitised at any
+	// display sink; must not appear in errors or audit entries.
+	Justification string
+}
+
+// RequestAccessResult is the opened-PR projection returned by Open. No SDK
+// type leaks past the adapter boundary.
+type RequestAccessResult struct {
+	// PRRef carries the registry "owner/repo#number" reference that an admin
+	// can supply to `byreis rotate --add --from-request`.
+	PRRef git.PRRef
+	// URL is the HTML URL of the opened PR, suitable for printing to the operator.
+	URL string
+}
+
+// RequestAccessOpener is the consumer-defined write-side port for the
+// contributor request-access flow. The adapter uses ONLY the contributor's own
+// GitHub identity (GH_TOKEN / BYREIS_GITHUB_TOKEN) — never a registry-write
+// keychain credential, never a signing key. It opens a PR from the
+// contributor's fork bearing requests/<handle>.yaml. The port performs the
+// open-PR quota check and existing-PR idempotency check before opening, and
+// returns the typed sentinels the CLI already maps. It introduces no new
+// trust-path surface.
+type RequestAccessOpener interface {
+	// ResolveHandle returns the authenticated GitHub login when in.Handle is "".
+	// Calling this before Open lets the caller echo the handle to the user
+	// before beginning the write sequence; it also ensures the quota and
+	// idempotency checks key on a concrete identity.
+	ResolveHandle(ctx context.Context, in RequestAccessInput) (handle string, err error)
+
+	// Open opens the request-access PR on behalf of the contributor. It is
+	// idempotent-safe: if the contributor already has an open request-access PR
+	// the opener returns ErrRequestAccessQuotaExceeded (wrapped) rather than
+	// opening a duplicate. If the bounded page-walk ceiling is hit before a
+	// definitive answer can be reached it returns ErrRequestAccessEnumerationBounded
+	// (wrapped) and refuses the open — never warns-and-proceeds.
+	Open(ctx context.Context, in RequestAccessInput) (RequestAccessResult, error)
+}
+
 // RequestAccessReader is the consumer-defined port the admin-side `--from-request`
 // orchestration uses to fetch the contributor's PR payload and the canonical
 // GitHub metadata required for the PR-author-vs-YAML check. The github-SDK
@@ -576,7 +628,19 @@ type RequestAccessReader interface {
 	// or justification. An empty result is a valid, non-error outcome ("nothing
 	// to triage"); a backend failure returns a non-nil error so the caller never
 	// mistakes a fetch failure for an empty queue.
+	//
+	// Callers that need truncation signalling should use ListOpenRequestsBounded.
+	// This method is kept as a thin wrapper for backward compatibility.
 	ListOpenRequests(ctx context.Context) ([]OpenRequestSummary, error)
+	// ListOpenRequestsBounded is the bounded variant of ListOpenRequests. It
+	// returns at most maxOpenRequestSummaries summaries and signals via truncated
+	// whether the underlying result set was larger than the cap. Truncation is
+	// never silent: when truncated is true the caller MUST surface a visible
+	// "showing N of many" affordance rather than implying the list is complete.
+	// An empty result with truncated=false is the valid "nothing to triage"
+	// outcome. A backend failure returns a non-nil error; a truncated=true result
+	// is not an error.
+	ListOpenRequestsBounded(ctx context.Context) (summaries []OpenRequestSummary, truncated bool, err error)
 }
 
 // AuditReader is the consumer-defined port the `byreis admin audit show`

@@ -1,0 +1,7 @@
+{
+  "error": {
+    "code": "permission-denied",
+    "hint": "review requires ADMIN mode — run `byreis doctor` to check your current mode",
+    "message": "command \"review\" is not permitted in CONTRIBUTOR mode: command not permitted in the current mode — this requires an admin key; see `byreis doctor` for your current mode"
+  }
+}

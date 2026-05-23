@@ -1,0 +1,11 @@
+{
+  "requests": [
+    {
+      "author": "alice",
+      "created_at": "2026-05-20T10:00:00Z",
+      "head_sha": "abc123def456",
+      "pr": "testorg/byreis-admins#7",
+      "title": "Add alice age1key..."
+    }
+  ]
+}

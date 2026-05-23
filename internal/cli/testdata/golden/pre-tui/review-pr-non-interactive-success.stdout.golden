@@ -1,0 +1,22 @@
+{
+  "author": "alice",
+  "justification": "add prod DB creds",
+  "per_key": [
+    {
+      "action": "add",
+      "key": "DB_HOST",
+      "validation_msg": "",
+      "validation_ok": true
+    },
+    {
+      "action": "replace",
+      "key": "DB_PASS",
+      "validation_msg": "",
+      "validation_ok": true
+    }
+  ],
+  "pinned_sha": "sha256:deadbeef",
+  "pr_number": 42,
+  "pr_project": "testorg/secrets",
+  "secrets_path": "secrets/prod.enc.yaml"
+}

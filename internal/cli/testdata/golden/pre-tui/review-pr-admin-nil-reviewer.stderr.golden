@@ -1,0 +1,7 @@
+{
+  "error": {
+    "code": "general-error",
+    "hint": "run `byreis init` or check your configuration",
+    "message": "review adapters not configured — run `byreis init` or check your BYREIS_* environment variables"
+  }
+}

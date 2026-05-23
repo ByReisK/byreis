@@ -13,7 +13,7 @@ LDFLAGS      := -X $(MODULE)/pkg/byreis.Version=$(VERSION)
 GOLANGCI     := golangci-lint
 GO_TEST_FLAGS := -race -timeout=120s
 
-.PHONY: build test test-testhook test-shipgate test-docgate test-composability lint install clean check-allowlist check-publish-boundary ci-parity ci-parity-windows-build
+.PHONY: build test test-testhook test-shipgate test-docgate test-composability test-tui-core-ceiling lint install clean check-allowlist check-publish-boundary ci-parity ci-parity-windows-build
 
 ## build: compile the byreis binary to ./bin/byreis
 build:
@@ -47,6 +47,14 @@ test-docgate:
 ## not included in either of those run sets.
 test-composability:
 	go test $(GO_TEST_FLAGS) -tags composability -run TestR005_6 ./internal/core/usecase/submit/
+
+## test-tui-core-ceiling: assert that internal/core/** exported symbols and the
+## mode-matrix allow set are unchanged from the committed baseline. This gate runs
+## on every TUI-related change and at v0.3 close. A new core symbol from TUI work
+## fails the gate; escalate to principal-go to extend. The baseline is reseeded
+## only when a reviewed, non-TUI change legitimately adds core symbols.
+test-tui-core-ceiling:
+	go test $(GO_TEST_FLAGS) -tags ceiling -run 'TestTUICeiling' ./internal/tui/
 
 ## lint: run golangci-lint (enforces Clean Architecture dependency rules)
 lint:

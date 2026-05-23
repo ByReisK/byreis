@@ -89,6 +89,25 @@ linters:
             - pkg: "github.com/ByReisK/byreis/internal/adapter"
               desc: "pkg/byreis and internal/cli must not import adapters directly. Adapters are wired in cmd/byreis/main.go via constructor injection."
 
+        # RULE 6: bubbletea, lipgloss, and huh are confined to internal/tui/**.
+        # internal/cli/** must not import them; any interactive TUI form or
+        # rendering widget lives exclusively under internal/tui/ so that the
+        # headless CLI path is structurally free of TUI framework imports.
+        # internal/core/** is already covered by RULE 1 (no-ui-in-core).
+        # internal/tui/** is intentionally absent from the deny scope: it is the
+        # one legal home. The rule becomes load-bearing when internal/tui/ lands.
+        ui-frameworks-tui-only:
+          list-mode: lax
+          files:
+            - "**/internal/cli/**"
+          deny:
+            - pkg: "github.com/charmbracelet/bubbletea"
+              desc: "internal/cli must not import bubbletea. TUI framework code belongs exclusively in internal/tui/. The headless CLI path must be structurally free of TUI imports."
+            - pkg: "github.com/charmbracelet/lipgloss"
+              desc: "internal/cli must not import lipgloss. TUI styling belongs exclusively in internal/tui/. Move any shared presentation helpers to internal/cli/render."
+            - pkg: "github.com/charmbracelet/huh"
+              desc: "internal/cli must not import huh. Interactive form widgets belong exclusively in internal/tui/. The CLI path uses flags and prompts, not huh forms."
+
     forbidigo:
       # Defend the forward-secrecy doc-gate fixture's "independent []byte
       # literal" boundary. A future refactor that would replace the verbatim

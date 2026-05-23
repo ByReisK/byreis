@@ -1,0 +1,8 @@
+{
+  "action": "add",
+  "artifact_sha": "sha256:aabbccdd",
+  "branch": "byreis/add-MYKEY-1748000000",
+  "pr_number": 10,
+  "pr_project": "testorg/secrets",
+  "pr_url": "https://github.com/testorg/secrets/pull/10"
+}

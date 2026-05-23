@@ -62,6 +62,18 @@ func (f *fakeOpenRequestLister) ListOpenRequests(
 	return f.summaries, nil
 }
 
+func (f *fakeOpenRequestLister) ListOpenRequestsBounded(
+	ctx context.Context,
+) ([]rotate.OpenRequestSummary, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+	if f.err != nil {
+		return nil, false, f.err
+	}
+	return f.summaries, false, nil
+}
+
 // TestListOpenRequests_ReturnsSummaries asserts the port surfaces every open
 // request summary verbatim, carrying the canonical PRRef domain type and the
 // advisory metadata fields. The list path performs no trust decision.

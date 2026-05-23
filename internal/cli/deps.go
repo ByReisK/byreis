@@ -96,6 +96,17 @@ type Deps struct {
 	// Tests inject a fake that returns canned RequestAccessFile + PRMetadata.
 	RequestAccessReader rotate.RequestAccessReader
 
+	// RequestAccessOpener is the narrow write-side port for the contributor
+	// `request-access` verb. It encapsulates the fork-PR write sequence using
+	// ONLY the contributor's own GitHub token (GH_TOKEN / BYREIS_GITHUB_TOKEN) —
+	// never a registry-write credential or signing key. When nil the verb returns
+	// a "not configured" error, mirroring the Submitter==nil pattern.
+	//
+	// The real adapter is internal/adapter/git/github.RequestAccessOpener.
+	// It is wired at BuildProductionDeps alongside RequestAccessReader when
+	// BYREIS_GITHUB_TOKEN is set.
+	RequestAccessOpener rotate.RequestAccessOpener
+
 	// Submitter is the contributor Submit use-case. Narrow interface:
 	// submit.Submitter. May be nil when adapters are not yet wired; the submit
 	// command will return a "not configured" error in that case.

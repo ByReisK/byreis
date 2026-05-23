@@ -231,19 +231,23 @@ func BuildProductionDeps(ctx context.Context) (*cli.Deps, error) {
 		regClient, forSource, codec, idLoader, decrypt.New(), projectIDFromEnvProd(),
 	)
 
-	// Build the RequestAccessReader for the `--from-request` path. Uses the
-	// admin's GitHub token (same auth source as submit) and does not acquire a
-	// registry-write credential. The reader is the only consumer of this port
-	// at this release; the pre-existing FetchPartialState read site remains on
-	// the write-token path and is not migrated here.
+	// Build the RequestAccessReader (admin read path, --from-request) and the
+	// RequestAccessOpener (contributor write path, request-access verb). Both
+	// use the same GitHub token gate and the same registry project coordinates.
+	// The opener uses ONLY the contributor's own token; it acquires no
+	// registry-write credential or signing key.
 	var requestAccessReader rotate.RequestAccessReader
+	var requestAccessOpener rotate.RequestAccessOpener
 	registryRepo := registryProjectFromURLProd(os.Getenv("BYREIS_REGISTRY"))
 	if registryRepo != "" {
-		adminToken := githubTokenProd()
-		if adminToken != "" {
-			ghsdk := ghClientProd(adminToken)
-			if reader, readerErr := gitadapter.NewRequestAccessReader(ghsdk, registryRepo); readerErr == nil {
+		contribToken := contribGitHubTokenProd()
+		if contribToken != "" {
+			ghClient := ghClientProd(contribToken)
+			if reader, readerErr := gitadapter.NewRequestAccessReader(ghClient, registryRepo); readerErr == nil {
 				requestAccessReader = reader
+			}
+			if opener, openerErr := gitadapter.NewRequestAccessOpener(ghClient, registryRepo); openerErr == nil {
+				requestAccessOpener = opener
 			}
 		}
 	}
@@ -281,6 +285,7 @@ func BuildProductionDeps(ctx context.Context) (*cli.Deps, error) {
 		RotateExitCode:        rotateExitCode,
 		RotatePreFlight:       rotatePreflight,
 		RequestAccessReader:   requestAccessReader,
+		RequestAccessOpener:   requestAccessOpener,
 		AuditReader:           auditReader,
 		Doctor:                doctor,
 		RotationHistoryDoctor: rotationHistoryDoctor,
@@ -1262,6 +1267,21 @@ func baseBranchFromEnvProd() string {
 // back to GITHUB_TOKEN (standard CI env var). Returns "" when neither is set.
 func githubTokenProd() string {
 	if v := os.Getenv("BYREIS_GITHUB_TOKEN"); v != "" {
+		return v
+	}
+	return os.Getenv("GITHUB_TOKEN")
+}
+
+// contribGitHubTokenProd reads the contributor GitHub token. It checks
+// BYREIS_GITHUB_TOKEN first, then GH_TOKEN. The contributor path uses GH_TOKEN
+// (the gh-cli conventional variable) as a fallback in addition to GITHUB_TOKEN
+// because contributors typically authenticate via the gh CLI, not CI pipelines.
+// Returns "" when neither is set — the opener is not wired.
+func contribGitHubTokenProd() string {
+	if v := os.Getenv("BYREIS_GITHUB_TOKEN"); v != "" {
+		return v
+	}
+	if v := os.Getenv("GH_TOKEN"); v != "" {
 		return v
 	}
 	return os.Getenv("GITHUB_TOKEN")

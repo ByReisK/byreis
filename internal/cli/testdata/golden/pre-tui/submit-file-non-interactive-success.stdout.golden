@@ -1,0 +1,17 @@
+{
+  "artifact_sha": "sha256:eeff0011",
+  "branch": "byreis/bulk-2keys-1748000001",
+  "keys": [
+    {
+      "action": "add",
+      "key": "DB_HOST"
+    },
+    {
+      "action": "replace",
+      "key": "DB_PASS"
+    }
+  ],
+  "pr_number": 11,
+  "pr_project": "testorg/secrets",
+  "pr_url": "https://github.com/testorg/secrets/pull/11"
+}

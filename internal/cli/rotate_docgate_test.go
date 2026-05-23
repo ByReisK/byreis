@@ -246,6 +246,14 @@ func (*docgateFakeRequestAccessReader) ListOpenRequests(
 	return nil, nil
 }
 
+// ListOpenRequestsBounded is not exercised by the docgate --from-request
+// fixtures; it satisfies the RequestAccessReader port so the fake compiles.
+func (*docgateFakeRequestAccessReader) ListOpenRequestsBounded(
+	_ context.Context,
+) ([]rotate.OpenRequestSummary, bool, error) {
+	return nil, false, nil
+}
+
 // docgateFakeRotatorFromRequest accepts the rotation input the CLI hands it
 // after --from-request validation completes and returns a completed result.
 // HasRemovals=false because --from-request is an additive --add path; the

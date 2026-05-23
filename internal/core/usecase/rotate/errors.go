@@ -257,4 +257,17 @@ var (
 		"refusing to open request-access PR: the configured open-PR quota " +
 			"for this GitHub identity is already exhausted — close stale PRs and " +
 			"retry")
+
+	// ErrRequestAccessEnumerationBounded is surfaced when the contributor-side
+	// quota and idempotency checks exhaust the page-walk ceiling without
+	// reaching a definitive answer (the registry has more open PRs than the
+	// bounded scan can inspect). Because these are correctness checks — not
+	// display-only aggregations — the opener refuses rather than risking a
+	// duplicate PR or an under-counted quota. The operator hint names the
+	// remediation: close stale request-access PRs so the scan stays within
+	// bounds, or contact an admin to triage the queue directly.
+	ErrRequestAccessEnumerationBounded = errors.New(
+		"refusing to open request-access PR: too many open PRs on the registry " +
+			"to verify your quota safely within the bounded scan — close stale " +
+			"request-access PRs or contact an admin to triage the open queue")
 )

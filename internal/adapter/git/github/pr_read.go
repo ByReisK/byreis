@@ -217,64 +217,29 @@ func (r *RequestAccessReader) FetchPRHeadSHA(
 	return sha, ownerLogin, nil
 }
 
-// ListOpenRequestAccessPRs returns the count of open request-access PRs authored
-// by the given GitHub login against the registry repo. Used by the request-access
-// verb to enforce the client-side open-PR quota (ErrRequestAccessQuotaExceeded).
-func (r *RequestAccessReader) ListOpenRequestAccessPRs(
-	ctx context.Context, authorLogin string,
-) (int, error) {
-	if err := ctx.Err(); err != nil {
-		return 0, fmt.Errorf("ListOpenRequestAccessPRs cancelled: %w", err)
-	}
+// maxOpenRequestSummaries is the result-cap for the admin-side display list.
+// When the registry has more open PRs than this cap, ListOpenRequestsBounded
+// returns exactly maxOpenRequestSummaries entries and sets truncated=true so
+// the caller can render a visible "showing N of many" affordance.
+const maxOpenRequestSummaries = 200
 
-	var count int
-	opts := &ghsdk.PullRequestListOptions{
-		State: "open",
-		ListOptions: ghsdk.ListOptions{
-			PerPage: 100,
-		},
-	}
-	for {
-		prs, resp, err := r.client.PullRequests.List(ctx, r.owner, r.repo, opts)
-		if err != nil {
-			return 0, r.wrapReadErr("ListOpenRequestAccessPRs/List", err)
-		}
-		for _, pr := range prs {
-			if pr.GetUser() == nil {
-				continue
-			}
-			login := strings.ToLower(pr.GetUser().GetLogin())
-			if login != strings.ToLower(authorLogin) {
-				continue
-			}
-			// Count only PRs whose head branch touches the requests/ path.
-			// Full file-scope check is expensive; a head-branch naming check is
-			// advisory and the file-path check at absorb time is the authoritative gate.
-			count++
-		}
-		if resp == nil || resp.NextPage == 0 {
-			break
-		}
-		opts.Page = resp.NextPage
-	}
-	return count, nil
-}
+// maxOpenRequestPages is the page-walk ceiling for ListOpenRequestsBounded.
+// At 100 items per page this caps the scan at 500 PRs inspected; truncation
+// fires at whichever limit is reached first (result cap or page ceiling).
+const maxOpenRequestPages = 5
 
-// ListOpenRequests returns the read-only triage projection of every open PR on
-// the registry repo. It performs no trust decision and fetches no per-PR fork
-// content: each summary carries only the GitHub-canonical metadata available on
-// the list response (PR number, author login, title, created-at, head SHA). An
-// empty registry yields an empty slice and a nil error.
+// ListOpenRequestsBounded is the bounded variant of ListOpenRequests. It walks
+// at most maxOpenRequestPages pages (capping the API scan) and returns at most
+// maxOpenRequestSummaries summaries. When either bound is reached before all
+// pages are consumed, truncated is set to true and the caller MUST surface a
+// visible truncation affordance — silent drop is forbidden.
 //
-// The richer per-PR validation (path-scope, HEAD-SHA pinning, the PR-author
-// state machine) is intentionally NOT performed here; that is the absorb-time
-// concern of FetchRequestAccessYAML / FetchPRHeadSHA, which the `--from-request`
-// lift re-runs against the chosen PR.
-func (r *RequestAccessReader) ListOpenRequests(
+// An empty result with truncated=false is the valid "nothing to triage" outcome.
+func (r *RequestAccessReader) ListOpenRequestsBounded(
 	ctx context.Context,
-) ([]rotate.OpenRequestSummary, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, fmt.Errorf("ListOpenRequests cancelled: %w", err)
+) (summaries []rotate.OpenRequestSummary, truncated bool, err error) {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, false, fmt.Errorf("ListOpenRequestsBounded cancelled: %w", ctxErr)
 	}
 
 	var out []rotate.OpenRequestSummary
@@ -282,12 +247,21 @@ func (r *RequestAccessReader) ListOpenRequests(
 		State:       "open",
 		ListOptions: ghsdk.ListOptions{PerPage: 100},
 	}
-	for {
-		prs, resp, err := r.client.PullRequests.List(ctx, r.owner, r.repo, opts)
-		if err != nil {
-			return nil, r.wrapReadErr("ListOpenRequests/List", err)
+	for page := 0; ; page++ {
+		if page >= maxOpenRequestPages {
+			// Page ceiling reached without exhausting all pages: signal truncation.
+			return out, true, nil
+		}
+
+		prs, resp, listErr := r.client.PullRequests.List(ctx, r.owner, r.repo, opts)
+		if listErr != nil {
+			return nil, false, r.wrapReadErr("ListOpenRequestsBounded/List", listErr)
 		}
 		for _, pr := range prs {
+			if len(out) >= maxOpenRequestSummaries {
+				// Result cap reached: signal truncation.
+				return out, true, nil
+			}
 			var authorLogin string
 			if pr.GetUser() != nil {
 				authorLogin = strings.ToLower(pr.GetUser().GetLogin())
@@ -308,7 +282,27 @@ func (r *RequestAccessReader) ListOpenRequests(
 		}
 		opts.Page = resp.NextPage
 	}
-	return out, nil
+	return out, false, nil
+}
+
+// ListOpenRequests returns the read-only triage projection of every open PR on
+// the registry repo. It performs no trust decision and fetches no per-PR fork
+// content: each summary carries only the GitHub-canonical metadata available on
+// the list response (PR number, author login, title, created-at, head SHA). An
+// empty registry yields an empty slice and a nil error.
+//
+// This method is a thin wrapper over ListOpenRequestsBounded; callers that need
+// to surface truncation should call ListOpenRequestsBounded directly.
+//
+// The richer per-PR validation (path-scope, HEAD-SHA pinning, the PR-author
+// state machine) is intentionally NOT performed here; that is the absorb-time
+// concern of FetchRequestAccessYAML / FetchPRHeadSHA, which the `--from-request`
+// lift re-runs against the chosen PR.
+func (r *RequestAccessReader) ListOpenRequests(
+	ctx context.Context,
+) ([]rotate.OpenRequestSummary, error) {
+	summaries, _, err := r.ListOpenRequestsBounded(ctx)
+	return summaries, err
 }
 
 // ─── internal helpers ────────────────────────────────────────────────────────
