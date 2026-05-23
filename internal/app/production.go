@@ -283,9 +283,18 @@ func BuildProductionDeps(ctx context.Context) (*cli.Deps, error) {
 		valValidator, buildAuditSinkProd(configDir),
 	)
 
+	// Build the shared submit adapter deps once so that both the CLI Submitter
+	// and the TUI SubmitterFactory consume identical instances. Constructing
+	// these independently in each builder is the maintenance hazard eliminated
+	// by this single construction site.
+	submitShared, submitSharedErr := buildSubmitSharedDepsProd(forSource, codec, cacheDirProd())
+	if submitSharedErr != nil {
+		fmt.Fprintf(os.Stderr, "byreis: warning: submit shared deps unavailable: %v\n", submitSharedErr)
+	}
+
 	// Build the Submitter use-case (all modes).
 	submitter, submitGitPort, subErr := buildSubmitterProd(
-		wrapper, gitProvider, codec, forSource, cacheDirProd(),
+		wrapper, gitProvider, codec, submitShared,
 	)
 	if subErr != nil {
 		fmt.Fprintf(os.Stderr, "byreis: warning: submit use-case unavailable: %v\n", subErr)
@@ -312,11 +321,12 @@ func BuildProductionDeps(ctx context.Context) (*cli.Deps, error) {
 
 	// Build the TUI RunTUISubmit factory. The composition root assembles the
 	// SubmitterFactory closure so internal/cli stays free of any internal/tui
-	// import (the cli↛tui boundary). The closure reuses the same 7 ports as
-	// the CLI's Submitter; only the Prompter differs.
+	// import (the cli↛tui boundary). The closure reuses the same shared deps as
+	// the CLI's Submitter; only the Prompter differs (supplied by the TUI at
+	// factory-call time).
 	var runTUISubmit func(ctx context.Context, out interface{ Write([]byte) (int, error) }, preFilledKey string, base submit.Input) error
 	if submitGitPort != nil && wrapper != nil {
-		runTUISubmit = buildRunTUISubmitProd(wrapper, submitGitPort, codec, forSource, cacheDirProd())
+		runTUISubmit = buildRunTUISubmitProd(wrapper, submitGitPort, submitShared)
 	}
 
 	// Build the TUI RunTUIReview factory. The closure is assembled here so
@@ -2157,15 +2167,75 @@ func buildReviewerProd(
 	return reviewer
 }
 
+// submitSharedDeps holds the adapter instances shared between the CLI Submitter
+// and the TUI SubmitterFactory. Both paths must consume the same constructed
+// instances so that a dependency added to one path is never silently absent
+// from the other.
+type submitSharedDeps struct {
+	keyProbe    submit.KeyExistenceProbe
+	resumeStore submit.ResumeStore
+	validator   submit.ValueValidator
+	clock       submit.Clock
+}
+
+// buildSubmitSharedDepsProd constructs the adapter instances that are shared
+// by both the CLI Submitter and the TUI SubmitterFactory. Callers MUST call
+// this once and pass the result to both buildSubmitterProd and
+// buildRunTUISubmitProd; constructing these adapters independently in each
+// builder is the maintenance hazard this helper eliminates.
+//
+// The forSourceBytesAdapter bridges usecase.FileOfRecordSource to
+// keyprobe.FileOfRecordBytesSource so the keyprobe package stays free of the
+// core/usecase import that would transitively pull in crypto/identity and
+// crypto/decrypt (the allowlist gate enforces this boundary).
+func buildSubmitSharedDepsProd(
+	forSrc usecase.FileOfRecordSource,
+	codec *artifactcodec.PortAdapter,
+	cacheDir string,
+) (submitSharedDeps, error) {
+	var keyProbe submit.KeyExistenceProbe
+	if forSrc != nil {
+		probe, probeErr := keyprobe.New(&forSourceBytesAdapter{src: forSrc}, codec)
+		if probeErr != nil {
+			return submitSharedDeps{}, fmt.Errorf("constructing key existence probe: %w", probeErr)
+		}
+		keyProbe = probe
+	} else {
+		// File-of-record source is not configured: the key-existence probe
+		// cannot distinguish ADD from REPLACE, so every submission is treated
+		// as a new key. Operators who see unexpected ADD actions when they
+		// expected REPLACE should verify that the file-of-record source is
+		// wired in their registry configuration.
+		fmt.Fprintln(os.Stderr, "byreis: warning: file-of-record source not configured; "+
+			"submit cannot detect existing keys (all submissions treated as new)")
+		keyProbe = &prodNoopKeyProbe{}
+	}
+
+	resumeStore, rsErr := resumestore.New(cacheDir)
+	if rsErr != nil {
+		return submitSharedDeps{}, fmt.Errorf("constructing resume store: %w", rsErr)
+	}
+
+	return submitSharedDeps{
+		keyProbe:    keyProbe,
+		resumeStore: resumeStore,
+		validator:   valueValidatorProd(),
+		clock:       &prodRotateClock{},
+	}, nil
+}
+
 // buildSubmitterProd constructs the Submitter use-case and the underlying
 // submit.GitPort. Submit is wired in all modes (an admin can also submit).
 // Returns (nil, nil, nil) when required dependencies are unavailable.
+//
+// The shared parameter carries the adapter instances built by
+// buildSubmitSharedDepsProd; both this function and buildRunTUISubmitProd
+// receive the same submitSharedDeps so each dep is constructed exactly once.
 func buildSubmitterProd(
 	recipsWrapper *RecipientSourceWrapper,
 	gitProvider coregit.GitProvider,
 	codec *artifactcodec.PortAdapter,
-	forSrc usecase.FileOfRecordSource,
-	cacheDir string,
+	shared submitSharedDeps,
 ) (submit.Submitter, submit.GitPort, error) {
 	if recipsWrapper == nil {
 		return nil, nil, nil
@@ -2182,43 +2252,15 @@ func buildSubmitterProd(
 		return nil, nil, fmt.Errorf("constructing submit git port: %w", err)
 	}
 
-	// Build the key existence probe. The forSourceBytesAdapter bridges the
-	// usecase.FileOfRecordSource port to keyprobe.FileOfRecordBytesSource so
-	// the keyprobe package stays free of the core/usecase import (which would
-	// transitively pull in crypto/identity and crypto/decrypt).
-	var keyProbe submit.KeyExistenceProbe
-	if forSrc != nil {
-		probe, probeErr := keyprobe.New(&forSourceBytesAdapter{src: forSrc}, codec)
-		if probeErr != nil {
-			return nil, nil, fmt.Errorf("constructing key existence probe: %w", probeErr)
-		}
-		keyProbe = probe
-	} else {
-		// File-of-record source is not configured: the key-existence probe
-		// cannot distinguish ADD from REPLACE, so every submission is treated
-		// as a new key. Operators who see unexpected ADD actions when they
-		// expected REPLACE should verify that the file-of-record source is
-		// wired in their registry configuration.
-		fmt.Fprintln(os.Stderr, "byreis: warning: file-of-record source not configured; "+
-			"submit cannot detect existing keys (all submissions treated as new)")
-		keyProbe = &prodNoopKeyProbe{}
-	}
-
-	// Build the resume store.
-	resumeStore, rsErr := resumestore.New(cacheDir)
-	if rsErr != nil {
-		return nil, nil, fmt.Errorf("constructing resume store: %w", rsErr)
-	}
-
 	submitter, newErr := submit.New(submit.Deps{
 		Recipients: recipsWrapper,
 		Encryptor:  encrypt.New(),
-		Validator:  valueValidatorProd(),
-		KeyProbe:   keyProbe,
+		Validator:  shared.validator,
+		KeyProbe:   shared.keyProbe,
 		Git:        gitPort,
-		Resume:     resumeStore,
+		Resume:     shared.resumeStore,
 		Prompter:   prompt.New(),
-		Clock:      &prodRotateClock{},
+		Clock:      shared.clock,
 	})
 	if newErr != nil {
 		return nil, nil, fmt.Errorf("constructing submit use-case: %w", newErr)
@@ -2246,49 +2288,24 @@ var _ ArtifactEncoder = (*prodArtifactCodecEncoder)(nil)
 // import (the cli↛tui boundary is enforced by depguard).
 //
 // The SubmitterFactory re-creates a submit.Submitter with the TUI-supplied
-// Prompter (a prefilledPrompter), reusing all other adapter deps unchanged.
+// Prompter (a prefilledPrompter), reusing all other adapter deps from shared.
+// shared MUST be the same submitSharedDeps instance passed to buildSubmitterProd
+// so both paths consume identical adapter instances.
 func buildRunTUISubmitProd(
 	recipsWrapper *RecipientSourceWrapper,
 	gitPort submit.GitPort,
-	codec *artifactcodec.PortAdapter,
-	forSrc usecase.FileOfRecordSource,
-	cacheDir string,
+	shared submitSharedDeps,
 ) func(ctx context.Context, out interface{ Write([]byte) (int, error) }, preFilledKey string, base submit.Input) error {
-	// Build shared deps for the TUI SubmitterFactory. The forSourceBytesAdapter
-	// bridges usecase.FileOfRecordSource → keyprobe.FileOfRecordBytesSource so
-	// the keyprobe package does not import core/usecase.
-	var keyProbeForTUI submit.KeyExistenceProbe
-	if forSrc != nil {
-		if p, err := keyprobe.New(&forSourceBytesAdapter{src: forSrc}, codec); err == nil {
-			keyProbeForTUI = p
-		}
-	}
-	if keyProbeForTUI == nil {
-		// File-of-record source is not configured or the probe could not be
-		// constructed: the TUI submit path cannot detect existing keys and will
-		// classify every submission as new. Operators who see unexpected ADD
-		// actions should verify their registry configuration includes a
-		// file-of-record source.
-		fmt.Fprintln(os.Stderr, "byreis: warning: file-of-record source not configured; "+
-			"submit cannot detect existing keys (all submissions treated as new)")
-		keyProbeForTUI = &prodNoopKeyProbe{}
-	}
-
-	resumeStore, rsErr := resumestore.New(cacheDir)
-	if rsErr != nil {
-		return nil
-	}
-
 	factory := tui.SubmitterFactory(func(p submit.Prompter) (submit.Submitter, error) {
 		return submit.New(submit.Deps{
 			Recipients: recipsWrapper,
 			Encryptor:  encrypt.New(),
-			Validator:  valueValidatorProd(),
-			KeyProbe:   keyProbeForTUI,
+			Validator:  shared.validator,
+			KeyProbe:   shared.keyProbe,
 			Git:        gitPort,
-			Resume:     resumeStore,
+			Resume:     shared.resumeStore,
 			Prompter:   p,
-			Clock:      &prodRotateClock{},
+			Clock:      shared.clock,
 		})
 	})
 

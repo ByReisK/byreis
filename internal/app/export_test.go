@@ -5,9 +5,12 @@ package app
 import (
 	"context"
 
+	"github.com/ByReisK/byreis/internal/adapter/artifactcodec"
 	registryadapter "github.com/ByReisK/byreis/internal/adapter/registry"
 	coregit "github.com/ByReisK/byreis/internal/core/git"
 	"github.com/ByReisK/byreis/internal/core/mode"
+	"github.com/ByReisK/byreis/internal/core/usecase"
+	"github.com/ByReisK/byreis/internal/core/usecase/submit"
 )
 
 // BaseBranchFromEnvForTest calls baseBranchFromEnvProd so that app_test
@@ -44,4 +47,35 @@ func NewCapturedModeProviderForTest(m mode.Mode) interface {
 // production adapter directly.
 var BuildGitProviderProdForTest = func(token, project, baseBranch string) (coregit.GitProvider, error) {
 	return buildGitProviderProd(token, project, baseBranch)
+}
+
+// SubmitSharedDepsForTest is the exported view of submitSharedDeps for the
+// AC-007-A equivalence test. It exposes the interface fields so the test can
+// assert pointer identity across the CLI and TUI paths.
+type SubmitSharedDepsForTest struct {
+	KeyProbe    submit.KeyExistenceProbe
+	ResumeStore submit.ResumeStore
+	Validator   submit.ValueValidator
+	Clock       submit.Clock
+}
+
+// BuildSubmitSharedDepsProdForTest calls buildSubmitSharedDepsProd so that the
+// AC-007-A equivalence test can construct the shared deps once and pass them
+// to both BuildSubmitterProdForTest and BuildRunTUISubmitProdForTest, asserting
+// that both paths receive identical instances.
+func BuildSubmitSharedDepsProdForTest(
+	forSrc usecase.FileOfRecordSource,
+	codec *artifactcodec.PortAdapter,
+	cacheDir string,
+) (SubmitSharedDepsForTest, error) {
+	sd, err := buildSubmitSharedDepsProd(forSrc, codec, cacheDir)
+	if err != nil {
+		return SubmitSharedDepsForTest{}, err
+	}
+	return SubmitSharedDepsForTest{
+		KeyProbe:    sd.keyProbe,
+		ResumeStore: sd.resumeStore,
+		Validator:   sd.validator,
+		Clock:       sd.clock,
+	}, nil
 }
