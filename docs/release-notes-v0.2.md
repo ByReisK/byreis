@@ -1,5 +1,18 @@
 # byreis v0.2 release notes
 
+## Correction (added 2026-05-23)
+
+The v0.2.0 binary did not wire the `submit` and `review` use-cases into its
+production composition root. The code for both — including the headlined
+`submit --file` bulk flow — shipped in the binary and passed its tests, but the
+runtime wiring that connects those use-cases to their adapters was missing.
+As a result, `byreis submit` (single-key and `--file`) and `byreis review`
+returned an "adapters not configured" error at runtime in v0.2.0. The
+encryption and review logic itself was unchanged and correct; only the
+production wiring was absent. This is fixed in v0.3.x, where `submit` and
+`review` are wired into the production composition root and work end to end.
+The original v0.2 notes are preserved below as published.
+
 ## What's new in v0.2
 
 v0.2 lands the admin key-rotation lifecycle and contributor onboarding flow on
