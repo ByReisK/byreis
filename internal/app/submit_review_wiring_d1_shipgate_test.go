@@ -73,21 +73,29 @@ import (
 	"filippo.io/age/armor"
 	"go.yaml.in/yaml/v3"
 
-	identityadapter "github.com/ByReisK/byreis/internal/adapter/identity"
 	"github.com/ByReisK/byreis/internal/adapter/artifactcodec"
+	identityadapter "github.com/ByReisK/byreis/internal/adapter/identity"
 	"github.com/ByReisK/byreis/internal/app"
 	"github.com/ByReisK/byreis/internal/core/audit"
 	"github.com/ByReisK/byreis/internal/core/crypto/artifact"
 	"github.com/ByReisK/byreis/internal/core/crypto/decrypt"
-	coregit "github.com/ByReisK/byreis/internal/core/git"
 	"github.com/ByReisK/byreis/internal/core/crypto/manifest"
 	"github.com/ByReisK/byreis/internal/core/crypto/sign"
+	coregit "github.com/ByReisK/byreis/internal/core/git"
 	"github.com/ByReisK/byreis/internal/core/mode"
 	"github.com/ByReisK/byreis/internal/core/usecase"
 )
 
-// d1ProjectID is the logical project identifier used by the D-1 fixture.
-const d1ProjectID = "myapp"
+// d1ProjectID is the BYREIS_PROJECT value: owner/repo form required by the
+// git provider. buildGitProviderProd passes this directly to gitadapter.New
+// which validates owner/repo format. projectIDFromEnvProd strips the owner
+// prefix so the registry path component is the bare repo name (d1RegistryID).
+const d1ProjectID = "myorg/myapp"
+
+// d1RegistryID is the bare logical project identifier used for registry
+// file paths (projects/<id>.yaml, counters/<id>/...) and artifact metadata.
+// It equals the repo-name part of d1ProjectID (after the "/").
+const d1RegistryID = "myapp"
 
 // d1LogicalFile is the logical file name configured in projects/<id>.yaml.
 const d1LogicalFile = "prod"
@@ -228,7 +236,7 @@ func TestD1_PositiveComposition(t *testing.T) {
 
 		result, reviewErr := reviewer.Review(context.Background(), usecase.ReviewInput{
 			Ref:               coregit.PRRef{Project: d1ProjectID + "/secrets", Number: 1},
-			ExpectedProjectID: d1ProjectID,
+			ExpectedProjectID: d1RegistryID,
 			ExpectedFileName:  d1LogicalFile,
 		})
 		if reviewErr != nil {
@@ -536,16 +544,16 @@ func (fx *d1Fixture) d1BuildRegistryRepo(t *testing.T) {
 		t.Fatalf("D-1: mkdir projects: %v", err)
 	}
 	d1WriteFileMode(t,
-		filepath.Join(fx.registryRepoDir, "projects", d1ProjectID+".yaml"),
+		filepath.Join(fx.registryRepoDir, "projects", d1RegistryID+".yaml"),
 		[]byte(projectYAML), 0o644)
 
-	counterDir := filepath.Join(fx.registryRepoDir, "counters", d1ProjectID)
+	counterDir := filepath.Join(fx.registryRepoDir, "counters", d1RegistryID)
 	if err := os.MkdirAll(counterDir, 0o755); err != nil {
 		t.Fatalf("D-1: mkdir counter dir: %v", err)
 	}
 	counterJSON := fmt.Sprintf(
 		`{"project_id":%q,"file":%q,"last_accepted_counter":0,"last_pr":"","updated_at":"2026-05-23T00:00:00Z","pending":null}`+"\n",
-		d1ProjectID, d1LogicalFile,
+		d1RegistryID, d1LogicalFile,
 	)
 	d1WriteFileMode(t, filepath.Join(counterDir, d1LogicalFile+".json"), []byte(counterJSON), 0o644)
 
@@ -607,7 +615,7 @@ func (fx *d1Fixture) d1BuildSignedFileOfRecord(t *testing.T) []byte {
 		},
 		Byreis: artifact.Metadata{
 			FormatVersion: "byreis.native.v1",
-			ProjectID:     d1ProjectID,
+			ProjectID:     d1RegistryID,
 			File:          d1LogicalFile,
 			Counter:       0,
 			Recipients:    []artifact.RecipientEntry{{FP: fpHex}},

@@ -159,6 +159,14 @@ type Deps struct {
 	// headless "use --pr" error path.
 	RunTUIReview func(ctx context.Context, out interface{ Write([]byte) (int, error) }, prRef string) error
 
+	// Rejecter is the admin reject use-case. Narrow interface:
+	// usecase.RequestRejecter. PR-close-only; never loads identity or advances
+	// a counter. May be nil when the required adapter is not yet wired (no
+	// GitHub token or no registry configured); the reject command returns a
+	// "not configured" error in that case. Nil in CONTRIBUTOR mode — the mode
+	// gate denies before any network contact.
+	Rejecter usecase.RequestRejecter
+
 	// RotatePreFlight is the narrow read-only port the rotate command uses to
 	// perform the two pre-flight checks required before invoking Rotator.Rotate:
 	//   (a) registry freshness/verification — SourceVerified + non-stale

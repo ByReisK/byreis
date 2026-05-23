@@ -39,6 +39,11 @@ func TestPolicy_CommandModeMatrix(t *testing.T) {
 	//     audit entries. Mirrors request-list: ADMIN and SUPER allowed,
 	//     CONTRIBUTOR denied. Contributors read the audit log out-of-band via
 	//     `git show audit/<project>.jsonl` + `git verify-commit`.
+	//
+	// v0.4 addition:
+	//   request-reject : admin-only verb that closes a request/submission PR with
+	//     a structured reason. Mirrors request-list: ADMIN and SUPER allowed,
+	//     CONTRIBUTOR denied. PR-close-only; never loads a key or decrypts.
 	allow := map[mode.Command]map[mode.Mode]bool{
 		mode.CommandVersion:           {mode.ModeContributor: true, mode.ModeAdmin: true, mode.ModeSuper: true},
 		mode.CommandInit:              {mode.ModeContributor: true, mode.ModeAdmin: true, mode.ModeSuper: true},
@@ -54,6 +59,7 @@ func TestPolicy_CommandModeMatrix(t *testing.T) {
 		mode.CommandRequestAccess:     {mode.ModeContributor: true, mode.ModeAdmin: false, mode.ModeSuper: false},
 		mode.CommandRequestList:       {mode.ModeContributor: false, mode.ModeAdmin: true, mode.ModeSuper: true},
 		mode.CommandAuditShow:         {mode.ModeContributor: false, mode.ModeAdmin: true, mode.ModeSuper: true},
+		mode.CommandRequestReject:     {mode.ModeContributor: false, mode.ModeAdmin: true, mode.ModeSuper: true},
 	}
 
 	allModes := []mode.Mode{mode.ModeContributor, mode.ModeAdmin, mode.ModeSuper}
@@ -62,6 +68,7 @@ func TestPolicy_CommandModeMatrix(t *testing.T) {
 		mode.CommandReview, mode.CommandMerge, mode.CommandGet, mode.CommandDecrypt,
 		mode.CommandEdit, mode.CommandRotate, mode.CommandRotationReconcile,
 		mode.CommandRequestAccess, mode.CommandRequestList, mode.CommandAuditShow,
+		mode.CommandRequestReject,
 	}
 
 	// Guard: the expectation grid must cover the full cross-product so a missing

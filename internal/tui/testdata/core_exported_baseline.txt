@@ -1,12 +1,15 @@
-# Baseline reseeded to add exported struct field enumeration (SANCTIONED reseed).
-# The ceiling gate now records:
+# Baseline reseeded for v0.4 S1 (REQ-V04-001 reject) under principal-go review.
+# Prior baseline (902) reseeded to add exported struct field enumeration.
+# The ceiling gate records:
 #   - exported top-level declarations as pkg#Name
 #   - exported methods on exported receiver types as pkg#RecvType.Method
-#   - exported fields of exported structs as pkg#Type.Field (NEW in this reseed)
+#   - exported fields of exported structs as pkg#Type.Field
 #
-# The field-level enumeration closes a gap where new exported struct fields in
-# internal/core/** could slip through the gate undetected. This reseed reflects
-# the post-V9 internal/core state with field symbols included for the first time.
+# S1 reseed: the v0.4 reject use-case adds the reviewed CLI-verb / use-case
+# exception symbols (the reject ports, RejectDeps + fields, RejectInput/Result/
+# PRState + fields, RepoKind + values, the reject sentinels, NewRequestRejecter,
+# mode.CommandRequestReject, audit.EventKindReject). This is a reviewed, non-TUI
+# bump; TUI work must never trigger a baseline reseed.
 #
 # From this point the baseline is FROZEN for TUI work. Any new exported symbol
 # from internal/core/** not present here fails the ceiling gate. Escalate to
@@ -33,6 +36,7 @@ github.com/ByReisK/byreis/internal/core/audit#EventKindMerge
 github.com/ByReisK/byreis/internal/core/audit#EventKindModePromotion
 github.com/ByReisK/byreis/internal/core/audit#EventKindPendingBump
 github.com/ByReisK/byreis/internal/core/audit#EventKindRegistryRefresh
+github.com/ByReisK/byreis/internal/core/audit#EventKindReject
 github.com/ByReisK/byreis/internal/core/audit#EventKindReview
 github.com/ByReisK/byreis/internal/core/audit#EventKindRotation
 github.com/ByReisK/byreis/internal/core/audit#EventKindSubmit
@@ -221,6 +225,7 @@ github.com/ByReisK/byreis/internal/core/mode#CommandInit
 github.com/ByReisK/byreis/internal/core/mode#CommandMerge
 github.com/ByReisK/byreis/internal/core/mode#CommandRequestAccess
 github.com/ByReisK/byreis/internal/core/mode#CommandRequestList
+github.com/ByReisK/byreis/internal/core/mode#CommandRequestReject
 github.com/ByReisK/byreis/internal/core/mode#CommandReview
 github.com/ByReisK/byreis/internal/core/mode#CommandRotate
 github.com/ByReisK/byreis/internal/core/mode#CommandRotationReconcile
@@ -422,6 +427,9 @@ github.com/ByReisK/byreis/internal/core/usecase#ErrReadNoIdentity
 github.com/ByReisK/byreis/internal/core/usecase#ErrReadReEncrypt
 github.com/ByReisK/byreis/internal/core/usecase#ErrReadRecipientsNotVerified
 github.com/ByReisK/byreis/internal/core/usecase#ErrRegistryVerifyFailed
+github.com/ByReisK/byreis/internal/core/usecase#ErrRejectAlreadyMerged
+github.com/ByReisK/byreis/internal/core/usecase#ErrRejectReasonUnsafe
+github.com/ByReisK/byreis/internal/core/usecase#ErrRejectWrongPRType
 github.com/ByReisK/byreis/internal/core/usecase#ErrReviewDecode
 github.com/ByReisK/byreis/internal/core/usecase#ErrReviewNoIdentity
 github.com/ByReisK/byreis/internal/core/usecase#ErrSignerChanged
@@ -520,7 +528,9 @@ github.com/ByReisK/byreis/internal/core/usecase#NewEditor
 github.com/ByReisK/byreis/internal/core/usecase#NewGetter
 github.com/ByReisK/byreis/internal/core/usecase#NewInitializer
 github.com/ByReisK/byreis/internal/core/usecase#NewMerger
+github.com/ByReisK/byreis/internal/core/usecase#NewRequestRejecter
 github.com/ByReisK/byreis/internal/core/usecase#NewReviewer
+github.com/ByReisK/byreis/internal/core/usecase#PRCloser
 github.com/ByReisK/byreis/internal/core/usecase#PendingBumpInput
 github.com/ByReisK/byreis/internal/core/usecase#PendingBumpInput.FileName
 github.com/ByReisK/byreis/internal/core/usecase#PendingBumpInput.PendingCounter
@@ -545,6 +555,29 @@ github.com/ByReisK/byreis/internal/core/usecase#RegistryStatus.Reachable
 github.com/ByReisK/byreis/internal/core/usecase#RegistryStatus.SignatureVerified
 github.com/ByReisK/byreis/internal/core/usecase#RegistryStatus.StaleReason
 github.com/ByReisK/byreis/internal/core/usecase#RegistryStatusProbe
+github.com/ByReisK/byreis/internal/core/usecase#RejectDeps
+github.com/ByReisK/byreis/internal/core/usecase#RejectDeps.Audit
+github.com/ByReisK/byreis/internal/core/usecase#RejectDeps.Closer
+github.com/ByReisK/byreis/internal/core/usecase#RejectDeps.Mode
+github.com/ByReisK/byreis/internal/core/usecase#RejectInput
+github.com/ByReisK/byreis/internal/core/usecase#RejectInput.NonInteractive
+github.com/ByReisK/byreis/internal/core/usecase#RejectInput.Reason
+github.com/ByReisK/byreis/internal/core/usecase#RejectInput.Ref
+github.com/ByReisK/byreis/internal/core/usecase#RejectPRState
+github.com/ByReisK/byreis/internal/core/usecase#RejectPRState.BranchName
+github.com/ByReisK/byreis/internal/core/usecase#RejectPRState.Closed
+github.com/ByReisK/byreis/internal/core/usecase#RejectPRState.Labels
+github.com/ByReisK/byreis/internal/core/usecase#RejectPRState.Merged
+github.com/ByReisK/byreis/internal/core/usecase#RejectPRState.SourceRepo
+github.com/ByReisK/byreis/internal/core/usecase#RejectResult
+github.com/ByReisK/byreis/internal/core/usecase#RejectResult.PR
+github.com/ByReisK/byreis/internal/core/usecase#RejectResult.Reason
+github.com/ByReisK/byreis/internal/core/usecase#RejectResult.Status
+github.com/ByReisK/byreis/internal/core/usecase#RejectResult.URL
+github.com/ByReisK/byreis/internal/core/usecase#RepoKind
+github.com/ByReisK/byreis/internal/core/usecase#RepoKindProject
+github.com/ByReisK/byreis/internal/core/usecase#RepoKindRegistry
+github.com/ByReisK/byreis/internal/core/usecase#RequestRejecter
 github.com/ByReisK/byreis/internal/core/usecase#ReviewDeps
 github.com/ByReisK/byreis/internal/core/usecase#ReviewDeps.ArtifactCodec
 github.com/ByReisK/byreis/internal/core/usecase#ReviewDeps.Audit

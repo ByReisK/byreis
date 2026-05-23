@@ -118,6 +118,7 @@ func TestTUICeiling_ModeMatrixUnchanged(t *testing.T) {
 		mode.CommandRequestAccess,
 		mode.CommandRequestList,
 		mode.CommandAuditShow,
+		mode.CommandRequestReject,
 	}
 
 	allModes := []mode.Mode{
@@ -131,37 +132,39 @@ func TestTUICeiling_ModeMatrixUnchanged(t *testing.T) {
 	// Any new entry here requires an update to this test under review;
 	// TUI work must not change this set.
 	allowedPairs := map[string]bool{
-		"version:CONTRIBUTOR": true,
-		"version:ADMIN":       true,
-		"version:SUPER":       true,
-		"init:CONTRIBUTOR":    true,
-		"init:ADMIN":          true,
-		"init:SUPER":          true,
-		"doctor:CONTRIBUTOR":  true,
-		"doctor:ADMIN":        true,
-		"doctor:SUPER":        true,
-		"submit:CONTRIBUTOR":  true,
-		"submit:ADMIN":        true,
-		"submit:SUPER":        true,
-		"review:ADMIN":        true,
-		"review:SUPER":        true,
-		"merge:ADMIN":         true,
-		"merge:SUPER":         true,
-		"get:ADMIN":           true,
-		"get:SUPER":           true,
-		"decrypt:ADMIN":       true,
-		"decrypt:SUPER":       true,
-		"edit:ADMIN":          true,
-		"edit:SUPER":          true,
-		"rotate:ADMIN":        true,
-		"rotate:SUPER":        true,
-		"rotation-reconcile:ADMIN": true,
-		"rotation-reconcile:SUPER": true,
+		"version:CONTRIBUTOR":        true,
+		"version:ADMIN":              true,
+		"version:SUPER":              true,
+		"init:CONTRIBUTOR":           true,
+		"init:ADMIN":                 true,
+		"init:SUPER":                 true,
+		"doctor:CONTRIBUTOR":         true,
+		"doctor:ADMIN":               true,
+		"doctor:SUPER":               true,
+		"submit:CONTRIBUTOR":         true,
+		"submit:ADMIN":               true,
+		"submit:SUPER":               true,
+		"review:ADMIN":               true,
+		"review:SUPER":               true,
+		"merge:ADMIN":                true,
+		"merge:SUPER":                true,
+		"get:ADMIN":                  true,
+		"get:SUPER":                  true,
+		"decrypt:ADMIN":              true,
+		"decrypt:SUPER":              true,
+		"edit:ADMIN":                 true,
+		"edit:SUPER":                 true,
+		"rotate:ADMIN":               true,
+		"rotate:SUPER":               true,
+		"rotation-reconcile:ADMIN":   true,
+		"rotation-reconcile:SUPER":   true,
 		"request-access:CONTRIBUTOR": true,
-		"request-list:ADMIN": true,
-		"request-list:SUPER": true,
-		"audit-show:ADMIN":   true,
-		"audit-show:SUPER":   true,
+		"request-list:ADMIN":         true,
+		"request-list:SUPER":         true,
+		"audit-show:ADMIN":           true,
+		"audit-show:SUPER":           true,
+		"request-reject:ADMIN":       true,
+		"request-reject:SUPER":       true,
 	}
 
 	// Sweep every (command, mode) pair and collect the live allowed set.
@@ -545,4 +548,3 @@ func mapKeys(m map[string]bool) []string {
 	sort.Strings(out)
 	return out
 }
-

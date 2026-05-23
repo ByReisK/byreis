@@ -36,7 +36,7 @@ test-testhook:
 ##                           and the V-3.5 nil-fallback wiring tests (TestV35_*)
 test-shipgate:
 	go test $(GO_TEST_FLAGS) -tags shipgate -run TestAsymmetryShipGate ./internal/core/usecase/
-	go test $(GO_TEST_FLAGS) -tags shipgate -run 'TestD1_PositiveComposition|TestV35_' ./internal/app/
+	go test $(GO_TEST_FLAGS) -tags shipgate -run 'TestD1_PositiveComposition|TestV35_|TestS1_' ./internal/app/
 
 ## test-docgate: run the docgate suite (forward-secrecy warning verbatim + release-wiring
 ## assertion + V5a R4a CLI emission + V6 request-access honesty contract + V6 admin warning

@@ -87,6 +87,44 @@ func TestV35_RunTUISubmitNilWhenNoGitProvider(t *testing.T) {
 	}
 }
 
+// TestS1_RejecterNilInContributorMode verifies that the RequestRejecter is nil
+// when no admin key is available on disk (CONTRIBUTOR mode). buildRejecterProd
+// is ADMIN-only; a contributor binary holds no Rejecter.
+func TestS1_RejecterNilInContributorMode(t *testing.T) {
+	t.Setenv("BYREIS_REGISTRY", "https://github.com/fake/registry")
+	t.Setenv("BYREIS_PROJECT", "myorg/myproject")
+	t.Setenv("BYREIS_GITHUB_TOKEN", "fake-token")
+	t.Setenv("BYREIS_CONFIG", t.TempDir())
+	t.Setenv("BYREIS_KEY_FILE", noKeychainKeyFile)
+
+	deps, _ := app.BuildProductionDeps(context.Background())
+	if deps == nil {
+		return
+	}
+	if deps.Rejecter != nil {
+		t.Errorf("Rejecter must be nil in CONTRIBUTOR mode; got non-nil")
+	}
+}
+
+// TestS1_RejecterNilWhenNoToken verifies that the RequestRejecter is nil when
+// no GitHub token is set (buildRejecterProd nil-fallbacks on missing token).
+func TestS1_RejecterNilWhenNoToken(t *testing.T) {
+	t.Setenv("BYREIS_REGISTRY", "")
+	t.Setenv("BYREIS_PROJECT", "")
+	t.Setenv("BYREIS_GITHUB_TOKEN", "")
+	t.Setenv("GITHUB_TOKEN", "")
+	t.Setenv("BYREIS_CONFIG", t.TempDir())
+	t.Setenv("BYREIS_KEY_FILE", noKeychainKeyFile)
+
+	deps, _ := app.BuildProductionDeps(context.Background())
+	if deps == nil {
+		return
+	}
+	if deps.Rejecter != nil {
+		t.Errorf("Rejecter must be nil when no GitHub token is configured; got non-nil")
+	}
+}
+
 // TestV35_BuildProductionDeps_NoPanic_PartialConfig verifies that
 // BuildProductionDeps never panics regardless of partial / missing
 // configuration. This covers the nil-fallback path for all V-3.5 use-cases.

@@ -27,6 +27,13 @@ const (
 	// CommitRotation counter advance (same-commit atomicity per the rotation
 	// protocol). Only the registry-side audit sink persists this event kind.
 	EventKindRotation EventKind = "rotation"
+
+	// EventKindReject is emitted when an admin closes a request or submission PR
+	// with a structured reason. Reject is a PR-close action with no decrypt and
+	// no merge, so it is a distinct kind from EventKindReview rather than a review
+	// outcome string. The free-text reason is NEVER stored on the event — only a
+	// reason-length byte count — so audit search/diff cannot leak it.
+	EventKindReject EventKind = "request.reject"
 )
 
 // Event is an append-only audit log entry. No secret values are ever stored;

@@ -268,11 +268,13 @@ func BuildProductionDeps(ctx context.Context) (*cli.Deps, error) {
 
 	// Build the git provider for the submit and review paths. A nil provider is
 	// safe: buildReviewerProd and buildSubmitterProd each nil-fallback.
-	project := projectIDFromEnvProd()
+	// The git provider requires the full owner/repo slug (BYREIS_PROJECT in
+	// owner/repo form); registry paths use the logical name only (no slash).
+	gitProjectSlug := gitProjectSlugFromEnvProd()
 	baseBranch := baseBranchFromEnvProd()
 	token := githubTokenProd()
 
-	gitProvider, gpErr := buildGitProviderProd(token, project, baseBranch)
+	gitProvider, gpErr := buildGitProviderProd(token, gitProjectSlug, baseBranch)
 	if gpErr != nil {
 		fmt.Fprintf(os.Stderr, "byreis: warning: git provider unavailable: %v\n", gpErr)
 	}
@@ -281,6 +283,16 @@ func BuildProductionDeps(ctx context.Context) (*cli.Deps, error) {
 	reviewer := buildReviewerProd(
 		currentMode, gitProvider, decrypt.New(), idLoader, codec, gate,
 		valValidator, buildAuditSinkProd(configDir),
+	)
+
+	// Build the RequestRejecter use-case (admin-only; nil in contributor mode).
+	// The PR-API token (githubTokenProd) is used — NOT the registry-write or
+	// signing credential. Two repo-bound PRCloser adapters are constructed:
+	// one for the project secrets repo (submission PRs) and one for the registry
+	// repo (access-request PRs). The use-case selects the correct adapter via
+	// the repo-bound SourceRepo stamp.
+	rejecter := buildRejecterProd(
+		currentMode, token, gitProjectSlug, registryRepo, gate, buildAuditSinkProd(configDir),
 	)
 
 	// Build the shared submit adapter deps once so that both the CLI Submitter
@@ -357,6 +369,7 @@ func BuildProductionDeps(ctx context.Context) (*cli.Deps, error) {
 		RotationHistoryDoctor: rotationHistoryDoctor,
 		Submitter:             submitter,
 		Reviewer:              reviewer,
+		Rejecter:              rejecter,
 		RunTUISubmit:          runTUISubmit,
 		RunTUIReview:          runTUIReview,
 		ErrTUISubmitAborted:   tui.ErrSubmitAborted,
@@ -722,12 +735,13 @@ func buildMergerProd(
 		return nil, mergeExitCode
 	}
 
-	// Build the GitHub git provider. The project and base branch must be set.
-	project := projectIDFromEnvProd()
+	// Build the GitHub git provider. The owner/repo slug and base branch must
+	// be set. The slug comes from the full BYREIS_PROJECT value (may be owner/repo
+	// form); the logical project ID used for registry paths is derived separately.
 	baseBranch := baseBranchFromEnvProd()
 	token := githubTokenProd()
 
-	gitProvider, err := buildGitProviderProd(token, project, baseBranch)
+	gitProvider, err := buildGitProviderProd(token, gitProjectSlugFromEnvProd(), baseBranch)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "byreis: warning: admin merge not available: git provider: %v\n", err)
 		return nil, mergeExitCode
@@ -1220,8 +1234,24 @@ func defaultSignKeyPathProd(configDir string) string {
 	return filepath.Join(configDir, "identity", "admin-sign.key")
 }
 
-// projectIDFromEnvProd reads the project ID from the environment.
+// projectIDFromEnvProd reads the logical project ID from the environment.
+// When BYREIS_PROJECT is in owner/repo form (required by the git provider),
+// only the repo part is returned as the logical project identifier: the
+// registry uses it as a bare filesystem path component (no slashes allowed
+// by the path-traversal guard in fetchtransport.ValidateProjectID).
 func projectIDFromEnvProd() string {
+	raw := os.Getenv("BYREIS_PROJECT")
+	if _, after, ok := strings.Cut(raw, "/"); ok {
+		return after
+	}
+	return raw
+}
+
+// gitProjectSlugFromEnvProd returns the raw BYREIS_PROJECT value for use as
+// the GitHub owner/repo slug when constructing the git provider. The git
+// provider (gitadapter.New) requires owner/repo format; passing the logical
+// project ID (bare name, no slash) would fail its format validation.
+func gitProjectSlugFromEnvProd() string {
 	return os.Getenv("BYREIS_PROJECT")
 }
 
@@ -2165,6 +2195,145 @@ func buildReviewerProd(
 		return nil
 	}
 	return reviewer
+}
+
+// buildRejecterProd constructs the RequestRejecter use-case (admin-only; nil
+// in CONTRIBUTOR mode or when required adapters cannot be constructed).
+//
+// Two repo-bound PRCloser adapters are constructed: one for the project secrets
+// repo (submission PRs) and one for the admin registry repo (access-request PRs).
+// Both adapters use the PR-API token (githubTokenProd) — NOT the registry-write
+// or signing credential (never held by this builder).
+func buildRejecterProd(
+	currentMode mode.Mode,
+	prAPIToken string,
+	projectRepo string,
+	registryRepo string,
+	gate usecase.ModeGate,
+	auditSink audit.Logger,
+) usecase.RequestRejecter {
+	if currentMode != mode.ModeAdmin && currentMode != mode.ModeSuper {
+		return nil
+	}
+	if prAPIToken == "" || gate == nil {
+		fmt.Fprintf(os.Stderr,
+			"byreis: warning: reject use-case not wired "+
+				"(GitHub token or mode gate unavailable)\n")
+		return nil
+	}
+
+	// Guard against operator misconfiguration where both BYREIS_PROJECT and
+	// BYREIS_REGISTRY resolve to the same GitHub repo. In a correct two-repo
+	// deployment the project secrets repo and the admin registry repo are
+	// distinct. When they are the same, routing by repo slug is ambiguous:
+	// every PR would be treated as a project submission PR and registry-side
+	// access-request PRs would never reach the registry adapter. Warn loudly
+	// and refuse to build the dual-repo closer so the misconfiguration is
+	// visible rather than silently misrouted.
+	if projectRepo != "" && registryRepo != "" && projectRepo == registryRepo {
+		fmt.Fprintf(os.Stderr,
+			"byreis: warning: BYREIS_PROJECT and BYREIS_REGISTRY resolve to the same "+
+				"repo %q — project and registry repos must be distinct; "+
+				"reject use-case not wired\n",
+			projectRepo)
+		return nil
+	}
+
+	ghClient := ghClientProd(prAPIToken)
+
+	// Build the project-repo PRCloser (submission PRs: byreis/add-*, byreis/replace-*, etc.).
+	var projCloser usecase.PRCloser
+	if projectRepo != "" {
+		c, err := gitadapter.NewProjectRepoPRCloser(ghClient, projectRepo)
+		if err != nil {
+			fmt.Fprintf(os.Stderr,
+				"byreis: warning: project-repo PR closer unavailable: %v\n", err)
+		} else {
+			projCloser = c
+		}
+	}
+
+	// Build the registry-repo PRCloser (access-request PRs: requests/<handle>.yaml).
+	var regCloser usecase.PRCloser
+	if registryRepo != "" {
+		c, err := gitadapter.NewRegistryRepoPRCloser(ghClient, registryRepo)
+		if err != nil {
+			fmt.Fprintf(os.Stderr,
+				"byreis: warning: registry-repo PR closer unavailable: %v\n", err)
+		} else {
+			regCloser = c
+		}
+	}
+
+	// Select the wiring strategy based on which closers are available.
+	// When both are present, a dualRepoPRCloser dispatches by repo slug:
+	// a PRRef whose Project matches projectRepo goes to the project adapter;
+	// all other PRefs (registry-side access-request PRs) go to the registry
+	// adapter. This repo-bound routing matches the SourceRepo stamp set by
+	// each adapter at FetchPRStateForReject time (RepoKindProject vs
+	// RepoKindRegistry), so classifyPRType corroborates the routing at use-case
+	// entry. When only one closer is available, that closer is used directly;
+	// reject calls for the absent repo type will fail at the adapter boundary
+	// with an actionable error surfaced to the operator.
+	var closer usecase.PRCloser
+	if projCloser != nil && regCloser != nil {
+		closer = &dualRepoPRCloser{
+			projectCloser:  projCloser,
+			registryCloser: regCloser,
+			projectRepo:    projectRepo,
+		}
+	} else if projCloser != nil {
+		closer = projCloser
+	} else if regCloser != nil {
+		closer = regCloser
+	} else {
+		fmt.Fprintf(os.Stderr,
+			"byreis: warning: reject use-case not wired (no PR closer available)\n")
+		return nil
+	}
+
+	rejecter, err := usecase.NewRequestRejecter(usecase.RejectDeps{
+		Closer: closer,
+		Mode:   gate,
+		Audit:  auditSink,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr,
+			"byreis: warning: reject use-case construction failed: %v\n", err)
+		return nil
+	}
+	return rejecter
+}
+
+// dualRepoPRCloser routes FetchPRStateForReject and CloseWithComment to the
+// correct repo-bound adapter based on the project coordinate in the PRRef.
+// The project-repo adapter handles submission PRs (ref.Project == projectRepo);
+// the registry-repo adapter handles access-request PRs (all other refs).
+// The SourceRepo stamp set by each adapter (RepoKindProject / RepoKindRegistry)
+// corroborates this routing at use-case entry via classifyPRType. Both adapters
+// must target distinct repos; the caller (buildRejecterProd) enforces this.
+type dualRepoPRCloser struct {
+	projectCloser  usecase.PRCloser
+	registryCloser usecase.PRCloser
+	projectRepo    string
+}
+
+func (d *dualRepoPRCloser) FetchPRStateForReject(
+	ctx context.Context, ref coregit.PRRef,
+) (usecase.RejectPRState, error) {
+	if ref.Project == d.projectRepo {
+		return d.projectCloser.FetchPRStateForReject(ctx, ref)
+	}
+	return d.registryCloser.FetchPRStateForReject(ctx, ref)
+}
+
+func (d *dualRepoPRCloser) CloseWithComment(
+	ctx context.Context, ref coregit.PRRef, sanitizedReason string,
+) error {
+	if ref.Project == d.projectRepo {
+		return d.projectCloser.CloseWithComment(ctx, ref, sanitizedReason)
+	}
+	return d.registryCloser.CloseWithComment(ctx, ref, sanitizedReason)
 }
 
 // submitSharedDeps holds the adapter instances shared between the CLI Submitter

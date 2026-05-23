@@ -129,6 +129,13 @@ const (
 	// audit log out-of-band via `git show audit/<project>.jsonl` followed by
 	// `git verify-commit` against the registry's signed HEAD.
 	CommandAuditShow Command = "audit-show"
+	// CommandRequestReject is the admin-side verb that closes an open request or
+	// submission PR with a structured reason. Permission mirrors CommandRequestList
+	// (ADMIN/SUPER, CONTRIBUTOR denied): rejecting another contributor's PR is an
+	// admin triage action. The verb is PR-close-only — it never loads identity,
+	// decrypts, advances a counter, or writes any trust state; a contributor
+	// invocation is denied at the matrix before any network contact.
+	CommandRequestReject Command = "request-reject"
 )
 
 // ErrKeyPermissions is a hard error returned when the private key file exists
@@ -330,6 +337,9 @@ var matrix = map[Command]map[Mode]bool{
 	// Admin-only read-only verb: CONTRIBUTOR is denied, ADMIN/SUPER may display
 	// signature-verified audit entries from the registry audit log.
 	CommandAuditShow: {ModeAdmin: true, ModeSuper: true},
+	// Admin-only verb (mirrors CommandRequestList): CONTRIBUTOR is denied,
+	// ADMIN/SUPER may close a request/submission PR with a reason. PR-close-only.
+	CommandRequestReject: {ModeAdmin: true, ModeSuper: true},
 }
 
 // Allow returns nil if cmd is permitted in mode m, or an error wrapping

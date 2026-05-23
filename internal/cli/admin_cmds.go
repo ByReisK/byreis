@@ -812,11 +812,7 @@ phase-1-only. All other classifications exit without any keychain access.`,
 	return cmd
 }
 
-// newAdminRequestCmd constructs the `admin request` parent command. Currently
-// provides only the `list` subverb. There is deliberately no `approve`,
-// `reject`, or `close` subverb here; request rejection must go through
-// `gh pr close` on the registry repo, and request promotion goes through
-// `byreis rotate --add --from-request <PR>`.
+// newAdminRequestCmd constructs the `admin request` parent command.
 func newAdminRequestCmd(deps *Deps, jsonFlag *bool) *cobra.Command {
 	req := &cobra.Command{
 		Use:   "request",
@@ -827,9 +823,10 @@ Commands under 'admin request' are gated by mode policy and denied-by-policy
 when running as CONTRIBUTOR.
 
 To approve a request: byreis rotate --add --from-request <owner/repo#N>
-To reject a request:  gh pr close <N> --repo <owner/repo>`,
+To reject a request:  byreis admin request reject --pr <owner/repo#N> --reason "<reason>"`,
 	}
 	req.AddCommand(newAdminRequestListCmd(deps, jsonFlag))
+	req.AddCommand(newAdminRequestRejectCmd(deps, jsonFlag))
 	return req
 }
 

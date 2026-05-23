@@ -153,6 +153,13 @@ jobs:
         # package where the suite lives — the Submit sub-package import allowlist
         # is covered by the allowlist job above.
         run: go test -v -race -tags shipgate -timeout=120s ./internal/core/usecase/
+      - name: Run positive-composition regression guard (D-1, S1 wiring)
+        # Covers the internal/app positive-composition tests that assert
+        # BuildProductionDeps returns non-nil Submitter/Reviewer/Merger in a
+        # fully-configured ADMIN environment. Not covered by the core/usecase
+        # step above; this step closes that gap so a typed-nil regression in
+        # the composition root is caught in CI, not only locally.
+        run: go test -v -race -tags shipgate -timeout=120s -run 'TestD1_PositiveComposition|TestV35_|TestS1_' ./internal/app/
 
   docgate:
     name: Doc Gate (forward-secrecy warning + release-wiring)
