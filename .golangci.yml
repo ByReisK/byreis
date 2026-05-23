@@ -125,6 +125,16 @@ linters:
           msg: "rotate.ForwardSecrecyWarning may only be referenced at byte-equality assertion sites against an independent verbatim fixture; any other reference defeats the forward-secrecy three-way equality check. If this is a legitimate boundary assertion, mark the line with //nolint:forbidigo // boundary: equality assertion only OR //nolint:forbidigo // boundary: CLI R4a output."
         - pattern: 'rotate\.RequestAccessAdminWarning'
           msg: "rotate.RequestAccessAdminWarning may only be referenced at the sole legitimate CLI emission site (rotate --add --from-request handler) and at the V6 docgate byte-equality assertion site. Any other reference defeats the single-source-of-truth contract. If this is a legitimate boundary assertion, mark the line with //nolint:forbidigo // boundary: CLI BO-3 warning OR //nolint:forbidigo // boundary: equality assertion only."
+        # Ban render.New() inside internal/tui/**. The bubbletea program owns
+        # its output channel; sub-renders inside the TUI must consume the
+        # injected Renderer (populated at the composition root) rather than
+        # constructing a new Renderer bound to bare os.Stdout. A bare
+        # render.New() call would bypass the bubbletea output model and corrupt
+        # the terminal frame. The Renderer is provided via tui.Deps.Renderer;
+        # call sites in internal/tui/** must use that injected instance.
+        - pattern: 'render\.New\('
+          path: 'internal/tui/.*\.go'
+          msg: "render.New() must not be called inside internal/tui/**. Use the injected tui.Deps.Renderer, which is bound to the bubbletea output channel at the composition root (cmd/byreis/main.go). Calling render.New() here would bind a second Renderer to bare os.Stdout and corrupt the bubbletea frame."
       analyze-types: false
 
     govet:

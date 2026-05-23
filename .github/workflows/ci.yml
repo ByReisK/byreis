@@ -173,6 +173,28 @@ jobs:
         # dropped.
         run: go test -v -race -tags docgate -timeout=120s ./internal/core/usecase/rotate/
 
+  tui-core-ceiling:
+    name: TUI Core Ceiling (zero-new-core gate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+          cache: true
+      - name: Assert no new exported core symbols or mode-matrix entries from TUI work
+        # This gate enforces the zero-new-core ceiling (ADR-0017 D3): the
+        # exported-symbol set of internal/core/** must be a subset of the
+        # committed baseline frozen at 393 symbols, and the (command, mode)
+        # allowed-pair set of the permission matrix must be unchanged.
+        # Any new symbol or matrix entry from TUI work fails the gate.
+        # The baseline is reseeded only when a reviewed, non-TUI change
+        # legitimately adds core symbols; a TUI slice must never trigger a
+        # silent baseline bump.
+        # A negative self-test baked into ceiling_test.go proves the checker
+        # fires on a real addition (the gate cannot silently pass).
+        run: go test -race -timeout=120s -tags ceiling -run 'TestTUICeiling' ./internal/tui/
+
   docgate-tag-isolation:
     name: Doc Gate tag isolation (docgate does not pull testhook)
     runs-on: ubuntu-latest
