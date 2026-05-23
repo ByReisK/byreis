@@ -319,6 +319,14 @@ func BuildProductionDeps(ctx context.Context) (*cli.Deps, error) {
 		runTUISubmit = buildRunTUISubmitProd(wrapper, submitGitPort, codec, forSource, cacheDirProd())
 	}
 
+	// Build the TUI RunTUIReview factory. The closure is assembled here so
+	// internal/cli stays free of any internal/tui import (cli↛tui boundary).
+	// Review is only available in ADMIN mode; a nil reviewer means the TUI
+	// review path is not wired (the cli surfaces "not configured" at command time).
+	runTUIReview := buildRunTUIReviewProd(
+		pol, currentMode, reviewer, requestAccessReader,
+	)
+
 	return &cli.Deps{
 		Policy:                pol,
 		CurrentMode:           currentMode,
@@ -340,6 +348,7 @@ func BuildProductionDeps(ctx context.Context) (*cli.Deps, error) {
 		Submitter:             submitter,
 		Reviewer:              reviewer,
 		RunTUISubmit:          runTUISubmit,
+		RunTUIReview:          runTUIReview,
 		ErrTUISubmitAborted:   tui.ErrSubmitAborted,
 	}, nil
 }
@@ -2275,6 +2284,42 @@ func buildRunTUISubmitProd(
 		return tui.RunSubmit(ctx, tui.Deps{
 			SubmitterFactory: factory,
 		}, w, preFilledKey, base)
+	}
+}
+
+// buildRunTUIReviewProd builds the RunTUIReview closure that the review CLI
+// command calls when ShouldLaunchTUI returns true. The closure is assembled
+// here at the composition root so internal/cli stays free of any internal/tui
+// import (the cli↛tui boundary).
+//
+// When reviewer is nil (e.g. contributor mode or adapters unavailable), the
+// function returns nil so the CLI falls through to the headless "not configured"
+// error path at command time. When reviewer is non-nil, the closure is wired
+// with the Reviewer and RequestAccessReader ports from the production deps.
+func buildRunTUIReviewProd(
+	pol *mode.Policy,
+	currentMode mode.Mode,
+	reviewer usecase.Reviewer,
+	requestAccessReader rotate.RequestAccessReader,
+) func(ctx context.Context, out interface{ Write([]byte) (int, error) }, prRef string) error {
+	if reviewer == nil {
+		// No reviewer: TUI review path is not available in this mode / configuration.
+		return nil
+	}
+
+	return func(ctx context.Context, out interface{ Write([]byte) (int, error) }, prRef string) error {
+		var w io.Writer
+		if out != nil {
+			w = out
+		} else {
+			w = os.Stdout
+		}
+		return tui.RunReview(ctx, tui.Deps{
+			Reviewer:            reviewer,
+			RequestAccessReader: requestAccessReader,
+			Policy:              pol,
+			CurrentMode:         currentMode,
+		}, w, prRef)
 	}
 }
 

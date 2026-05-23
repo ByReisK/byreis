@@ -502,7 +502,9 @@ A branch re-push between review and merge invalidates the pin and merge fails.`,
 			r.Out = cmd.OutOrStdout()
 			r.Err = cmd.ErrOrStderr()
 
-			// Mode gate FIRST — denied-not-attempted before any git fetch or decrypt.
+			// Mode gate FIRST — denied-not-attempted before any git fetch, decrypt,
+			// or TUI launch. A contributor reaching `review` is denied here before
+			// any other path is considered.
 			if deps.Policy != nil {
 				if err := deps.Policy.Allow(deps.CurrentMode, mode.CommandReview); err != nil {
 					r.PrintErrorClass(
@@ -527,6 +529,53 @@ A branch re-push between review and merge invalidates the pin and merge fails.`,
 				return &exitError{code: render.ExitPermissionDenied, cause: err}
 			}
 
+			ctx := cmd.Context()
+
+			// TUI fork: if ShouldLaunchTUI returns true and RunTUIReview is wired,
+			// delegate to the TUI review screen. This happens AFTER the mode gate
+			// (contributor denied above) and BEFORE the headless --pr enforcement.
+			// Bare `byreis review` at a TTY launches the TUI queue; the TUI's own
+			// ref-entry screen collects the PR ref interactively.
+			//
+			// When --pr is supplied but we still launch the TUI (e.g. future
+			// supply-and-review path), prRef is forwarded so the TUI can jump
+			// directly to the detail screen.
+			if deps.RunTUIReview != nil && ShouldLaunchTUI(
+				"review",
+				*jsonFlag,
+				EnvFromOS(),
+				IsTTYFile(os.Stdin),
+				IsTTYFile(os.Stdout),
+				deps.Policy,
+				deps.CurrentMode,
+				"",    // flagKey (not used by review)
+				"",    // flagFile (not used by review)
+				prRef, // flagPR
+				false, // flagNonInteractive (review has no --non-interactive flag)
+			) {
+				tuiErr := deps.RunTUIReview(ctx, cmd.OutOrStdout(), prRef)
+				if tuiErr != nil {
+					// A deliberate quit without completing a review is a clean non-zero
+					// exit. Any other error is surfaced as a review failure.
+					return &exitError{code: render.ExitGeneralError, cause: tuiErr}
+				}
+				return nil
+			}
+
+			// Headless path: --pr is required when not going through the TUI.
+			// This enforces the "use --pr" contract on the headless path only,
+			// rather than as a global cobra MarkFlagRequired (which would prevent
+			// the bare `review` TUI launch at a TTY).
+			if prRef == "" {
+				err := fmt.Errorf(
+					"--pr is required in headless mode — " +
+						"pass --pr <project#number> (e.g. myorg/my-app-secrets#42), " +
+						"or run `byreis review` at a TTY to use the interactive review screen")
+				r.PrintErrorClass("general-error", err.Error(),
+					"use the form project#number (e.g. myorg/my-app-secrets#42)")
+				return &exitError{code: render.ExitGeneralError, cause: err}
+			}
+
 			// Reviewer must be wired before any use-case call.
 			if deps.Reviewer == nil {
 				err := fmt.Errorf(
@@ -546,8 +595,6 @@ A branch re-push between review and merge invalidates the pin and merge fails.`,
 					"use the form project#number (e.g. myorg/my-app-secrets#42)")
 				return &exitError{code: render.ExitGeneralError, cause: parseErr}
 			}
-
-			ctx := cmd.Context()
 
 			reviewResult, reviewErr := deps.Reviewer.Review(ctx, usecase.ReviewInput{
 				Ref: git.PRRef{
@@ -574,8 +621,7 @@ A branch re-push between review and merge invalidates the pin and merge fails.`,
 		},
 	}
 
-	cmd.Flags().StringVar(&prRef, "pr", "", "PR reference in project#number form (e.g. myorg/my-app-secrets#42) (required)")
-	_ = cmd.MarkFlagRequired("pr")
+	cmd.Flags().StringVar(&prRef, "pr", "", "PR reference in project#number form (e.g. myorg/my-app-secrets#42)")
 
 	return cmd
 }

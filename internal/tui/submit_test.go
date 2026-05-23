@@ -174,7 +174,7 @@ func TestSubmitModel_PrefilledKeyStartsAtValuePhase(t *testing.T) {
 	spy := &fakeSpySubmitter{}
 	deps := buildTestDepsInternal(spy)
 
-	m := newSubmitModel(deps, "MY_KEY", buildTestBase())
+	m := newSubmitModel(context.Background(), deps, "MY_KEY", buildTestBase())
 
 	if m.phase != phaseValueEntry {
 		t.Errorf("with preFilledKey, expected phaseValueEntry (%d), got %d", phaseValueEntry, m.phase)
@@ -198,7 +198,7 @@ func TestSubmitModel_NoPrefilledKeyStartsAtKeyPhase(t *testing.T) {
 	spy := &fakeSpySubmitter{}
 	deps := buildTestDepsInternal(spy)
 
-	m := newSubmitModel(deps, "", buildTestBase())
+	m := newSubmitModel(context.Background(), deps, "", buildTestBase())
 
 	if m.phase != phaseKeyEntry {
 		t.Errorf("without preFilledKey, expected phaseKeyEntry (%d), got %d", phaseKeyEntry, m.phase)
@@ -227,7 +227,7 @@ func TestSubmitModel_AffordancePresentOnConfirmView(t *testing.T) {
 	deps := buildTestDepsInternal(spy)
 
 	// Build the model and manually advance to phaseConfirm.
-	m := newSubmitModel(deps, "AFFORD_KEY", buildTestBase())
+	m := newSubmitModel(context.Background(), deps, "AFFORD_KEY", buildTestBase())
 	m.phase = phaseConfirm
 	m.confirmed = false
 	m.confirmForm = buildConfirmForm(&m.confirmed)
@@ -274,13 +274,13 @@ func TestSubmitModel_ValueNeverAppearsInView(t *testing.T) {
 		{
 			"phaseKeyEntry",
 			func() submitModel {
-				return newSubmitModel(deps, "", buildTestBase())
+				return newSubmitModel(context.Background(), deps, "", buildTestBase())
 			},
 		},
 		{
 			"phaseValueEntry",
 			func() submitModel {
-				m := newSubmitModel(deps, "MY_KEY", buildTestBase())
+				m := newSubmitModel(context.Background(), deps, "MY_KEY", buildTestBase())
 				// Inject the secret value into the valueBinding field.
 				m.valueBinding = secretValue
 				return m
@@ -289,7 +289,7 @@ func TestSubmitModel_ValueNeverAppearsInView(t *testing.T) {
 		{
 			"phaseConfirm",
 			func() submitModel {
-				m := newSubmitModel(deps, "MY_KEY", buildTestBase())
+				m := newSubmitModel(context.Background(), deps, "MY_KEY", buildTestBase())
 				m.phase = phaseConfirm
 				m.valueBinding = secretValue // should not appear in View
 				m.confirmForm = buildConfirmForm(&m.confirmed)
@@ -300,7 +300,7 @@ func TestSubmitModel_ValueNeverAppearsInView(t *testing.T) {
 		{
 			"phaseSubmitting",
 			func() submitModel {
-				m := newSubmitModel(deps, "MY_KEY", buildTestBase())
+				m := newSubmitModel(context.Background(), deps, "MY_KEY", buildTestBase())
 				m.phase = phaseSubmitting
 				m.valueBinding = secretValue // should not appear in View
 				return m
@@ -309,7 +309,7 @@ func TestSubmitModel_ValueNeverAppearsInView(t *testing.T) {
 		{
 			"phaseDone_success",
 			func() submitModel {
-				m := newSubmitModel(deps, "MY_KEY", buildTestBase())
+				m := newSubmitModel(context.Background(), deps, "MY_KEY", buildTestBase())
 				m.phase = phaseDone
 				m.valueBinding = secretValue
 				m.result = submit.Result{
@@ -322,7 +322,7 @@ func TestSubmitModel_ValueNeverAppearsInView(t *testing.T) {
 		{
 			"phaseDone_error",
 			func() submitModel {
-				m := newSubmitModel(deps, "MY_KEY", buildTestBase())
+				m := newSubmitModel(context.Background(), deps, "MY_KEY", buildTestBase())
 				m.phase = phaseDone
 				m.valueBinding = secretValue
 				m.submitErr = errors.New("some error")
@@ -332,7 +332,7 @@ func TestSubmitModel_ValueNeverAppearsInView(t *testing.T) {
 		{
 			"phaseAborted",
 			func() submitModel {
-				m := newSubmitModel(deps, "MY_KEY", buildTestBase())
+				m := newSubmitModel(context.Background(), deps, "MY_KEY", buildTestBase())
 				m.phase = phaseAborted
 				m.valueBinding = secretValue
 				return m
@@ -401,7 +401,7 @@ func TestSubmitModel_GoldenEquivalence_InputFieldsMatchCLIPath(t *testing.T) {
 		SubmitterFactory: fakeSubmitterFactory(spy),
 	}
 
-	m := newSubmitModel(deps, preFilledKey, tuiBase)
+	m := newSubmitModel(context.Background(), deps, preFilledKey, tuiBase)
 
 	// Simulate the doSubmit command by calling it and inspecting the returned
 	// tea.Cmd. The command is a function that calls the SubmitterFactory and
@@ -460,7 +460,7 @@ func TestSubmitModel_AbortAtValuePhase_NoSubmitCalled(t *testing.T) {
 	spy := &fakeSpySubmitter{}
 	deps := buildTestDepsInternal(spy)
 
-	m := newSubmitModel(deps, "ABORT_KEY", buildTestBase())
+	m := newSubmitModel(context.Background(), deps, "ABORT_KEY", buildTestBase())
 	// m starts at phaseValueEntry (preFilledKey is non-empty).
 
 	// Simulate the valueForm reaching StateAborted.
@@ -495,7 +495,7 @@ func TestSubmitModel_AbortAtConfirmCancel_NoSubmitCalled(t *testing.T) {
 	spy := &fakeSpySubmitter{}
 	deps := buildTestDepsInternal(spy)
 
-	m := newSubmitModel(deps, "CANCEL_KEY", buildTestBase())
+	m := newSubmitModel(context.Background(), deps, "CANCEL_KEY", buildTestBase())
 	m.phase = phaseConfirm
 	m.confirmed = false
 	m.confirmForm = buildConfirmForm(&m.confirmed)
@@ -535,7 +535,7 @@ func TestSubmitModel_NilFactory_GracefulError(t *testing.T) {
 		SubmitterFactory: nil, // deliberately nil
 	}
 
-	m := newSubmitModel(deps, "NIL_FACTORY_KEY", buildTestBase())
+	m := newSubmitModel(context.Background(), deps, "NIL_FACTORY_KEY", buildTestBase())
 	m.phase = phaseConfirm
 	m.confirmed = true
 	m.valueBinding = "some-value"
@@ -576,7 +576,7 @@ func TestSubmitModel_DoSubmitSetsKeyFromCollectedKey(t *testing.T) {
 		Key:          "", // deliberately empty — TUI populates from collectedKey
 	}
 
-	m := newSubmitModel(deps, "COLLECTED_KEY", base)
+	m := newSubmitModel(context.Background(), deps, "COLLECTED_KEY", base)
 	m.valueBinding = "collected-value"
 
 	cmd := m.doSubmit()
@@ -613,7 +613,7 @@ func TestSubmitModel_ZeroizedAfterDoSubmit(t *testing.T) {
 		SubmitterFactory: fakeSubmitterFactory(spy),
 	}
 
-	m := newSubmitModel(deps, "ZERO_KEY", buildTestBase())
+	m := newSubmitModel(context.Background(), deps, "ZERO_KEY", buildTestBase())
 	m.valueBinding = "value-to-zeroize"
 
 	// The cmd returned by doSubmit zeroizes the value before returning the msg.
@@ -641,7 +641,7 @@ func TestSubmitModel_UpdateFromPhaseSubmittingToPhaseDone(t *testing.T) {
 	spy := &fakeSpySubmitter{}
 	deps := buildTestDepsInternal(spy)
 
-	m := newSubmitModel(deps, "DONE_KEY", buildTestBase())
+	m := newSubmitModel(context.Background(), deps, "DONE_KEY", buildTestBase())
 	m.phase = phaseSubmitting
 	m.valueBinding = "should-be-cleared"
 
@@ -679,7 +679,7 @@ func TestSubmitModel_ViewPhaseDoneShowsPRURL(t *testing.T) {
 	spy := &fakeSpySubmitter{}
 	deps := buildTestDepsInternal(spy)
 
-	m := newSubmitModel(deps, "DONE_VIEW_KEY", buildTestBase())
+	m := newSubmitModel(context.Background(), deps, "DONE_VIEW_KEY", buildTestBase())
 	m.phase = phaseDone
 	m.result = submit.Result{
 		PRURL:  "https://github.com/testorg/test-secrets/pull/7",
@@ -700,7 +700,7 @@ func TestSubmitModel_ViewPhaseAbortedShowsCancelled(t *testing.T) {
 	spy := &fakeSpySubmitter{}
 	deps := buildTestDepsInternal(spy)
 
-	m := newSubmitModel(deps, "ABORT_VIEW_KEY", buildTestBase())
+	m := newSubmitModel(context.Background(), deps, "ABORT_VIEW_KEY", buildTestBase())
 	m.phase = phaseAborted
 
 	view := m.View()

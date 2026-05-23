@@ -22,6 +22,8 @@ package cli_test
 //   - JSON output schema: stable keys array, no plaintext (TestSubmitCmd_FileJSONOutput).
 //   - Review denied-not-attempted for CONTRIBUTOR (TestReviewCmd_DeniedNotAttempted).
 //   - Nil Reviewer in ADMIN mode yields ExitGeneralError (TestReviewCmd_NilReviewer).
+//   - Headless-deny: RunTUIReview wired + non-TTY + no --pr yields ExitGeneralError
+//     with actionable hint; Reviewer not invoked (TestReviewCmd_HeadlessNoPR).
 
 import (
 	"bytes"
@@ -36,6 +38,7 @@ import (
 	"github.com/ByReisK/byreis/internal/cli"
 	"github.com/ByReisK/byreis/internal/cli/render"
 	"github.com/ByReisK/byreis/internal/core/mode"
+	"github.com/ByReisK/byreis/internal/core/usecase"
 	"github.com/ByReisK/byreis/internal/core/usecase/submit"
 )
 
@@ -572,4 +575,88 @@ func TestReviewCmd_NilReviewer(t *testing.T) {
 	if cli.ExitCodeOf(err) != int(render.ExitGeneralError) {
 		t.Errorf("nil Reviewer must yield ExitGeneralError, got %d", cli.ExitCodeOf(err))
 	}
+}
+
+// TestReviewCmd_HeadlessNoPR verifies the headless-deny branch: when
+// RunTUIReview is wired but the process is not running on a TTY (which is
+// always true in the test harness, since SetOut/SetErr uses bytes.Buffer) and
+// --pr is absent, the command must return ExitGeneralError with an actionable
+// error message. Reviewer must not be invoked.
+//
+// This is T-V5-1: coverage for the "RunTUIReview non-nil + non-TTY + prRef==" branch
+// in the review RunE (the ShouldLaunchTUI guard fails at the TTY check, causing
+// the headless path to enforce "--pr is required in headless mode").
+func TestReviewCmd_HeadlessNoPR(t *testing.T) {
+	t.Parallel()
+
+	// reviewerInvoked is set to true if the Reviewer is called. Any call here
+	// is a test failure: the command must error before reaching the use-case.
+	reviewerInvoked := false
+
+	// tuiInvoked is set to true if RunTUIReview is called. The test harness
+	// provides non-TTY file descriptors (bytes.Buffer), so ShouldLaunchTUI must
+	// return false and the TUI must never be launched.
+	tuiInvoked := false
+
+	deps := &cli.Deps{
+		Policy:      &mode.Policy{},
+		CurrentMode: mode.ModeAdmin,
+		// Reviewer records if it is invoked. A real use-case call here would mean
+		// the deny fence failed.
+		Reviewer: &recordingReviewer{invoked: &reviewerInvoked},
+		// RunTUIReview is non-nil, satisfying the "RunTUIReview != nil" precondition
+		// of the TUI fork. ShouldLaunchTUI will still return false (non-TTY), so
+		// the closure must never be reached.
+		RunTUIReview: func(_ context.Context, _ interface{ Write([]byte) (int, error) }, _ string) error {
+			tuiInvoked = true
+			return nil
+		},
+	}
+
+	root := cli.NewRootCmdWithDeps(deps)
+	var out bytes.Buffer
+	root.SetOut(&out)
+	root.SetErr(&out)
+	// No --pr flag: the headless deny branch fires.
+	root.SetArgs([]string{"review"})
+
+	err := root.Execute()
+	if err == nil {
+		t.Fatal("expected ExitGeneralError for headless review without --pr, got nil")
+	}
+	if errors.Is(err, mode.ErrPermissionDenied) {
+		t.Error("headless-no-pr must NOT produce ErrPermissionDenied (it is an ADMIN invocation)")
+	}
+	if cli.ExitCodeOf(err) != int(render.ExitGeneralError) {
+		t.Errorf("headless-no-pr must yield ExitGeneralError, got %d", cli.ExitCodeOf(err))
+	}
+
+	outStr := out.String()
+	// The error output must include the actionable hint directing the user to
+	// supply --pr or run at a TTY.
+	if !strings.Contains(outStr, "--pr") {
+		t.Errorf("error output must mention --pr as the required flag; got: %q", outStr)
+	}
+	if !strings.Contains(outStr, "headless") {
+		t.Errorf("error output must mention headless mode; got: %q", outStr)
+	}
+
+	if tuiInvoked {
+		t.Error("RunTUIReview must not be called when the process is not on a TTY")
+	}
+	if reviewerInvoked {
+		t.Error("Reviewer must not be invoked: command must error before any use-case call")
+	}
+}
+
+// recordingReviewer is a minimal fake for usecase.Reviewer that records
+// whether Review was called. It does not return a useful result; any call is a
+// test failure in the headless-deny scenario.
+type recordingReviewer struct {
+	invoked *bool
+}
+
+func (r *recordingReviewer) Review(_ context.Context, _ usecase.ReviewInput) (usecase.ReviewResult, error) {
+	*r.invoked = true
+	return usecase.ReviewResult{}, fmt.Errorf("recordingReviewer.Review must not be called in this test")
 }

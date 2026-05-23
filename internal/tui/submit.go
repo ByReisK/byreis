@@ -64,6 +64,7 @@ const (
 //   - WriteOnlyAffordance is displayed persistently on phaseConfirm.
 //   - Submit is called exactly once on confirm; never on abort.
 type submitModel struct {
+	ctx         context.Context
 	deps        Deps
 	submitInput submit.Input // metadata fields only — no value
 
@@ -104,8 +105,12 @@ type submitModel struct {
 // would put into submit.Input (ProjectID, LogicalFileName, Justification,
 // SecretsPath, BaseFilePath) — the Key field is populated from the form or
 // preFilledKey before Submit is called.
-func newSubmitModel(deps Deps, preFilledKey string, base submit.Input) submitModel {
+//
+// ctx is the caller's context (from RunSubmit) and is used for the Submit call
+// in doSubmit so that cancellation and deadlines from the caller are honored.
+func newSubmitModel(ctx context.Context, deps Deps, preFilledKey string, base submit.Input) submitModel {
 	m := submitModel{
+		ctx:          ctx,
 		deps:         deps,
 		submitInput:  base,
 		preFilledKey: preFilledKey,
@@ -294,16 +299,17 @@ func (m submitModel) doSubmit() tea.Cmd {
 	in.Key = key
 	deps := m.deps
 
+	// Capture ctx before the goroutine is scheduled.
+	ctx := m.ctx
+
 	return func() tea.Msg {
 		// Build a pre-filled Prompter so the use-case's CollectValue returns the
 		// value the TUI form already collected. The TUI confirm IS the
 		// irreversibility acknowledgement: IrreversibleAcknowledged is true,
 		// Interactive is true (mirrors the TTY path).
 		//
-		// The caller (doSubmit) and the use-case both operate in the same
-		// goroutine context; the pre-filled value is captured in this closure
-		// and released when the use-case returns.
-		ctx := context.Background()
+		// ctx is the caller's context (captured from the submitModel), so
+		// cancellation and deadlines from RunSubmit's caller are honored.
 		prompter := &prefilledPrompter{
 			value:                    value,
 			irreversibleAcknowledged: true,
@@ -475,7 +481,7 @@ func zeroizeString(s *string) {
 // The entered value is zeroized after Submit returns (or immediately on abort);
 // it is never persisted to disk in plaintext and never passed to a render path.
 func RunSubmit(ctx context.Context, deps Deps, out interface{ Write([]byte) (int, error) }, preFilledKey string, base submit.Input) error {
-	m := newSubmitModel(deps, preFilledKey, base)
+	m := newSubmitModel(ctx, deps, preFilledKey, base)
 
 	opts := []tea.ProgramOption{
 		tea.WithContext(ctx),

@@ -143,6 +143,22 @@ type Deps struct {
 	// any non-nil RunTUISubmit error is treated as a submit failure.
 	ErrTUISubmitAborted error
 
+	// RunTUIReview is the function the review RunE calls when ShouldLaunchTUI
+	// returns true and --pr is absent (or even when --pr is supplied but a TTY is
+	// present, for the future supply-and-review case). It encapsulates the full
+	// review TUI flow: access-request triage queue, PR ref entry, and the Review
+	// use-case call. It returns nil on a clean quit after completing a review, or
+	// ErrTUIReviewAborted when the admin quits without completing one.
+	//
+	// prRef may be empty (opens on the queue + ref-entry flow) or non-empty (a
+	// pre-supplied --pr value; jumps directly to reviewing). The function is
+	// assembled at the composition root so internal/cli stays free of any
+	// internal/tui import (the cli↛tui boundary is enforced by depguard).
+	//
+	// When nil the TUI review path is disabled; RunE falls through to the
+	// headless "use --pr" error path.
+	RunTUIReview func(ctx context.Context, out interface{ Write([]byte) (int, error) }, prRef string) error
+
 	// RotatePreFlight is the narrow read-only port the rotate command uses to
 	// perform the two pre-flight checks required before invoking Rotator.Rotate:
 	//   (a) registry freshness/verification — SourceVerified + non-stale
