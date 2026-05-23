@@ -43,11 +43,30 @@ const (
 
 	// screenDone is the terminal state reached after the admin quits from any screen.
 	screenDone
+
+	// screenConfirmApprove is the explicit opt-in confirm step shown before the
+	// irreversible merge. The detail screen stays read-only by default; the admin
+	// must press 'a' to enter this screen, then confirm or abort.
+	screenConfirmApprove
+
+	// screenApproving is the transient state while Merger.Merge is executing.
+	screenApproving
+
+	// screenApproveError is shown when the Merge call returns an error (including
+	// the already-merged/closed race case). The admin can press Esc/q to return
+	// to the queue or 'r' to review another submission.
+	screenApproveError
+
+	// screenApproveSuccess is the terminal acknowledgment shown after a
+	// successful Merge. The admin presses q/Esc to quit.
+	screenApproveSuccess
 )
 
 // reviewDetail is the no-plaintext projection of a ReviewResult. It carries
-// ONLY the fields needed for display: ref, author, justification,
-// secrets path, per-key review lines, sorted key names, and the pinned SHA.
+// ONLY the fields needed for display and for the in-TUI approve action: ref,
+// author, justification, secrets path, per-key review lines, sorted key names,
+// the pinned SHA, and the artifact-embedded logical project ID and file name
+// (needed to construct the MergeInput without introducing new core symbols).
 //
 // The enforcement mechanism is structural absence: reviewDetail has no
 // Plaintext field, so the Review call site cannot copy a decrypted value into
@@ -65,6 +84,13 @@ type reviewDetail struct {
 	PerKey        []usecase.KeyReviewLine
 	KeyNames      []string
 	PinnedSHA     string
+	// ProjectID and FileName are the artifact-embedded logical identifiers
+	// required to construct MergeInput.ExpectedProjectID and
+	// MergeInput.ExpectedFileName for the in-TUI approve action. They are
+	// not secret: they are the same values the admin would pass to
+	// `byreis admin merge --project <ProjectID> --file <FileName>`.
+	ProjectID string
+	FileName  string
 }
 
 // reviewDetailMsg is the bubbletea message delivered when a Review call completes
@@ -84,6 +110,20 @@ type queueLoadedMsg struct {
 	summaries []rotate.OpenRequestSummary
 	truncated bool
 	err       error
+}
+
+// mergeApproveMsg is delivered when the Merger.Merge call completes
+// successfully. It carries the live file SHA for the acknowledgment view.
+type mergeApproveMsg struct {
+	liveFileSHA string
+	reEncrypted bool
+	counter     uint64
+}
+
+// mergeErrMsg is delivered when the Merger.Merge call returns an error.
+// The error message is pre-sanitized and carries an actionable hint.
+type mergeErrMsg struct {
+	err error
 }
 
 // reviewModel is the bubbletea model for the admin review TUI. It manages the
@@ -124,6 +164,13 @@ type reviewModel struct {
 
 	// Error message from a failed Review or queue fetch.
 	errMsg string
+
+	// approveResult carries the merge acknowledgment data after a successful
+	// Merger.Merge call (screenApproveSuccess state).
+	approveResult mergeApproveMsg
+	// approveErrMsg carries the sanitized error string from a failed merge
+	// (screenApproveError state).
+	approveErrMsg string
 }
 
 // newReviewModel constructs the review model. prRef, when non-empty, causes the
@@ -210,6 +257,9 @@ func (m reviewModel) doReview(prRef string) tea.Cmd {
 		}
 
 		// Extract ONLY the display-safe fields. Plaintext is deliberately absent.
+		// ProjectID and FileName come from the artifact-embedded Byreis header
+		// (res.ProjectID / res.FileName); they are needed to construct MergeInput
+		// for the in-TUI approve action without new core symbols.
 		detail := reviewDetail{
 			Ref:           res.Ref,
 			Author:        res.Author,
@@ -218,6 +268,8 @@ func (m reviewModel) doReview(prRef string) tea.Cmd {
 			PerKey:        res.PerKey,
 			KeyNames:      res.KeyNames,
 			PinnedSHA:     res.PinnedSHA,
+			ProjectID:     res.ProjectID,
+			FileName:      res.FileName,
 		}
 		return reviewDetailMsg{detail: detail}
 	}
@@ -303,17 +355,82 @@ func (m reviewModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
-	case screenDetail, screenError:
+	case screenDetail:
 		if key, ok := msg.(tea.KeyMsg); ok {
 			switch key.String() {
 			case "q", "esc", "ctrl+c":
 				m.screen = screenDone
 				return m, tea.Quit
 			case "r":
-				// Press 'r' from detail or error to review another submission.
 				m.detail = reviewDetail{}
 				m.detailOK = false
 				m.errMsg = ""
+				m.refBinding = ""
+				m.refForm = buildRefForm(&m.refBinding)
+				m.screen = screenRefEntry
+				return m, m.refForm.Init()
+			case "a":
+				// 'a' enters the confirm-before-approve screen. The detail view
+				// is read-only by default; approve is an explicit opt-in that
+				// triggers a confirm step before the irreversible merge.
+				// Merger nil check: approve is unreachable if no Merger is wired.
+				if m.deps.Merger == nil {
+					m.approveErrMsg = "approve not available: merge adapters not configured — " +
+						"run `byreis doctor` to verify your admin mode and registry-write credential"
+					m.screen = screenApproveError
+					return m, nil
+				}
+				m.screen = screenConfirmApprove
+				return m, nil
+			}
+		}
+		return m, nil
+
+	case screenError:
+		if key, ok := msg.(tea.KeyMsg); ok {
+			switch key.String() {
+			case "q", "esc", "ctrl+c":
+				m.screen = screenDone
+				return m, tea.Quit
+			case "r":
+				m.detail = reviewDetail{}
+				m.detailOK = false
+				m.errMsg = ""
+				m.refBinding = ""
+				m.refForm = buildRefForm(&m.refBinding)
+				m.screen = screenRefEntry
+				return m, m.refForm.Init()
+			}
+		}
+		return m, nil
+
+	case screenConfirmApprove:
+		return m.updateConfirmApprove(msg)
+
+	case screenApproving:
+		switch msg := msg.(type) {
+		case mergeApproveMsg:
+			m.approveResult = msg
+			m.screen = screenApproveSuccess
+			return m, nil
+		case mergeErrMsg:
+			m.approveErrMsg = sanitizeErr(msg.err)
+			m.screen = screenApproveError
+			return m, nil
+		}
+		return m, nil
+
+	case screenApproveError, screenApproveSuccess:
+		if key, ok := msg.(tea.KeyMsg); ok {
+			switch key.String() {
+			case "q", "esc", "ctrl+c":
+				m.screen = screenDone
+				return m, tea.Quit
+			case "r":
+				m.detail = reviewDetail{}
+				m.detailOK = false
+				m.errMsg = ""
+				m.approveErrMsg = ""
 				m.refBinding = ""
 				m.refForm = buildRefForm(&m.refBinding)
 				m.screen = screenRefEntry
@@ -412,6 +529,72 @@ func (m reviewModel) updateRefEntry(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
+// updateConfirmApprove handles key events on the confirm-before-approve screen.
+// 'y' / Enter confirms and dispatches the merge; any other key aborts back to
+// the detail screen (the detail is read-only by default; the abort path must
+// leave the queue consistent and not call Merger.Merge).
+func (m reviewModel) updateConfirmApprove(msg tea.Msg) (tea.Model, tea.Cmd) {
+	key, ok := msg.(tea.KeyMsg)
+	if !ok {
+		return m, nil
+	}
+	switch key.String() {
+	case "y", "enter":
+		m.screen = screenApproving
+		return m, m.doApprove()
+	default:
+		// Any other key (including Esc/q) aborts back to detail without calling Merge.
+		m.screen = screenDetail
+		return m, nil
+	}
+}
+
+// doApprove dispatches a Merger.Merge call using the MergeInput constructed
+// from the reviewed detail. Field-for-field equivalence with the admin_cmds.go
+// merge path:
+//
+//   - MergeInput.Ref               ← detail.Ref
+//   - MergeInput.ExpectSHA         ← detail.PinnedSHA  (the replay-protection pin)
+//   - MergeInput.ExpectedProjectID ← detail.ProjectID
+//   - MergeInput.ExpectedFileName  ← detail.FileName
+//   - MergeInput.CommitMessage     ← derived (same default as CLI merge path)
+//
+// The PinnedSHA is the load-bearing replay-protection keystone:
+// if the PR branch is re-pushed between review and approve, the Merge use-case
+// compares the on-PR artifact SHA against ExpectSHA and fails closed, preventing
+// the admin from approving a different artifact than the one reviewed.
+//
+// doApprove never decrypts or displays values; it merges the reviewed PR.
+// The no_plaintext_guard AST test confirms no .Plaintext selector appears here.
+func (m reviewModel) doApprove() tea.Cmd {
+	ctx := m.ctx
+	deps := m.deps
+	detail := m.detail
+	return func() tea.Msg {
+		commitMsg := fmt.Sprintf("byreis: merge submission %s#%d",
+			detail.Ref.Project, detail.Ref.Number)
+		res, err := deps.Merger.Merge(ctx, usecase.MergeInput{
+			Ref:               detail.Ref,
+			ExpectSHA:         detail.PinnedSHA,
+			ExpectedProjectID: detail.ProjectID,
+			ExpectedFileName:  detail.FileName,
+			CommitMessage:     commitMsg,
+		})
+		if err != nil {
+			return mergeErrMsg{err: fmt.Errorf(
+				"merging %s#%d: %w — "+
+					"check your admin key and registry-write credential; "+
+					"run `byreis doctor` for diagnostics",
+				detail.Ref.Project, detail.Ref.Number, err)}
+		}
+		return mergeApproveMsg{
+			liveFileSHA: res.LiveFileSHA,
+			reEncrypted: res.ReEncrypted,
+			counter:     res.FinalCounter,
+		}
+	}
+}
+
 // View renders the current review model state.
 func (m reviewModel) View() string {
 	switch m.screen {
@@ -431,6 +614,20 @@ func (m reviewModel) View() string {
 				Render("Error: "+m.errMsg) + "\n\n" +
 			lipgloss.NewStyle().Foreground(lipgloss.Color("240")).
 				Render("Press r to review another submission  •  q / Esc to quit") + "\n"
+	case screenConfirmApprove:
+		return m.viewConfirmApprove()
+	case screenApproving:
+		return reviewHeaderStyle() + "\n" +
+			lipgloss.NewStyle().Foreground(lipgloss.Color("240")).
+				Render("Merging…") + "\n"
+	case screenApproveError:
+		return reviewHeaderStyle() + "\n" +
+			lipgloss.NewStyle().Foreground(lipgloss.Color("1")).
+				Render("Merge error: "+m.approveErrMsg) + "\n\n" +
+			lipgloss.NewStyle().Foreground(lipgloss.Color("240")).
+				Render("Press r to review another submission  •  q / Esc to quit") + "\n"
+	case screenApproveSuccess:
+		return m.viewApproveSuccess()
 	case screenDone:
 		return ""
 	}
@@ -583,6 +780,68 @@ func (m reviewModel) viewDetail() string {
 			d.Ref.Project, d.Ref.Number, d.PinnedSHA)))
 	sb.WriteString("\n\n")
 
+	hintParts := []string{"r review another", "q / Esc quit"}
+	if m.deps.Merger != nil {
+		hintParts = append([]string{"a approve (merge)"}, hintParts...)
+	}
+	sb.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("240")).
+		Render(strings.Join(hintParts, "  •  ")))
+	sb.WriteString("\n")
+
+	return sb.String()
+}
+
+// viewConfirmApprove renders the explicit confirm screen shown before the
+// irreversible merge. The admin must press 'y' or Enter to proceed; any other
+// key returns to the detail screen without calling Merge.
+func (m reviewModel) viewConfirmApprove() string {
+	d := m.detail
+	var sb strings.Builder
+
+	sb.WriteString(reviewHeaderStyle())
+	sb.WriteString("\n")
+
+	warning := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(lipgloss.Color("1")).
+		Render("CONFIRM MERGE — this action is irreversible")
+	sb.WriteString(warning)
+	sb.WriteString("\n\n")
+
+	_, _ = fmt.Fprintf(&sb, "PR:         %s#%d\n", d.Ref.Project, d.Ref.Number)
+	_, _ = fmt.Fprintf(&sb, "pinned_sha: %s\n", d.PinnedSHA)
+	_, _ = fmt.Fprintf(&sb, "project:    %s\n", render.SanitizeForTerminal(d.ProjectID))
+	_, _ = fmt.Fprintf(&sb, "file:       %s\n", render.SanitizeForTerminal(d.FileName))
+	sb.WriteString("\n")
+
+	sb.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("240")).
+		Render("Press y / Enter to merge  •  any other key to cancel"))
+	sb.WriteString("\n")
+
+	return sb.String()
+}
+
+// viewApproveSuccess renders the merge acknowledgment screen shown after a
+// successful Merger.Merge call.
+func (m reviewModel) viewApproveSuccess() string {
+	var sb strings.Builder
+
+	sb.WriteString(reviewHeaderStyle())
+	sb.WriteString("\n")
+
+	ok := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(lipgloss.Color("2")).
+		Render("Merge complete")
+	sb.WriteString(ok)
+	sb.WriteString("\n\n")
+
+	res := m.approveResult
+	_, _ = fmt.Fprintf(&sb, "content_sha:  %s\n", res.liveFileSHA)
+	_, _ = fmt.Fprintf(&sb, "re_encrypted: %v\n", res.reEncrypted)
+	_, _ = fmt.Fprintf(&sb, "counter:      %d\n", res.counter)
+	sb.WriteString("\n")
+
 	sb.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("240")).
 		Render("r review another  •  q / Esc quit"))
 	sb.WriteString("\n")
@@ -678,8 +937,9 @@ func RunReview(ctx context.Context, deps Deps, out io.Writer, prRef string) erro
 		return fmt.Errorf("TUI review: unexpected final model type — internal error")
 	}
 
-	// A clean quit after having viewed a detail is success.
-	if rm.screen == screenDone && rm.detailOK {
+	// A clean quit after having viewed a detail, or after a successful merge,
+	// is success (the admin completed the flow they entered the TUI for).
+	if rm.screen == screenDone && (rm.detailOK || rm.approveResult.liveFileSHA != "") {
 		return nil
 	}
 	// Any other terminal state is treated as a deliberate quit without completing.

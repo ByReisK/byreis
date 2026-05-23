@@ -90,6 +90,16 @@ type ReviewResult struct {
 	// bytes: the value the admin passes to `merge --expect`. A branch re-push
 	// between review and merge changes this and merge fails closed.
 	PinnedSHA string
+	// ProjectID is the logical project identifier embedded in the artifact. It
+	// is the value the admin passes to `merge --project` (or the TUI approve
+	// action passes as MergeInput.ExpectedProjectID). Not secret; sourced from
+	// the artifact's Byreis.ProjectID field.
+	ProjectID string
+	// FileName is the logical file name embedded in the artifact. It is the
+	// value the admin passes to `merge --file` (or the TUI approve action
+	// passes as MergeInput.ExpectedFileName). Not secret; sourced from the
+	// artifact's Byreis.File field.
+	FileName string
 }
 
 // ValueValidator is the consumer-defined per-key value-validation port for the
@@ -246,6 +256,8 @@ func (r *reviewUseCase) Review(ctx context.Context, in ReviewInput) (ReviewResul
 		Plaintext:     plaintext,
 		KeyNames:      keyNames,
 		PinnedSHA:     pinned,
+		ProjectID:     art.Byreis.ProjectID,
+		FileName:      art.Byreis.File,
 	}, nil
 }
 

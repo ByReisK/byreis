@@ -324,7 +324,7 @@ func BuildProductionDeps(ctx context.Context) (*cli.Deps, error) {
 	// Review is only available in ADMIN mode; a nil reviewer means the TUI
 	// review path is not wired (the cli surfaces "not configured" at command time).
 	runTUIReview := buildRunTUIReviewProd(
-		pol, currentMode, reviewer, requestAccessReader,
+		pol, currentMode, reviewer, merger, requestAccessReader,
 	)
 
 	return &cli.Deps{
@@ -2295,11 +2295,14 @@ func buildRunTUISubmitProd(
 // When reviewer is nil (e.g. contributor mode or adapters unavailable), the
 // function returns nil so the CLI falls through to the headless "not configured"
 // error path at command time. When reviewer is non-nil, the closure is wired
-// with the Reviewer and RequestAccessReader ports from the production deps.
+// with the Reviewer, Merger, and RequestAccessReader ports from the production
+// deps. Merger is optional: when nil, the in-TUI approve action is disabled
+// (the detail screen renders without the 'a' hint).
 func buildRunTUIReviewProd(
 	pol *mode.Policy,
 	currentMode mode.Mode,
 	reviewer usecase.Reviewer,
+	merger usecase.Merger,
 	requestAccessReader rotate.RequestAccessReader,
 ) func(ctx context.Context, out interface{ Write([]byte) (int, error) }, prRef string) error {
 	if reviewer == nil {
@@ -2316,6 +2319,7 @@ func buildRunTUIReviewProd(
 		}
 		return tui.RunReview(ctx, tui.Deps{
 			Reviewer:            reviewer,
+			Merger:              merger,
 			RequestAccessReader: requestAccessReader,
 			Policy:              pol,
 			CurrentMode:         currentMode,
