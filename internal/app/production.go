@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -17,8 +18,10 @@ import (
 	auditadapter "github.com/ByReisK/byreis/internal/adapter/audit"
 	editadapter "github.com/ByReisK/byreis/internal/adapter/editor"
 	"github.com/ByReisK/byreis/internal/adapter/fs/atomicwrite"
+	"github.com/ByReisK/byreis/internal/adapter/fs/resumestore"
 	"github.com/ByReisK/byreis/internal/adapter/git/fileofrecord"
 	gitadapter "github.com/ByReisK/byreis/internal/adapter/git/github"
+	"github.com/ByReisK/byreis/internal/adapter/git/keyprobe"
 	identityadapter "github.com/ByReisK/byreis/internal/adapter/identity"
 	"github.com/ByReisK/byreis/internal/adapter/keychain"
 	manifestsigneradapter "github.com/ByReisK/byreis/internal/adapter/manifestsigner"
@@ -28,7 +31,9 @@ import (
 	writesigneradapter "github.com/ByReisK/byreis/internal/adapter/registry/writesigner"
 	"github.com/ByReisK/byreis/internal/adapter/signingkey"
 	"github.com/ByReisK/byreis/internal/adapter/truststore"
+	validatoradapter "github.com/ByReisK/byreis/internal/adapter/validator"
 	"github.com/ByReisK/byreis/internal/cli"
+	"github.com/ByReisK/byreis/internal/cli/prompt"
 	"github.com/ByReisK/byreis/internal/cli/render"
 	"github.com/ByReisK/byreis/internal/core/audit"
 	"github.com/ByReisK/byreis/internal/core/crypto/decrypt"
@@ -42,6 +47,8 @@ import (
 	"github.com/ByReisK/byreis/internal/core/registry/countertypes"
 	"github.com/ByReisK/byreis/internal/core/usecase"
 	"github.com/ByReisK/byreis/internal/core/usecase/rotate"
+	"github.com/ByReisK/byreis/internal/core/usecase/submit"
+	"github.com/ByReisK/byreis/internal/tui"
 )
 
 // BuildProductionDeps constructs the real Deps for the production wiring path.
@@ -167,10 +174,14 @@ func BuildProductionDeps(ctx context.Context) (*cli.Deps, error) {
 	}
 
 	// Build the RecipientSourceWrapper over the registry client (if available).
+	// wrapper is declared at function scope so buildSubmitterProd and
+	// buildRunTUISubmitProd can receive the concrete type (which satisfies both
+	// usecase.RecipientSource and submit.RecipientSource).
+	var wrapper *RecipientSourceWrapper
 	var recips usecase.RecipientSource
 	var counter usecase.CounterStore
 	if regClient != nil {
-		wrapper := NewRecipientSourceWrapper(regClient)
+		wrapper = NewRecipientSourceWrapper(regClient)
 		recips = wrapper
 		counter = &prodRegistryCounterStoreBridge{client: regClient}
 	}
@@ -252,6 +263,34 @@ func BuildProductionDeps(ctx context.Context) (*cli.Deps, error) {
 		}
 	}
 
+	// Build the ValueValidator shared by the submit and review use-cases.
+	valValidator := valueValidatorProd()
+
+	// Build the git provider for the submit and review paths. A nil provider is
+	// safe: buildReviewerProd and buildSubmitterProd each nil-fallback.
+	project := projectIDFromEnvProd()
+	baseBranch := baseBranchFromEnvProd()
+	token := githubTokenProd()
+
+	gitProvider, gpErr := buildGitProviderProd(token, project, baseBranch)
+	if gpErr != nil {
+		fmt.Fprintf(os.Stderr, "byreis: warning: git provider unavailable: %v\n", gpErr)
+	}
+
+	// Build the Reviewer use-case (admin-only; nil in contributor mode).
+	reviewer := buildReviewerProd(
+		currentMode, gitProvider, decrypt.New(), idLoader, codec, gate,
+		valValidator, buildAuditSinkProd(configDir),
+	)
+
+	// Build the Submitter use-case (all modes).
+	submitter, submitGitPort, subErr := buildSubmitterProd(
+		wrapper, gitProvider, codec, forSource, cacheDirProd(),
+	)
+	if subErr != nil {
+		fmt.Fprintf(os.Stderr, "byreis: warning: submit use-case unavailable: %v\n", subErr)
+	}
+
 	// Build the Doctor use-case and the rotation-history variant.
 	registryURL := os.Getenv("BYREIS_REGISTRY")
 	doctor, rotationHistoryDoctor := buildDoctorProd(
@@ -269,6 +308,15 @@ func BuildProductionDeps(ctx context.Context) (*cli.Deps, error) {
 		if ar, ok := regClient.(rotate.AuditReader); ok {
 			auditReader = ar
 		}
+	}
+
+	// Build the TUI RunTUISubmit factory. The composition root assembles the
+	// SubmitterFactory closure so internal/cli stays free of any internal/tui
+	// import (the cli↛tui boundary). The closure reuses the same 7 ports as
+	// the CLI's Submitter; only the Prompter differs.
+	var runTUISubmit func(ctx context.Context, out interface{ Write([]byte) (int, error) }, preFilledKey string, base submit.Input) error
+	if submitGitPort != nil && wrapper != nil {
+		runTUISubmit = buildRunTUISubmitProd(wrapper, submitGitPort, codec, forSource, cacheDirProd())
 	}
 
 	return &cli.Deps{
@@ -289,6 +337,10 @@ func BuildProductionDeps(ctx context.Context) (*cli.Deps, error) {
 		AuditReader:           auditReader,
 		Doctor:                doctor,
 		RotationHistoryDoctor: rotationHistoryDoctor,
+		Submitter:             submitter,
+		Reviewer:              reviewer,
+		RunTUISubmit:          runTUISubmit,
+		ErrTUISubmitAborted:   tui.ErrSubmitAborted,
 	}, nil
 }
 
@@ -2029,6 +2081,236 @@ func (p *prodRotationEpochProbe) FetchRotationEpochs(ctx context.Context, projec
 	return p.client.FetchRotationEpochs(ctx, projectID)
 }
 
+// ─── submit / review builder helpers ─────────────────────────────────────────
+
+// valueValidatorProd returns the shared ValueValidator adapter wired into both
+// the submit and review use-cases. The adapter is stateless; a single instance
+// is safe for concurrent use.
+func valueValidatorProd() *validatoradapter.Adapter {
+	return validatoradapter.New()
+}
+
+// cacheDirProd returns the user cache directory for byreis.
+func cacheDirProd() string {
+	if v := os.Getenv("BYREIS_CACHE"); v != "" {
+		return v
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".cache", "byreis")
+}
+
+// buildReviewerProd constructs the Reviewer use-case for the admin review path.
+// Returns nil in CONTRIBUTOR mode or when any required dependency is unavailable
+// (fail-closed, mirroring buildRotatorProd).
+//
+// Review is ADMIN-only: a contributor binary holds no Reviewer at all. This is
+// defense-in-depth; the use-case also re-checks the mode gate at Review time.
+func buildReviewerProd(
+	currentMode mode.Mode,
+	gitProvider coregit.GitProvider,
+	decryptor decrypt.Decryptor,
+	idLoader identity.Loader,
+	codec usecase.ArtifactCodec,
+	gate usecase.ModeGate,
+	validator usecase.ValueValidator,
+	auditSink audit.Logger,
+) usecase.Reviewer {
+	if currentMode != mode.ModeAdmin && currentMode != mode.ModeSuper {
+		return nil
+	}
+	if gitProvider == nil || decryptor == nil || idLoader == nil || codec == nil || gate == nil {
+		fmt.Fprintf(os.Stderr,
+			"byreis: warning: review use-case not wired (required dependency unavailable)\n")
+		return nil
+	}
+	reviewer, err := usecase.NewReviewer(usecase.ReviewDeps{
+		Git:           gitProvider,
+		Decryptor:     decryptor,
+		IDLoader:      idLoader,
+		ArtifactCodec: codec,
+		Mode:          gate,
+		Validator:     validator,
+		Audit:         auditSink,
+		Log:           logging.Discard,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr,
+			"byreis: warning: review use-case construction failed: %v\n", err)
+		return nil
+	}
+	return reviewer
+}
+
+// buildSubmitterProd constructs the Submitter use-case and the underlying
+// submit.GitPort. Submit is wired in all modes (an admin can also submit).
+// Returns (nil, nil, nil) when required dependencies are unavailable.
+func buildSubmitterProd(
+	recipsWrapper *RecipientSourceWrapper,
+	gitProvider coregit.GitProvider,
+	codec *artifactcodec.PortAdapter,
+	forSrc usecase.FileOfRecordSource,
+	cacheDir string,
+) (submit.Submitter, submit.GitPort, error) {
+	if recipsWrapper == nil {
+		return nil, nil, nil
+	}
+	if gitProvider == nil {
+		return nil, nil, nil
+	}
+
+	// Build the submit git port using the existing SubmitGitPort (wrapper.go).
+	// The codec's EncodeUnsignedFromValues is the artifact encoder.
+	codecEncoder := &prodArtifactCodecEncoder{codec: codec}
+	gitPort, err := NewSubmitGitPort(gitProvider, codecEncoder)
+	if err != nil {
+		return nil, nil, fmt.Errorf("constructing submit git port: %w", err)
+	}
+
+	// Build the key existence probe. The forSourceBytesAdapter bridges the
+	// usecase.FileOfRecordSource port to keyprobe.FileOfRecordBytesSource so
+	// the keyprobe package stays free of the core/usecase import (which would
+	// transitively pull in crypto/identity and crypto/decrypt).
+	var keyProbe submit.KeyExistenceProbe
+	if forSrc != nil {
+		probe, probeErr := keyprobe.New(&forSourceBytesAdapter{src: forSrc}, codec)
+		if probeErr != nil {
+			return nil, nil, fmt.Errorf("constructing key existence probe: %w", probeErr)
+		}
+		keyProbe = probe
+	} else {
+		keyProbe = &prodNoopKeyProbe{}
+	}
+
+	// Build the resume store.
+	resumeStore, rsErr := resumestore.New(cacheDir)
+	if rsErr != nil {
+		return nil, nil, fmt.Errorf("constructing resume store: %w", rsErr)
+	}
+
+	submitter, newErr := submit.New(submit.Deps{
+		Recipients: recipsWrapper,
+		Encryptor:  encrypt.New(),
+		Validator:  valueValidatorProd(),
+		KeyProbe:   keyProbe,
+		Git:        gitPort,
+		Resume:     resumeStore,
+		Prompter:   prompt.New(),
+		Clock:      &prodRotateClock{},
+	})
+	if newErr != nil {
+		return nil, nil, fmt.Errorf("constructing submit use-case: %w", newErr)
+	}
+	return submitter, gitPort, nil
+}
+
+// prodArtifactCodecEncoder adapts the *artifactcodec.PortAdapter to the
+// app.ArtifactEncoder interface required by SubmitGitPort.
+type prodArtifactCodecEncoder struct {
+	codec *artifactcodec.PortAdapter
+}
+
+// EncodeUnsigned implements app.ArtifactEncoder.
+func (e *prodArtifactCodecEncoder) EncodeUnsigned(in submit.OpenPRInput) ([]byte, error) {
+	return e.codec.EncodeUnsignedFromValues(in.Artifact)
+}
+
+// Compile-time assertion.
+var _ ArtifactEncoder = (*prodArtifactCodecEncoder)(nil)
+
+// buildRunTUISubmitProd builds the RunTUISubmit closure that the submit CLI
+// command calls when ShouldLaunchTUI returns true. The closure is assembled
+// here at the composition root so internal/cli stays free of any internal/tui
+// import (the cli↛tui boundary is enforced by depguard).
+//
+// The SubmitterFactory re-creates a submit.Submitter with the TUI-supplied
+// Prompter (a prefilledPrompter), reusing all other adapter deps unchanged.
+func buildRunTUISubmitProd(
+	recipsWrapper *RecipientSourceWrapper,
+	gitPort submit.GitPort,
+	codec *artifactcodec.PortAdapter,
+	forSrc usecase.FileOfRecordSource,
+	cacheDir string,
+) func(ctx context.Context, out interface{ Write([]byte) (int, error) }, preFilledKey string, base submit.Input) error {
+	// Build shared deps for the TUI SubmitterFactory. The forSourceBytesAdapter
+	// bridges usecase.FileOfRecordSource → keyprobe.FileOfRecordBytesSource so
+	// the keyprobe package does not import core/usecase.
+	var keyProbeForTUI submit.KeyExistenceProbe
+	if forSrc != nil {
+		if p, err := keyprobe.New(&forSourceBytesAdapter{src: forSrc}, codec); err == nil {
+			keyProbeForTUI = p
+		}
+	}
+	if keyProbeForTUI == nil {
+		keyProbeForTUI = &prodNoopKeyProbe{}
+	}
+
+	resumeStore, rsErr := resumestore.New(cacheDir)
+	if rsErr != nil {
+		return nil
+	}
+
+	factory := tui.SubmitterFactory(func(p submit.Prompter) (submit.Submitter, error) {
+		return submit.New(submit.Deps{
+			Recipients: recipsWrapper,
+			Encryptor:  encrypt.New(),
+			Validator:  valueValidatorProd(),
+			KeyProbe:   keyProbeForTUI,
+			Git:        gitPort,
+			Resume:     resumeStore,
+			Prompter:   p,
+			Clock:      &prodRotateClock{},
+		})
+	})
+
+	return func(ctx context.Context, out interface{ Write([]byte) (int, error) }, preFilledKey string, base submit.Input) error {
+		var w io.Writer
+		if out != nil {
+			w = out
+		} else {
+			w = os.Stdout
+		}
+		return tui.RunSubmit(ctx, tui.Deps{
+			SubmitterFactory: factory,
+		}, w, preFilledKey, base)
+	}
+}
+
+// prodNoopKeyProbe is a fail-open KeyExistenceProbe used when no
+// file-of-record source is wired (e.g. on first-ever submission with no live
+// secrets file). It always returns (false, nil) so the submit use-case
+// classifies the key as ADD. This is safe: a false ADD for a key that already
+// exists is harmless (the merge step enforces the authoritative state).
+type prodNoopKeyProbe struct{}
+
+func (p *prodNoopKeyProbe) KeyExists(_ context.Context, _, _, _ string) (bool, error) {
+	return false, nil
+}
+
+// forSourceBytesAdapter bridges usecase.FileOfRecordSource (which returns
+// usecase.FileOfRecord) to keyprobe.FileOfRecordBytesSource (which returns
+// only []byte). This keeps the keyprobe package free of the core/usecase
+// import that would transitively pull in crypto/identity and crypto/decrypt,
+// violating the contributor-path import allowlist.
+type forSourceBytesAdapter struct {
+	src usecase.FileOfRecordSource
+}
+
+func (a *forSourceBytesAdapter) FileOfRecordBytes(ctx context.Context, projectID, fileName string) ([]byte, error) {
+	rec, err := a.src.FileOfRecord(ctx, projectID, fileName)
+	if err != nil {
+		// Map the usecase not-found sentinel to keyprobe's sentinel so the
+		// probe can distinguish "no file yet" from a hard fetch error.
+		if errors.Is(err, usecase.ErrFileOfRecordNotFound) {
+			return nil, fmt.Errorf("%w: %v", keyprobe.ErrFileNotFound, err)
+		}
+		return nil, err
+	}
+	return rec.Bytes, nil
+}
+
 // ─── compile-time assertions ─────────────────────────────────────────────────
 
 var (
@@ -2042,4 +2324,6 @@ var (
 	_ cli.RotatePreFlightReader                  = (*prodRotatePreFlight)(nil)
 	_ usecase.RegistryStatusProbe                = (*prodRegistryStatusProbe)(nil)
 	_ usecase.RotationEpochProbe                 = (*prodRotationEpochProbe)(nil)
+	_ submit.KeyExistenceProbe                   = (*prodNoopKeyProbe)(nil)
+	_ keyprobe.FileOfRecordBytesSource           = (*forSourceBytesAdapter)(nil)
 )

@@ -789,3 +789,48 @@ func (a *PortAdapter) EncodeSigned(s artifact.Signed) ([]byte, error) {
 func (a *PortAdapter) EncodeUnsignedFromValues(u artifact.Unsigned) ([]byte, error) {
 	return a.codec.EncodeUnsigned(context.Background(), u)
 }
+
+// DecodeKeyNames decodes the top-level per-key names from an artifact's YAML
+// envelope WITHOUT decoding encrypted values or touching any identity material.
+// Only the mapping keys at the document root that are NOT "byreis" or
+// "manifest_sig" are returned — these are the secret key names.
+//
+// This method is adapter-layer only; the core ArtifactCodec port is NOT
+// widened. It is consumed exclusively by the KeyExistenceProbe adapter
+// (internal/adapter/git/keyprobe) which needs name-only key membership
+// without any decrypt or identity route.
+//
+// Returns ErrDecodeMalformed on structural violations; ErrInputTooLarge when
+// the input exceeds 10 MiB. Never returns a partial result alongside an error.
+func (a *PortAdapter) DecodeKeyNames(b []byte) ([]string, error) {
+	return a.codec.DecodeKeyNames(context.Background(), b)
+}
+
+// DecodeKeyNames decodes the top-level per-key names from the YAML envelope
+// without decrypting values or loading any identity material.
+//
+// The set of returned names is EXACTLY the set of keys in rawEnvelope.values:
+// every top-level mapping key that is not "byreis" or "manifest_sig". Ordering
+// is undefined (map iteration); callers needing stable order must sort.
+//
+// Returns ErrDecodeMalformed or ErrInputTooLarge on structural violations.
+// Never returns a partial result alongside an error.
+func (c *Codec) DecodeKeyNames(ctx context.Context, b []byte) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("artifact decode cancelled: %w", err)
+	}
+	if len(b) > maxInputBytes {
+		return nil, fmt.Errorf("%w", ErrInputTooLarge)
+	}
+
+	raw, err := parseRawEnvelope(b)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrDecodeMalformed, err)
+	}
+
+	names := make([]string, 0, len(raw.values))
+	for k := range raw.values {
+		names = append(names, k)
+	}
+	return names, nil
+}

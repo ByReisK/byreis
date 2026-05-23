@@ -22,11 +22,11 @@ func main() {
 		os.Exit(int(cli.ExitCodeOf(err)))
 	}
 
-	// Wire the TUI submit sentinel so the submit RunE can distinguish a
+	// Wire the TUI submit abort sentinel so the submit RunE can distinguish a
 	// contributor cancellation (non-zero exit, no message) from a submit
-	// failure (non-zero exit + error text) once RunTUISubmit is enabled.
-	// RunTUISubmit itself is wired here when the SubmitterFactory is
-	// available; it is left nil until the submit adapter wiring is complete.
+	// failure (non-zero exit + error text). The RunTUISubmit factory is
+	// assembled in app.BuildProductionDeps to preserve the cli↛tui boundary;
+	// main sets only the abort sentinel.
 	deps.ErrTUISubmitAborted = tui.ErrSubmitAborted
 
 	root := cli.NewRootCmdWithDeps(deps)
