@@ -100,7 +100,77 @@ Contributor and admin modes are both permitted to submit.`,
 				return &exitError{code: render.ExitGeneralError, cause: err}
 			}
 
-			// At least one input mode is required.
+			// TUI fork: if ShouldLaunchTUI returns true and RunTUISubmit is wired,
+			// delegate to the TUI submit screen instead of the headless CLI path.
+			// The fork runs BEFORE the "at least one flag required" check because
+			// bare `byreis submit` with no flags at a TTY is the canonical TUI
+			// launch case.
+			//
+			// The --file bulk path and --key-with-piped-stdin path always stay
+			// headless (FlagsFullySpecify returns true for them), so the bulk and
+			// piped paths stay headless without an explicit --file guard here.
+			//
+			// The TUI fork is placed after the mode gate and the mutual-exclusion
+			// check but before the "at least one input mode" check so that bare
+			// `submit` reaches the TUI rather than the headless error path.
+			if deps.RunTUISubmit != nil && ShouldLaunchTUI(
+				"submit",
+				*jsonFlag,
+				EnvFromOS(),
+				IsTTYFile(os.Stdin),
+				IsTTYFile(os.Stdout),
+				deps.Policy,
+				deps.CurrentMode,
+				key,
+				filePath,
+				"",
+				nonInteractive,
+			) {
+				// Build the base submit.Input with the same metadata fields the
+				// headless CLI path uses. The TUI model populates Key from its
+				// form (or from the pre-supplied --key value).
+				projectID := os.Getenv("BYREIS_PROJECT")
+				logicalFile := os.Getenv("BYREIS_LOGICAL_FILE")
+				secretsPath := os.Getenv("BYREIS_SECRETS_PATH")
+				baseFilePath := os.Getenv("BYREIS_BASE_FILE_PATH")
+				if projectID == "" || secretsPath == "" {
+					err := fmt.Errorf(
+						"project configuration not set — " +
+							"set BYREIS_PROJECT and BYREIS_SECRETS_PATH, " +
+							"or run `byreis init` to generate a project config")
+					r.PrintErrorClass(
+						"general-error",
+						err.Error(),
+						"run `byreis init` or set BYREIS_PROJECT + BYREIS_SECRETS_PATH",
+					)
+					return &exitError{code: render.ExitGeneralError, cause: err}
+				}
+				if baseFilePath == "" {
+					baseFilePath = secretsPath
+				}
+
+				base := submit.Input{
+					ProjectID:       projectID,
+					LogicalFileName: logicalFile,
+					Justification:   justification,
+					SecretsPath:     secretsPath,
+					BaseFilePath:    baseFilePath,
+				}
+
+				ctx := cmd.Context()
+				tuiErr := deps.RunTUISubmit(ctx, cmd.OutOrStdout(), key, base)
+				if tuiErr != nil {
+					if deps.ErrTUISubmitAborted != nil && errors.Is(tuiErr, deps.ErrTUISubmitAborted) {
+						// Abort is clean: non-zero exit, no error message (the TUI
+						// already rendered the "cancelled" state).
+						return &exitError{code: render.ExitGeneralError, cause: tuiErr}
+					}
+					return handleSubmitError(r, tuiErr)
+				}
+				return nil
+			}
+
+			// At least one input mode is required for the headless path.
 			if key == "" && filePath == "" {
 				err := fmt.Errorf(
 					"one of --key or --file is required — " +

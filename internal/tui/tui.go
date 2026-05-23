@@ -38,6 +38,19 @@ import (
 	"github.com/ByReisK/byreis/internal/core/usecase/submit"
 )
 
+// SubmitterFactory is a function that constructs a submit.Submitter using the
+// same underlying adapter deps as the CLI's Submitter but with the supplied
+// Prompter. The TUI submit screen calls this factory with a prefilledPrompter
+// (backed by the huh form's collected value) so the core use-case's
+// CollectValue call returns the TUI-collected value without re-prompting.
+//
+// The factory function is set by the composition root (cmd/byreis/main.go) and
+// reuses the same Recipients, Encryptor, Validator, KeyProbe, Git, Resume,
+// Clock, Audit, and Log adapters as the CLI's Submitter. Only the Prompter
+// differs. This is intentional: the TUI is a UI shell, not a second adapter
+// wiring layer — it drives the same adapters through a different interaction model.
+type SubmitterFactory func(prompter submit.Prompter) (submit.Submitter, error)
+
 // Deps carries the narrow set of core ports the TUI needs. It is a strict
 // subset of cli.Deps fields — all consumer-defined core ports, never adapter
 // types. The TUI calls the same constructed port instances handed to the CLI:
@@ -86,20 +99,25 @@ type Deps struct {
 	// render_guard_test.go AST test in this package): render.New binds bare
 	// os.Stdout and would bypass the bubbletea output model.
 	Renderer *render.Renderer
+
+	// SubmitterFactory constructs a submit.Submitter backed by the given
+	// Prompter. The factory is set by the composition root and reuses all
+	// the same adapter deps as the CLI's Submitter; only the Prompter differs.
+	// When nil the TUI submit screen returns an error (adapters not configured).
+	SubmitterFactory SubmitterFactory
 }
 
-// Run launches the interactive TUI program. It is the single entry point from
-// cmd/byreis/main.go. Run must only be called after ShouldLaunchTUI returns
-// true for the current invocation; the caller is responsible for that check.
+// Run launches the interactive TUI program for non-submit verbs (review queue,
+// etc.). It is retained as the entry point for the review and other TUI screens
+// that are added in subsequent build slices. Run must only be called after
+// ShouldLaunchTUI returns true; the caller is responsible for that check.
+//
+// For the submit verb use RunSubmit (defined in submit.go), which handles the
+// pre-filled-key argument and the masked-value form lifecycle.
 //
 // The context ctx carries the caller's deadline and cancellation signal.
 // Run honors cancellation: if ctx is cancelled before the program finishes,
 // Run returns ctx.Err() wrapped with an actionable hint.
-//
-// This implementation is a minimal placeholder shell. The actual submit and
-// review screens are added in subsequent build slices. The placeholder renders
-// a brief informational message and exits cleanly so the scaffold compiles and
-// all integration tests remain green.
 func Run(ctx context.Context, deps Deps, out io.Writer) error {
 	if deps.Policy == nil {
 		return fmt.Errorf(
@@ -126,25 +144,21 @@ func Run(ctx context.Context, deps Deps, out io.Writer) error {
 	return nil
 }
 
-// shellModel is the minimal placeholder bubbletea model. It renders a brief
-// informational message and exits after the first render cycle. The real submit
-// and review models are added in subsequent build slices.
+// shellModel is the placeholder bubbletea model for non-submit TUI paths
+// (review queue, etc.). It renders a brief informational message and exits
+// after the first render cycle. The real review screens are added in
+// subsequent build slices.
 //
-// submitF is nil in the scaffold; it is populated with the masked value form
-// when the submit screen lands.
+// The submit screen uses submitModel (defined in submit.go), not this model.
+// Run is retained for non-submit entry points; submit uses RunSubmit.
 type shellModel struct {
-	deps    Deps
-	done    bool
-	submitF *SubmitForm
+	deps Deps
+	done bool
 }
 
-// newShellModel constructs the placeholder shell model. The submit form is
-// pre-allocated as a typed placeholder; the real submit screen populates it
-// with the actual key name when the submit path launches the TUI. In the
-// scaffold the form is constructed but never Run().
+// newShellModel constructs the placeholder shell model for non-submit paths.
 func newShellModel(deps Deps) shellModel {
-	sf := newSubmitForm("")
-	return shellModel{deps: deps, submitF: sf}
+	return shellModel{deps: deps}
 }
 
 // Init returns no initial command: the placeholder shell has nothing to set up.
@@ -153,14 +167,7 @@ func (m shellModel) Init() tea.Cmd {
 }
 
 // Update handles incoming messages. The placeholder shell quits immediately.
-// When a submit form is active, Update forwards messages to it and returns a
-// quit command when the form completes.
 func (m shellModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	if m.submitF != nil {
-		// The submit form is allocated but not run in the placeholder shell.
-		// The real submit screen wires form message delegation here.
-		_ = m.submitF
-	}
 	switch msg.(type) {
 	case tea.QuitMsg:
 		m.done = true
@@ -181,5 +188,5 @@ func (m shellModel) View() string {
 		Foreground(lipgloss.Color("62")).
 		Render("byreis")
 
-	return header + " — interactive mode (screens landing in upcoming slices)\n"
+	return header + " — interactive mode (review screens landing in upcoming slices)\n"
 }

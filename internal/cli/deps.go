@@ -123,6 +123,26 @@ type Deps struct {
 	// client is available. When nil the command returns a "not configured" error.
 	AuditReader rotate.AuditReader
 
+	// RunTUISubmit is the function the submit RunE calls when ShouldLaunchTUI
+	// returns true. It encapsulates the full TUI submit flow (huh form +
+	// Submit use-case call) and returns nil on success, ErrTUISubmitAborted on
+	// Ctrl-C / cancel, or a wrapped submit use-case error on failure.
+	//
+	// The function signature avoids any direct dependency on internal/tui from
+	// internal/cli: the composition root (cmd/byreis/main.go) sets this field
+	// to tui.RunSubmit(...), keeping the cli→tui import edge at the root layer.
+	//
+	// When nil the TUI submit path is disabled; ShouldLaunchTUI may still
+	// return true, but the RunE fork falls through to the headless error path.
+	RunTUISubmit func(ctx context.Context, out interface{ Write([]byte) (int, error) }, preFilledKey string, base submit.Input) error
+
+	// ErrTUISubmitAborted is the sentinel returned by RunTUISubmit when the
+	// contributor cancels the form before any Submit call (Ctrl-C / Esc /
+	// "Cancel" on the confirm screen). The submit RunE maps this to a non-zero
+	// exit with no error message (the TUI rendered the abort state). When nil
+	// any non-nil RunTUISubmit error is treated as a submit failure.
+	ErrTUISubmitAborted error
+
 	// RotatePreFlight is the narrow read-only port the rotate command uses to
 	// perform the two pre-flight checks required before invoking Rotator.Rotate:
 	//   (a) registry freshness/verification — SourceVerified + non-stale
