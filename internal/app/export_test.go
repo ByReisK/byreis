@@ -6,6 +6,7 @@ import (
 	"context"
 
 	registryadapter "github.com/ByReisK/byreis/internal/adapter/registry"
+	coregit "github.com/ByReisK/byreis/internal/core/git"
 	"github.com/ByReisK/byreis/internal/core/mode"
 )
 
@@ -36,4 +37,11 @@ func NewCapturedModeProviderForTest(m mode.Mode) interface {
 	CurrentMode(ctx context.Context) (mode.Mode, error)
 } {
 	return &capturedModeProvider{m: m}
+}
+
+// BuildGitProviderProdForTest calls buildGitProviderProd so that app_test
+// package tests can assert the typed-nil invariant without importing the
+// production adapter directly.
+var BuildGitProviderProdForTest = func(token, project, baseBranch string) (coregit.GitProvider, error) {
+	return buildGitProviderProd(token, project, baseBranch)
 }

@@ -773,7 +773,11 @@ func buildGitProviderProd(token, project, baseBranch string) (coregit.GitProvide
 	if baseBranch == "" {
 		baseBranch = "main"
 	}
-	return gitadapter.New(token, project, baseBranch, "byreis")
+	p, err := gitadapter.New(token, project, baseBranch, "byreis")
+	if err != nil {
+		return nil, err
+	}
+	return p, nil
 }
 
 // buildAtomicWriterProd constructs the atomicwrite.Writer rooted at the project
