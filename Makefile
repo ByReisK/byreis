@@ -56,8 +56,11 @@ test-composability:
 test-tui-core-ceiling:
 	go test $(GO_TEST_FLAGS) -tags ceiling -run 'TestTUICeiling' ./internal/tui/
 
-## lint: run golangci-lint (enforces Clean Architecture dependency rules)
+## lint: verify the golangci-lint config schema, then run golangci-lint.
+## config verify matches what golangci-lint-action@v7 (CI) runs before lint,
+## so a schema error that would fail CI also fails locally.
 lint:
+	$(GOLANGCI) config verify
 	$(GOLANGCI) run ./...
 
 ## install: install the byreis binary to $GOPATH/bin (or $HOME/go/bin)

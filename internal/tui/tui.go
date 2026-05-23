@@ -82,9 +82,9 @@ type Deps struct {
 	// Renderer, not directly to os.Stdout, so the bubbletea frame is never
 	// corrupted by bare os.Stdout writes.
 	//
-	// Never call render.New() inside the TUI package (forbidigo-enforced):
-	// render.New binds bare os.Stdout and would bypass the bubbletea output
-	// model.
+	// Never call render.New() inside the TUI package (enforced by the
+	// render_guard_test.go AST test in this package): render.New binds bare
+	// os.Stdout and would bypass the bubbletea output model.
 	Renderer *render.Renderer
 }
 
