@@ -7,6 +7,9 @@ import (
 
 	"github.com/ByReisK/byreis/internal/adapter/artifactcodec"
 	registryadapter "github.com/ByReisK/byreis/internal/adapter/registry"
+	"github.com/ByReisK/byreis/internal/core/audit"
+	"github.com/ByReisK/byreis/internal/core/crypto/decrypt"
+	"github.com/ByReisK/byreis/internal/core/crypto/identity"
 	coregit "github.com/ByReisK/byreis/internal/core/git"
 	"github.com/ByReisK/byreis/internal/core/mode"
 	"github.com/ByReisK/byreis/internal/core/usecase"
@@ -47,6 +50,24 @@ func NewCapturedModeProviderForTest(m mode.Mode) interface {
 // production adapter directly.
 var BuildGitProviderProdForTest = func(token, project, baseBranch string) (coregit.GitProvider, error) {
 	return buildGitProviderProd(token, project, baseBranch)
+}
+
+// BuildReviewerProdForTest calls buildReviewerProd so that app_test package
+// tests can assert the positive composition leg (ADMIN mode + non-nil git
+// provider → non-nil Reviewer) and its mode gate (CONTRIBUTOR → nil) directly,
+// without needing a real GitHub repo to satisfy both ADMIN-promotion and a
+// non-nil git provider simultaneously through full mode detection.
+var BuildReviewerProdForTest = func(
+	currentMode mode.Mode,
+	gitProvider coregit.GitProvider,
+	decryptor decrypt.Decryptor,
+	idLoader identity.Loader,
+	codec usecase.ArtifactCodec,
+	gate usecase.ModeGate,
+	validator usecase.ValueValidator,
+	auditSink audit.Logger,
+) usecase.Reviewer {
+	return buildReviewerProd(currentMode, gitProvider, decryptor, idLoader, codec, gate, validator, auditSink)
 }
 
 // SubmitSharedDepsForTest is the exported view of submitSharedDeps for the

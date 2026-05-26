@@ -42,8 +42,14 @@ package app_test
 //   BYREIS_GITHUB_TOKEN with write access to a real repo, so a full
 //   submit-through-PR-open round-trip is not driven here. The non-nil
 //   assertion (deps.Submitter != nil, deps.RunTUISubmit != nil) is the
-//   primary regression guard. FL-V7-CRYPTO-3 (fixture-github-server for full
-//   submit round-trip) is carried to a future slice.
+//   primary regression guard for the submit leg.
+//
+//   The Reviewer-wiring property is NOT deferred: it is asserted directly
+//   against buildReviewerProd (see PRIMARY/ReviewerWiredFromAdminModeAndGitProvider).
+//   What FL-V7-CRYPTO-3 still carries to a future slice is only the end-to-end
+//   exercise of ADMIN-mode + Reviewer through live BuildProductionDeps detection
+//   against a real (cloneable) GitHub repo, plus a fixture-github-server for the
+//   full submit-through-PR-open round-trip.
 //
 // Fixture strategy:
 //   Replicates the shipgate fixture pattern from
@@ -86,16 +92,16 @@ import (
 	"github.com/ByReisK/byreis/internal/core/usecase"
 )
 
-// d1ProjectID is the BYREIS_PROJECT value: owner/repo form required by the
-// git provider. buildGitProviderProd passes this directly to gitadapter.New
-// which validates owner/repo format. projectIDFromEnvProd strips the owner
-// prefix so the registry path component is the bare repo name (d1RegistryID).
-const d1ProjectID = "myorg/myapp"
+// d1ProjectID is the BYREIS_PROJECT value: the pure logical/registry project
+// identifier — slash-free, matching the registry_project_id signed-manifest
+// field. Registry file paths (projects/<id>.yaml, counters/<id>/...) and
+// artifact metadata use this value directly.
+const d1ProjectID = "myapp"
 
-// d1RegistryID is the bare logical project identifier used for registry
-// file paths (projects/<id>.yaml, counters/<id>/...) and artifact metadata.
-// It equals the repo-name part of d1ProjectID (after the "/").
-const d1RegistryID = "myapp"
+// d1GitSlug is the BYREIS_PROJECT_REPO owner/repo slug consumed by the git
+// provider. It is allowed to differ from d1ProjectID; here "myorg/myapp" is a
+// distinct repo name to exercise that the two-var contract separates them.
+const d1GitSlug = "myorg/myapp"
 
 // d1LogicalFile is the logical file name configured in projects/<id>.yaml.
 const d1LogicalFile = "prod"
@@ -119,10 +125,32 @@ const d1AnchorPrincipal = "byreis-anchor"
 
 // TestD1_PositiveComposition is the D-1 regression guard.
 //
-// PRIMARY assertion: with a fully-configured ADMIN environment (real admin age
-// key at 0600 + file:// registry signed by the ssh anchor), BuildProductionDeps
-// returns non-nil Submitter, Reviewer, and RunTUISubmit. This directly prevents
-// the silent re-nil regression that shipped twice (v0.1, v0.2).
+// Two-var contract exercise: BYREIS_PROJECT carries the slash-free logical
+// project id; BYREIS_PROJECT_REPO carries the secrets-repo location. The two
+// values are allowed to differ (e.g. project "myapp" living in "myorg/myapp").
+//
+// PRIMARY/AdminModeDetected: with BYREIS_PROJECT_REPO set to a real file://
+// project repo, the mode detector probes the file-of-record and promotes to
+// ADMIN. With a file:// repo the GitHub git provider cannot be constructed
+// (correct: GitHub API requires an owner/repo slug, not a local path), so
+// Reviewer and Submitter are nil — this is correct and expected behavior for
+// file:// project repos.
+//
+// PRIMARY/SubmitterAndRunTUISubmitWiredWithGitHubSlug: with BYREIS_PROJECT_REPO
+// set to a fake owner/repo slug (no real network call), the git provider is
+// constructed non-nil and the Submitter + RunTUISubmit fields are wired. Mode
+// may downgrade to CONTRIBUTOR (the decrypt probe's git clone of the fake slug
+// fails — fail-closed per design), but Submitter is all-mode and is wired
+// whenever the git provider and recipient source are available.
+//
+// PRIMARY/ReviewerWiredFromAdminModeAndGitProvider: the Reviewer-wiring
+// property requires ADMIN mode AND a non-nil git provider simultaneously, which
+// the two-var contract cannot produce in a single live detection run (a file://
+// project repo yields no owner/repo slug, so the GitHub provider is nil). The
+// wiring leg is therefore asserted against the production buildReviewerProd
+// function directly — ADMIN mode + non-nil stub provider → non-nil Reviewer —
+// with a CONTRIBUTOR-mode negative companion proving the ADMIN gate. No real
+// GitHub repo, httptest, or network is involved.
 //
 // ROUND-TRIP assertion: a reviewer constructed from the same ports that
 // BuildProductionDeps uses (real decrypt, real identity loader, real codec)
@@ -140,36 +168,117 @@ func TestD1_PositiveComposition(t *testing.T) {
 
 	fx := newD1Fixture(t)
 
-	t.Run("PRIMARY/SubmitterAndReviewerNonNilInAdminMode", func(t *testing.T) {
-		// Apply the ADMIN env. A fake (non-empty) BYREIS_GITHUB_TOKEN is set so
-		// buildGitProviderProd constructs a non-nil git provider — the token is
-		// never used in this test (no real API call is made). This is the
-		// minimum required to make both Submitter and Reviewer non-nil.
+	t.Run("PRIMARY/AdminModeDetected", func(t *testing.T) {
+		// BYREIS_PROJECT_REPO = file:// URL so the mode probe can clone and
+		// decrypt the file-of-record (required for ADMIN promotion). The GitHub
+		// git provider cannot be constructed from a file:// URL; Reviewer and
+		// Submitter are nil — this is correct behavior.
 		fx.applyAdminEnv(t)
+
+		deps, err := app.BuildProductionDeps(context.Background())
+		if err != nil {
+			t.Fatalf("D-1/PRIMARY/AdminModeDetected: BuildProductionDeps: %v", err)
+		}
+		if deps.CurrentMode != mode.ModeAdmin {
+			t.Fatalf("D-1/PRIMARY/AdminModeDetected: deps.CurrentMode = %v, want ModeAdmin "+
+				"(admin age key + file-of-record decryptable + key registered in registry)",
+				deps.CurrentMode)
+		}
+	})
+
+	t.Run("PRIMARY/SubmitterAndRunTUISubmitWiredWithGitHubSlug", func(t *testing.T) {
+		// Override BYREIS_PROJECT_REPO with a fake owner/repo slug so
+		// gitSlugFromProjectRepoURLProd returns a non-empty value and the git
+		// provider is constructed non-nil. A fake token is set for construction
+		// only; no real GitHub API call is made. The decrypt probe's clone of
+		// the fake slug will fail, downgrading mode to CONTRIBUTOR — this is
+		// correct fail-closed behavior. Submitter and RunTUISubmit are all-mode
+		// and are wired whenever git provider + recipient source are available.
+		fx.applyAdminEnv(t)
+		t.Setenv("BYREIS_PROJECT_REPO", d1GitSlug)
 		t.Setenv("BYREIS_GITHUB_TOKEN", "fake-d1-github-token-for-construction-only")
 
 		deps, err := app.BuildProductionDeps(context.Background())
 		if err != nil {
-			t.Fatalf("D-1/PRIMARY: BuildProductionDeps in ADMIN mode: %v", err)
-		}
-		if deps.CurrentMode != mode.ModeAdmin {
-			t.Fatalf("D-1/PRIMARY: deps.CurrentMode = %v, want ModeAdmin "+
-				"(admin age key + registered in registry; mode detection failed)",
-				deps.CurrentMode)
+			t.Fatalf("D-1/PRIMARY/Wiring: BuildProductionDeps: %v", err)
 		}
 
-		// PRIMARY regression guard: all three wired fields must be non-nil.
+		// PRIMARY regression guard: Submitter and RunTUISubmit must be non-nil
+		// whenever the git provider and recipient source are available.
 		if deps.Submitter == nil {
-			t.Errorf("D-1/PRIMARY: deps.Submitter is nil — " +
+			t.Errorf("D-1/PRIMARY/Wiring: deps.Submitter is nil — " +
 				"production wiring re-niled Submitter (regression)")
 		}
-		if deps.Reviewer == nil {
-			t.Errorf("D-1/PRIMARY: deps.Reviewer is nil — " +
-				"production wiring re-niled Reviewer (regression)")
-		}
 		if deps.RunTUISubmit == nil {
-			t.Errorf("D-1/PRIMARY: deps.RunTUISubmit is nil — " +
+			t.Errorf("D-1/PRIMARY/Wiring: deps.RunTUISubmit is nil — " +
 				"SubmitterFactory closure not assembled at the composition root (regression)")
+		}
+	})
+
+	t.Run("PRIMARY/ReviewerWiredFromAdminModeAndGitProvider", func(t *testing.T) {
+		// Directly exercises the production Reviewer-wiring leg of the
+		// composition root (buildReviewerProd) with ADMIN mode + a non-nil git
+		// provider. This is the silent-nil regression D-1 guards: the v0.1/v0.2
+		// composition re-niled the Reviewer field unnoticed.
+		//
+		// The two-var contract means a single live BuildProductionDeps run cannot
+		// give ADMIN mode (needs a cloneable file:// project repo) AND a non-nil
+		// git provider (needs an owner/repo slug) at once — so the wiring property
+		// is asserted against buildReviewerProd directly. The same real ports the
+		// ROUNDTRIP subtest constructs are reused; only a non-nil stub git
+		// provider stands in for the GitHub adapter (no network, no httptest).
+		idLoader := identityadapter.New(identityadapter.Config{
+			EnvKeyFile:     fx.adminAgeKeyPath,
+			DefaultKeyPath: func() string { return "" },
+		})
+		codec := artifactcodec.NewPortAdapter(artifactcodec.New())
+		stubGit := &d1StubGitProvider{}
+		gate := &d1AdminModeGate{}
+
+		reviewer := app.BuildReviewerProdForTest(
+			mode.ModeAdmin,
+			stubGit,
+			decrypt.New(),
+			idLoader,
+			codec,
+			gate,
+			nil, // Validator is optional (review per-key display only).
+			audit.Discard,
+		)
+		if reviewer == nil {
+			t.Fatalf("D-1/PRIMARY/ReviewerWired: buildReviewerProd returned nil " +
+				"Reviewer in ADMIN mode with a non-nil git provider — the production " +
+				"Reviewer-wiring leg is silently nil (v0.1/v0.2 regression)")
+		}
+	})
+
+	t.Run("PRIMARY/ReviewerNilInContributorMode", func(t *testing.T) {
+		// Negative companion: proves buildReviewerProd's ADMIN-mode gate actually
+		// gates (mirrors its `currentMode != ModeAdmin && != ModeSuper → nil`
+		// guard), so the positive leg above is not merely non-nil-on-everything.
+		// Same non-nil ports as the positive leg — only the mode differs.
+		idLoader := identityadapter.New(identityadapter.Config{
+			EnvKeyFile:     fx.adminAgeKeyPath,
+			DefaultKeyPath: func() string { return "" },
+		})
+		codec := artifactcodec.NewPortAdapter(artifactcodec.New())
+		stubGit := &d1StubGitProvider{}
+		gate := &d1AdminModeGate{}
+
+		reviewer := app.BuildReviewerProdForTest(
+			mode.ModeContributor,
+			stubGit,
+			decrypt.New(),
+			idLoader,
+			codec,
+			gate,
+			nil,
+			audit.Discard,
+		)
+		if reviewer != nil {
+			t.Fatalf("D-1/PRIMARY/ReviewerNilInContributorMode: buildReviewerProd " +
+				"returned a non-nil Reviewer in CONTRIBUTOR mode — the ADMIN-mode " +
+				"gate is not enforced; a contributor binary must hold no Reviewer")
 		}
 	})
 
@@ -201,7 +310,7 @@ func TestD1_PositiveComposition(t *testing.T) {
 
 		meta := coregit.SubmissionMeta{
 			SchemaVersion: 1,
-			Project:       d1ProjectID,
+			Project:       d1GitSlug,
 			SecretsPath:   d1ConfiguredPath,
 			Key:           d1SecretKey,
 			Action:        "add",
@@ -210,7 +319,7 @@ func TestD1_PositiveComposition(t *testing.T) {
 
 		stubGit := &d1StubGitProvider{
 			submission: coregit.Submission{
-				Ref:           coregit.PRRef{Project: d1ProjectID + "/secrets", Number: 1},
+				Ref:           coregit.PRRef{Project: d1GitSlug + "/secrets", Number: 1},
 				Author:        "contributor",
 				Justification: "D-1 fixture justification",
 				ArtifactBytes: artifactBytes,
@@ -235,8 +344,8 @@ func TestD1_PositiveComposition(t *testing.T) {
 		}
 
 		result, reviewErr := reviewer.Review(context.Background(), usecase.ReviewInput{
-			Ref:               coregit.PRRef{Project: d1ProjectID + "/secrets", Number: 1},
-			ExpectedProjectID: d1RegistryID,
+			Ref:               coregit.PRRef{Project: d1GitSlug + "/secrets", Number: 1},
+			ExpectedProjectID: d1ProjectID,
 			ExpectedFileName:  d1LogicalFile,
 		})
 		if reviewErr != nil {
@@ -544,16 +653,16 @@ func (fx *d1Fixture) d1BuildRegistryRepo(t *testing.T) {
 		t.Fatalf("D-1: mkdir projects: %v", err)
 	}
 	d1WriteFileMode(t,
-		filepath.Join(fx.registryRepoDir, "projects", d1RegistryID+".yaml"),
+		filepath.Join(fx.registryRepoDir, "projects", d1ProjectID+".yaml"),
 		[]byte(projectYAML), 0o644)
 
-	counterDir := filepath.Join(fx.registryRepoDir, "counters", d1RegistryID)
+	counterDir := filepath.Join(fx.registryRepoDir, "counters", d1ProjectID)
 	if err := os.MkdirAll(counterDir, 0o755); err != nil {
 		t.Fatalf("D-1: mkdir counter dir: %v", err)
 	}
 	counterJSON := fmt.Sprintf(
 		`{"project_id":%q,"file":%q,"last_accepted_counter":0,"last_pr":"","updated_at":"2026-05-23T00:00:00Z","pending":null}`+"\n",
-		d1RegistryID, d1LogicalFile,
+		d1ProjectID, d1LogicalFile,
 	)
 	d1WriteFileMode(t, filepath.Join(counterDir, d1LogicalFile+".json"), []byte(counterJSON), 0o644)
 
@@ -615,7 +724,7 @@ func (fx *d1Fixture) d1BuildSignedFileOfRecord(t *testing.T) []byte {
 		},
 		Byreis: artifact.Metadata{
 			FormatVersion: "byreis.native.v1",
-			ProjectID:     d1RegistryID,
+			ProjectID:     d1ProjectID,
 			File:          d1LogicalFile,
 			Counter:       0,
 			Recipients:    []artifact.RecipientEntry{{FP: fpHex}},

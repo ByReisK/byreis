@@ -268,9 +268,9 @@ func BuildProductionDeps(ctx context.Context) (*cli.Deps, error) {
 
 	// Build the git provider for the submit and review paths. A nil provider is
 	// safe: buildReviewerProd and buildSubmitterProd each nil-fallback.
-	// The git provider requires the full owner/repo slug (BYREIS_PROJECT in
-	// owner/repo form); registry paths use the logical name only (no slash).
-	gitProjectSlug := gitProjectSlugFromEnvProd()
+	// The git provider requires the owner/repo slug from BYREIS_PROJECT_REPO.
+	// Registry paths use the logical name from BYREIS_PROJECT (no slash).
+	gitProjectSlug := gitSlugFromProjectRepoURLProd()
 	baseBranch := baseBranchFromEnvProd()
 	token := githubTokenProd()
 
@@ -735,13 +735,13 @@ func buildMergerProd(
 		return nil, mergeExitCode
 	}
 
-	// Build the GitHub git provider. The owner/repo slug and base branch must
-	// be set. The slug comes from the full BYREIS_PROJECT value (may be owner/repo
-	// form); the logical project ID used for registry paths is derived separately.
+	// Build the GitHub git provider. The owner/repo slug comes from
+	// BYREIS_PROJECT_REPO; the logical project ID used for registry paths
+	// comes from BYREIS_PROJECT (slash-free, no derivation needed).
 	baseBranch := baseBranchFromEnvProd()
 	token := githubTokenProd()
 
-	gitProvider, err := buildGitProviderProd(token, gitProjectSlugFromEnvProd(), baseBranch)
+	gitProvider, err := buildGitProviderProd(token, gitSlugFromProjectRepoURLProd(), baseBranch)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "byreis: warning: admin merge not available: git provider: %v\n", err)
 		return nil, mergeExitCode
@@ -786,7 +786,8 @@ func isErr(err, target error) bool {
 func buildGitProviderProd(token, project, baseBranch string) (coregit.GitProvider, error) {
 	if project == "" {
 		return nil, fmt.Errorf(
-			"BYREIS_PROJECT is not set — pass --project or set BYREIS_PROJECT " +
+			"BYREIS_PROJECT_REPO is not set or not a valid owner/repo slug — " +
+				"set BYREIS_PROJECT_REPO to the secrets-repo location (e.g. owner/repo) " +
 				"to construct the git provider for admin merge")
 	}
 	if token == "" {
@@ -1234,25 +1235,33 @@ func defaultSignKeyPathProd(configDir string) string {
 	return filepath.Join(configDir, "identity", "admin-sign.key")
 }
 
-// projectIDFromEnvProd reads the logical project ID from the environment.
-// When BYREIS_PROJECT is in owner/repo form (required by the git provider),
-// only the repo part is returned as the logical project identifier: the
-// registry uses it as a bare filesystem path component (no slashes allowed
-// by the path-traversal guard in fetchtransport.ValidateProjectID).
+// projectIDFromEnvProd reads the logical project ID from BYREIS_PROJECT.
+// This value is the pure registry project identifier — slash-free, exactly the
+// registry_project_id signed-manifest field. It must not contain a slash; the
+// registry path guard (fetchtransport.ValidateProjectID) rejects slash-bearing
+// values. For the git provider slug, use gitSlugFromProjectRepoURLProd instead.
 func projectIDFromEnvProd() string {
-	raw := os.Getenv("BYREIS_PROJECT")
-	if _, after, ok := strings.Cut(raw, "/"); ok {
-		return after
-	}
-	return raw
+	return os.Getenv("BYREIS_PROJECT")
 }
 
-// gitProjectSlugFromEnvProd returns the raw BYREIS_PROJECT value for use as
-// the GitHub owner/repo slug when constructing the git provider. The git
-// provider (gitadapter.New) requires owner/repo format; passing the logical
-// project ID (bare name, no slash) would fail its format validation.
-func gitProjectSlugFromEnvProd() string {
-	return os.Getenv("BYREIS_PROJECT")
+// gitSlugFromProjectRepoURLProd extracts the owner/repo slug from
+// BYREIS_PROJECT_REPO for use with the GitHub git provider. Only GitHub forms
+// are accepted (https://github.com/owner/repo, git@github.com:owner/repo, or
+// bare owner/repo). A file:// URL returns "" — the git provider is only
+// meaningful for real GitHub repos and is safely nil-fallback for file:// paths.
+func gitSlugFromProjectRepoURLProd() string {
+	raw := strings.TrimSuffix(os.Getenv("BYREIS_PROJECT_REPO"), ".git")
+	if after, ok := strings.CutPrefix(raw, "https://github.com/"); ok {
+		return after
+	}
+	if after, ok := strings.CutPrefix(raw, "git@github.com:"); ok {
+		return after
+	}
+	// Bare owner/repo: two path components, no dot in the first (not a hostname).
+	if parts := strings.SplitN(raw, "/", 2); len(parts) == 2 && !strings.Contains(parts[0], ".") {
+		return raw
+	}
+	return ""
 }
 
 // configDirFromEnvProd returns the config directory path.
@@ -2222,7 +2231,7 @@ func buildRejecterProd(
 		return nil
 	}
 
-	// Guard against operator misconfiguration where both BYREIS_PROJECT and
+	// Guard against operator misconfiguration where BYREIS_PROJECT_REPO and
 	// BYREIS_REGISTRY resolve to the same GitHub repo. In a correct two-repo
 	// deployment the project secrets repo and the admin registry repo are
 	// distinct. When they are the same, routing by repo slug is ambiguous:
@@ -2232,7 +2241,7 @@ func buildRejecterProd(
 	// visible rather than silently misrouted.
 	if projectRepo != "" && registryRepo != "" && projectRepo == registryRepo {
 		fmt.Fprintf(os.Stderr,
-			"byreis: warning: BYREIS_PROJECT and BYREIS_REGISTRY resolve to the same "+
+			"byreis: warning: BYREIS_PROJECT_REPO and BYREIS_REGISTRY resolve to the same "+
 				"repo %q — project and registry repos must be distinct; "+
 				"reject use-case not wired\n",
 			projectRepo)

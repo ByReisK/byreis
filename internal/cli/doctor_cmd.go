@@ -2,6 +2,8 @@ package cli
 
 import (
 	"fmt"
+	"os"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -60,6 +62,22 @@ alone does NOT cause a non-zero exit.`,
 			if err != nil {
 				r.PrintError(err.Error())
 				return &exitError{code: render.ExitGeneralError, cause: err}
+			}
+
+			// Warn if BYREIS_PROJECT looks like an owner/repo slug. Under the
+			// two-var contract, BYREIS_PROJECT must be the slash-free logical
+			// project id; the GitHub repo slug belongs in BYREIS_PROJECT_REPO.
+			if bp := os.Getenv("BYREIS_PROJECT"); strings.Contains(bp, "/") {
+				result.Findings = append([]usecase.DoctorFinding{{
+					Check:    "env:BYREIS_PROJECT",
+					Severity: usecase.SeverityWarn,
+					Detail: fmt.Sprintf(
+						"BYREIS_PROJECT=%q looks like an owner/repo slug — "+
+							"BYREIS_PROJECT must be the slash-free logical project id "+
+							"(e.g. \"myapp\"); set the GitHub secrets-repo location in "+
+							"BYREIS_PROJECT_REPO instead (e.g. \"myorg/myapp\")",
+						bp),
+				}}, result.Findings...)
 			}
 
 			if *jsonFlag {
