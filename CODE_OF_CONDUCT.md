@@ -24,9 +24,10 @@ other conduct reasonably considered inappropriate in a professional setting.
 ## Enforcement
 
 Instances of abusive, harassing, or otherwise unacceptable behavior may be
-reported to the maintainers via an issue or the maintainers. All complaints will be reviewed
-and investigated promptly and fairly. Maintainers will respect the privacy and
-security of the reporter.
+reported to the maintainers via GitHub's private vulnerability reporting form
+or by opening a confidential contact through the repository's Security tab.
+All complaints will be reviewed and investigated promptly and fairly.
+Maintainers will respect the privacy and security of the reporter.
 
 This Code of Conduct is adapted from the [Contributor Covenant][cc], v2.1.
 

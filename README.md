@@ -22,15 +22,20 @@ can never decrypt one — not even the value they just submitted. An admin revie
 the decrypted value and merges.
 
 ```bash
-# Contributor — write-only, no private key
-byreis submit STRIPE_API_KEY --env dev
-# → opens a PR with the encrypted value for an admin to review
+# Contributor — write-only, no private key required
+byreis submit --key STRIPE_API_KEY
 
 # Admin — review the real value, then merge
-byreis review --pr 1234
+byreis review --pr myorg/my-app-secrets#42
+byreis admin merge --pr myorg/my-app-secrets#42 --expect <pin> \
+  --project myapp --file secrets/production.enc.yaml
 ```
 
 No server. No vendor backend. Just git and modern public-key encryption.
+
+Access level is derived from cryptographic reality, never from a config flag or
+environment variable. If you can decrypt a project file and your public key is in
+the verified admin registry, you are an admin. Otherwise you are a contributor.
 
 ## Why?
 
@@ -40,40 +45,111 @@ Existing tooling forces a trade:
   reads everything, and a keyless contributor cannot edit a shared environment
   file at all.
 - **Server-based managers** — good UX, but require infrastructure or a vendor.
-- **Kubernetes-only controllers** — not usable for plain local/CI workflows.
+- **Kubernetes-only controllers** — not usable for plain local or CI workflows.
 
 byreis fills the gap: the only zero-infra, plain-git tool where people who must
-never *read* secrets can still safely *add and update* them, with friendly
-errors and CI-native flows.
+never _read_ secrets can still safely _add and update_ them.
 
 ## Status
 
-🚧 **Early development.** The architecture and the cryptographic access model are
-settled and the project skeleton is in place; core commands are being
-implemented. Interfaces and on-disk formats may still change before `v0.1`.
+Stable releases shipped through **v0.5.0**. See the [Releases](https://github.com/ByReisK/byreis/releases) page.
 
-## Roadmap (high level)
+## Install
 
-**v0.1 — the spine**
-- Crypto-derived access mode (admin vs contributor is decided by what you can
-  cryptographically do, never by a config flag)
-- `init`, `doctor`
-- `submit` — keyless, write-only, opens a GitHub PR
-- `review` / `merge` — admin decrypts, validates, and merges
-- Admin read path: `get`, `decrypt`, `edit`
-- Keyless CI submit + CI decrypt
-- Offline-first admin registry with signature verification
+### Pre-built binaries (recommended)
 
-**Later**
-- Interactive TUI for admins
-- `rotate`, `share`, `revoke`, self-service access requests
-- GitLab support, bulk submit
+Download the binary for your platform from the [Releases](https://github.com/ByReisK/byreis/releases) page.
+Supported platforms: **linux/amd64**, **linux/arm64**, **darwin/amd64**, **darwin/arm64**.
+
+Windows is build-safe but is not a release binary target; Windows users must build from source.
+
+```bash
+# Example: Linux amd64
+curl -L https://github.com/ByReisK/byreis/releases/download/v0.5.0/byreis-linux-amd64 \
+  -o /usr/local/bin/byreis
+chmod +x /usr/local/bin/byreis
+```
+
+### From source
+
+Requires Go 1.26 or later.
+
+```bash
+git clone https://github.com/ByReisK/byreis.git
+cd byreis
+make build        # produces ./bin/byreis
+```
+
+Or install directly with:
+
+```bash
+go install github.com/ByReisK/byreis/cmd/byreis@latest
+```
+
+## 2-minute quickstart
+
+### Contributor: submit a secret
+
+```bash
+# 1. Initialize the project (first time only — pins the registry trust anchor)
+byreis init --project myapp --registry myorg/byreis-admins
+
+# 2. Submit a secret — value is collected interactively (masked entry)
+byreis submit --key DATABASE_URL
+
+# byreis opens a PR against the project secrets repo.
+# You never see the value again; it was encrypted to admin public keys only.
+```
+
+### Admin: review and merge
+
+```bash
+# 1. Review the submission — decrypts and shows the value
+byreis review --pr myorg/my-app-secrets#42
+
+# The output includes a PinnedSHA. Pass it to merge to guard against branch re-push.
+
+# 2. Merge the reviewed submission
+byreis admin merge --pr myorg/my-app-secrets#42 \
+  --expect <PinnedSHA> \
+  --project myapp \
+  --file secrets/production.enc.yaml
+```
+
+On an interactive terminal, `submit` and `review` open an interactive TUI.
+Set `BYREIS_NON_INTERACTIVE=1` or pipe stdout to suppress the TUI and use the
+plain CLI path (for CI).
+
+## Commands
+
+| Command | Mode | Description |
+|---|---|---|
+| `init` | any | Initialize a project and pin the registry trust anchor |
+| `doctor` | any | Health check: mode, trust anchor, registry status |
+| `submit` | any | Encrypt and submit a secret (single key or `--file .env` bulk) |
+| `review` | admin | Review a pending submission PR |
+| `admin merge` | admin | Merge a reviewed submission into the live secrets file |
+| `get` | admin | Decrypt and print a single secret value |
+| `decrypt` | admin | Decrypt and print all values in a secrets file |
+| `edit` | admin | Edit a secret value in-place (decrypt → `$EDITOR` → re-encrypt) |
+| `rotate` | admin | Rotate the recipient set and re-encrypt all secrets files |
+| `admin rotation reconcile` | admin | Recover a partially rotated project |
+| `request-access` | contributor | Open a PR requesting to be added as a recipient |
+| `admin request list` | admin | List open request-access PRs |
+| `admin request reject` | admin | Close a request or submission PR with a reason |
+| `admin audit show` | admin | Display (and optionally verify) the registry audit log |
+| `version` | any | Print the version |
+
+For flags and full usage: `byreis <command> --help`.
+
+See the **[full user guide](docs/guide.md)** for detailed workflows, configuration
+reference, CI integration, and the security model.
 
 ## Admin registry requirements
 
-The admin registry repository (the one pointed to by `.byreis.yaml` in each
-project repo) **must** have the following branch-protection rules on `main`
-before any `byreis admin merge` or counter-write operation is attempted:
+The admin registry repository (pointed to by `.byreis.yaml` in each project repo)
+**must** have the following branch-protection rules on `main` before any
+`byreis admin merge` or counter-write operation is attempted:
 
 - **Signed commits required (byreis-aware status check)** — the registry must
   run a byreis verifier as a CI gate on `main` that validates the
@@ -81,8 +157,7 @@ before any `byreis admin merge` or counter-write operation is attempted:
   registry's signer roster. GitHub's native "Require signed commits"
   branch-protection rule is **not** the enforcement point and must not be
   relied on, because byreis embeds its Ed25519 signature in the commit
-  message body (preserving the signer port abstraction) rather than in the
-  commit object's `gpgsig` header.
+  message body rather than in the commit object's `gpgsig` header.
 - **Linear history** — no merge commits; rebase-only. Ensures counter
   monotonicity.
 - **No force-push** — ordinary `git push --force` is rejected. byreis uses
@@ -91,15 +166,13 @@ before any `byreis admin merge` or counter-write operation is attempted:
 - **No branch deletion** — protects the history that signed-commit verification
   and anti-rollback checks rely on.
 
-Counter writes (`WriteCounter` / `CommitCounter`) validate these requirements at
-push time and surface `ErrRegistryWriteRejected` if the remote refuses the push.
-If you see that error, verify the branch-protection configuration above.
+Counter writes validate these requirements at push time and surface
+`ErrRegistryWriteRejected` if the remote refuses the push. If you see that error,
+verify the branch-protection configuration above.
 
 ## Contributing
 
-byreis is in active early development and not yet ready for production use.
-Issues and discussion are welcome. Please open an issue before sending a pull
-request so the design direction can be discussed.
+See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 

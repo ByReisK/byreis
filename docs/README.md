@@ -1,16 +1,29 @@
-# byreis documentation (public)
+# byreis documentation
 
-This folder holds **user-facing documentation** intended for public release —
-written for people who *use* byreis, not for people building it.
+User-facing documentation for byreis. All documents here are written for people
+who use byreis; internal engineering and design notes are kept out of the public
+repository.
 
-Planned contents (per `PLAN.md` §1/§9, written during/after BUILD):
+## Start here
 
-- `quickstart.md` — install + first submit in under 2 minutes
-- `user-guide.md` — contributor workflow (`init`, `submit`)
-- `admin-guide.md` — admin workflow (`review`, `merge`, registry, bootstrap)
-- `ci-integration.md` — keyless CI submit + CI decrypt
-- `threat-model.md` — public-facing security model & what byreis does/doesn't protect
-- `architecture.md` — high-level overview for evaluators
+- **[User guide](guide.md)** — complete feature and usage reference: the
+  asymmetric model, install, contributor workflow, admin workflow, interactive
+  TUI, CI usage, audit verification, and security boundaries.
 
-This tree holds only user-facing documentation. Internal engineering and
-design notes are intentionally kept out of the public repository.
+## Runbooks
+
+- **[Request-access runbook](request-access-runbook.md)** — opening, reviewing,
+  and absorbing access-request PRs (`request-access` + `rotate --from-request`).
+- **[Rotation runbook](rotation-runbook.md)** — recovering from a partial
+  rotation via `admin rotation reconcile`.
+- **[Forward secrecy](forward-secrecy.md)** — what `rotate --remove` does and
+  does not guarantee about pre-rotation ciphertext; the incident runbook when a
+  recipient is suspected compromised.
+
+## Release notes
+
+- [v0.5](release-notes-v0.5.md) — audit-binding release (`admin audit show --verify`)
+- [v0.4](release-notes-v0.4.md) — reviewer-loop release (submission-PR queue TUI, `admin request reject`, durable merge audit)
+- [v0.3.1](release-notes-v0.3.1.md) — patch: graceful fallback on malformed `BYREIS_PROJECT`
+- [v0.3](release-notes-v0.3.md) — production-wired submit/review, interactive TUI
+- [v0.2](release-notes-v0.2.md) — key rotation, contributor onboarding, bulk submit
