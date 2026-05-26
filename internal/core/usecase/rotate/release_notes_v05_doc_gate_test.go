@@ -106,6 +106,15 @@ const (
 
 	// Asymmetric-access guarantee restated for v0.5.
 	v05HonestyAsymmetryUnchanged = "no v0.5 surface gives a non-key-holder a route to a plaintext value"
+
+	// (S3) Actor attribution is anchor-attested + current-admin-scoped; removed/rotated
+	// admins display "-"; attribution only on binding-verified path; JSONL actor field untrusted.
+	v05HonestyActorAnchorAttested   = "derived from the anchor-attested signer identity recorded in the signed introducing"
+	v05HonestyActorJSONLUntrusted   = "The in-line JSONL `actor` field is never used for display."
+	v05HonestyActorRemovedDash      = "An action by a since-removed or rotated admin displays `-`."
+	v05HonestyActorBindingOnly      = "Only entries whose binding status is `verified` receive an actor attribution."
+	v05HonestyActorForgeImpossible  = "A registry-writer who controlled only the JSONL bytes (but not a registered " +
+		"signing key) cannot cause a forged name to appear in the actor column."
 )
 
 // v05HonestyFixtures pairs each verbatim statement with a short human label
@@ -129,6 +138,12 @@ var v05HonestyFixtures = []struct {
 	{"residual-exploitable-only-by-maximally-trusted", v05HonestyResidualAdminOnly},
 	{"counter-anti-rollback-unaffected", v05HonestyCounterUnaffected},
 	{"asymmetry-unchanged", v05HonestyAsymmetryUnchanged},
+	// S3 actor-identity attribution disclosures.
+	{"actor-attribution-anchor-attested", v05HonestyActorAnchorAttested},
+	{"actor-jsonl-field-untrusted-for-display", v05HonestyActorJSONLUntrusted},
+	{"actor-removed-admin-displays-dash", v05HonestyActorRemovedDash},
+	{"actor-attribution-binding-verified-only", v05HonestyActorBindingOnly},
+	{"actor-forge-impossible-without-signing-key", v05HonestyActorForgeImpossible},
 }
 
 // v05ForbiddenPositioningTerms are case-insensitive substrings that MUST NOT

@@ -10,6 +10,10 @@
 //     leaf key-name format ^[a-zA-Z0-9._-]{1,256}$ (no slash, no control bytes,
 //     no whitespace) — the key name is contributor-influenced and reaches the
 //     durable signed write.
+//   - A non-empty top-level Event.Actor that is an age recipient pubkey
+//     (^age1<58 bech32 chars>$) — an actor label is a human identity, never a
+//     recipient pubkey, so an age1... value indicates a leaked pubkey in the
+//     actor slot and is refused before the durable signed write.
 //   - Age recipient fields (key contains "pubkey", "recipient", or "age_key")
 //     whose values do not match the canonical age1<58 bech32 chars> format.
 //   - Project-ID or file-name fields (key contains "project", "file", or
@@ -94,6 +98,17 @@ func ValidateEventFields(e Event) error {
 		return fmt.Errorf(
 			"%w: event KeyName does not match the key-name format (^[a-zA-Z0-9._-]{1,256}$, no slash): %q",
 			ErrAuditEventInvalidField, truncate(e.KeyName))
+	}
+
+	// Top-level Actor is a human identity label attested by the registry signer
+	// record; it is NEVER a recipient pubkey. An age1... value in Actor means a
+	// recipient pubkey leaked into the actor slot — refuse it fail-closed so such
+	// material can never reach the durable signed write. This is write-side
+	// defense-in-depth; the read side never displays an unresolved label as a key.
+	if e.Actor != "" && agePubkeyRE.MatchString(e.Actor) {
+		return fmt.Errorf(
+			"%w: event Actor is an age recipient pubkey, which is never a valid actor label: %q",
+			ErrAuditEventInvalidField, truncate(e.Actor))
 	}
 
 	for k, v := range e.Details {

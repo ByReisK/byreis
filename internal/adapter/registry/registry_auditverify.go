@@ -487,6 +487,12 @@ type auditCommitInfo struct {
 	// SignedByAnchor is true when git verify-commit confirmed the commit was
 	// signed by exactly the pinned trust anchor (exit 0).
 	SignedByAnchor bool
+	// SignerID is the signer identity extracted from the "byreis-signer: "
+	// footer of the commit body. It identifies the admin key that produced the
+	// commit and is the ONLY permissible source for the actor label resolver.
+	// Empty when the footer is absent (pre-binding era commits, or commits
+	// that predate the byreis-signer footer convention).
+	SignerID string
 	// StagedFiles is the set of file paths staged in this commit. Used for the
 	// cross-project-splice check.
 	StagedFiles map[string]struct{}
@@ -635,6 +641,11 @@ func extractCommitInfo(
 
 	// Extract audit_entry_sha from the body (the "audit_entry_sha: <hex>" line).
 	info.AuditEntrySHA = parseAuditEntrySHA(string(bodyOut))
+
+	// Extract byreis-signer from the body (the "byreis-signer: <signerID>" line).
+	// This is the ONLY permissible source for actor label resolution; the JSONL
+	// Actor field is adversarial input and is never used for display.
+	info.SignerID = parseByreisSignerFooter(string(bodyOut))
 
 	// Verify commit signature against the pinned anchor via git verify-commit.
 	// We build a dedicated verify env that includes the allowed-signers file.
@@ -839,6 +850,11 @@ func bindLines(
 		}
 
 		result.Entries[lineIdx].BindingStatus = rotate.BindingVerified
+		// Populate VerifiedSignerID ONLY for BindingVerified lines, from the
+		// anchor-verified commit's byreis-signer footer. This is the sole
+		// authoritative source for actor label resolution; the JSONL Actor
+		// field is never used.
+		result.Entries[lineIdx].VerifiedSignerID = ci.SignerID
 	}
 
 	return result, tamperErr
@@ -879,6 +895,35 @@ func sha256HexOfLine(line []byte) string {
 	}
 	sum := sha256.Sum256(line)
 	return fmt.Sprintf("%x", sum[:])
+}
+
+// parseByreisSignerFooter extracts the value of the "byreis-signer: " footer
+// from a commit message body. Returns "" when the footer is absent.
+//
+// The signerID is the attested signer identity written by the rotation or
+// reversal commit path. It is the ONLY permissible input for actor label
+// resolution; the JSONL Actor field is adversarial and is never surfaced.
+//
+// A value that looks like an age1... recipient pubkey is rejected and returns
+// "": an age recipient public key is not a valid signer identity label, and
+// exposing one in the actor column would violate the ActorResolver contract.
+func parseByreisSignerFooter(body string) string {
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "byreis-signer:") {
+			val := strings.TrimSpace(strings.TrimPrefix(line, "byreis-signer:"))
+			if val == "" {
+				return ""
+			}
+			// Reject age1... recipient pubkeys: a recipient key is never a valid
+			// signer identity. Length check: age1 + 58 bech32 chars = 62 chars.
+			if len(val) == 62 && strings.HasPrefix(val, "age1") {
+				return ""
+			}
+			return val
+		}
+	}
+	return ""
 }
 
 // parseAuditEntrySHA extracts the value of the "audit_entry_sha: " line from

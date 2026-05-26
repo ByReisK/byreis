@@ -499,8 +499,12 @@ type AuditEntryView struct {
 	Kind string
 	// OccurredAt is the event timestamp in RFC3339 (advisory display).
 	OccurredAt string
-	// Actor is the admin identity string that performed the action; may be
-	// empty for system events. Never a key or pubkey.
+	// Actor is the unvalidated actor string the entry's producer recorded; it
+	// may be empty for system events and is never a key or pubkey. It is
+	// display-dead: the audit display derives the actor label exclusively from
+	// VerifiedSignerID via the ActorResolver, and never reads this field. Do not
+	// re-wire a display sink to Actor — its value is not signature-bound and a
+	// registry-write capability with no trusted-signer key could shape it.
 	Actor string
 	// Project is the canonical project identifier the entry belongs to.
 	Project string
@@ -525,6 +529,19 @@ type AuditEntryView struct {
 	// sets it per line. The render layer surfaces it in a dedicated BINDING
 	// column and as the additive --json binding_status field.
 	BindingStatus BindingStatus
+
+	// VerifiedSignerID is the signer identity extracted from the
+	// anchor-verified introducing commit's byreis-signer: footer. It is
+	// populated ONLY for BindingVerified entries by the verifier walk; it is
+	// empty for all other entries (BindingMissing, BindingUnverifiedLegacy,
+	// BindingTampered, and non-verifying FetchAuditLog paths).
+	//
+	// This value is the ONLY permissible input to ActorResolver.ResolveActorLabel.
+	// The JSONL Actor field (e.Actor from the audit event) MUST NEVER be used as
+	// the resolution key or as a display fallback: it is adversarial input. The
+	// render layer resolves the human actor label from this field via the resolver
+	// and displays "-" when this field is empty or the resolver returns ok=false.
+	VerifiedSignerID string
 }
 
 // RequestAccessInput carries the contributor-authored intent for opening a

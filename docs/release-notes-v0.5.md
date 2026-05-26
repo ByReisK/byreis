@@ -106,6 +106,26 @@ These statements bound what byreis does, deliberately:
   trust anchor). It does not affect the monotonic-counter anti-rollback layer that
   protects secret artifacts.
 
+### Actor attribution in `audit show --verify`
+
+When `--verify` is used, the ACTOR column and the `actor` JSON field are now
+derived from the anchor-attested signer identity recorded in the signed introducing
+commit's `byreis-signer` footer, not from the in-line JSONL field. The JSONL `actor`
+field is adversarial input from the registry-write path and is never used for display.
+
+Only entries whose binding status is `verified` receive an actor attribution. Entries
+that are `legacy`, `missing`, or `TAMPERED`, as well as any `audit show` invocation
+without `--verify`, display `-` for the actor column.
+
+An action by a since-removed or rotated admin displays `-`. The resolver looks up
+the signerID against the current `SourceVerified` admin set at the time of the command;
+a signerID that is no longer present is treated as unknown and never displays a stale
+or reassigned name.
+
+The in-line JSONL `actor` field is never used for display. A registry-writer who
+controlled only the JSONL bytes (but not a registered signing key) cannot cause a
+forged name to appear in the actor column.
+
 ## Upgrading
 
 Drop-in replacement for v0.4. No secrets-format change, no registry-schema change,

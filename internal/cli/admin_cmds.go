@@ -17,6 +17,7 @@ package cli
 // all required parameters from flags and invokes the Merger use-case directly.
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"regexp"
@@ -525,7 +526,7 @@ truncated on forward-compat unknowns.`,
 				}
 				result, verifyErr := deps.AuditVerifier.VerifyAuditLog(ctx, project)
 				// Render even on a tamper error (the result still carries per-line status).
-				renderAuditEntries(r, *jsonFlag, result.Entries, true, project)
+				renderAuditEntries(ctx, r, *jsonFlag, result.Entries, true, project, deps.ActorResolver)
 				if verifyErr != nil {
 					code := auditFetchExitCode(verifyErr)
 					r.PrintErrorClass(auditExitClass(code), verifyErr.Error(),
@@ -552,7 +553,7 @@ truncated on forward-compat unknowns.`,
 					auditFetchHint(code))
 				return &exitError{code: code, cause: err}
 			}
-			renderAuditEntries(r, *jsonFlag, entries, false, project)
+			renderAuditEntries(ctx, r, *jsonFlag, entries, false, project, deps.ActorResolver)
 			return nil
 		},
 	}
@@ -568,7 +569,15 @@ truncated on forward-compat unknowns.`,
 // renderAuditEntries renders []rotate.AuditEntryView to r as either a JSON
 // object or a human table. showBinding controls whether the BINDING column /
 // binding_status field is included; it is true only on the --verify path.
-func renderAuditEntries(r *render.Renderer, jsonMode bool, entries []rotate.AuditEntryView, showBinding bool, project string) {
+//
+// Actor attribution cutover: the ACTOR column and the "actor" JSON field are
+// derived exclusively from ActorResolver.ResolveActorLabel(VerifiedSignerID),
+// NOT from e.Actor (the raw JSONL field, which is adversarial input). A
+// BindingVerified entry whose VerifiedSignerID resolves to a known label
+// displays that label. Any entry that is not BindingVerified, has an absent or
+// unresolvable VerifiedSignerID, or has a nil resolver displays "-". There is
+// NO fallback to e.Actor under any circumstance.
+func renderAuditEntries(ctx context.Context, r *render.Renderer, jsonMode bool, entries []rotate.AuditEntryView, showBinding bool, project string, resolver rotate.ActorResolver) {
 	if jsonMode {
 		type jsonEntry struct {
 			Kind            string            `json:"kind"`
@@ -586,7 +595,7 @@ func renderAuditEntries(r *render.Renderer, jsonMode bool, entries []rotate.Audi
 			je := jsonEntry{
 				Kind:        e.Kind,
 				OccurredAt:  e.OccurredAt,
-				Actor:       e.Actor,
+				Actor:       resolveActorForDisplay(ctx, resolver, e),
 				Project:     e.Project,
 				Outcome:     e.Outcome,
 				SafeDetails: e.SafeDetails,
@@ -634,7 +643,9 @@ func renderAuditEntries(r *render.Renderer, jsonMode bool, entries []rotate.Audi
 			kind = "WARN: " + kind
 		}
 		occurredAt := collapseLineBreaks(render.SanitizeForTerminal(e.OccurredAt))
-		actor := collapseLineBreaks(render.SanitizeForTerminal(e.Actor))
+		// Actor attribution: derived from the anchor-verified signerID via the
+		// resolver; never from e.Actor. "-" for all non-BindingVerified entries.
+		actor := collapseLineBreaks(render.SanitizeForTerminal(resolveActorForDisplay(ctx, resolver, e)))
 		outcome := collapseLineBreaks(render.SanitizeForTerminal(e.Outcome))
 
 		// Build a compact SafeDetails summary for the table cell.
@@ -656,6 +667,31 @@ func renderAuditEntries(r *render.Renderer, jsonMode bool, entries []rotate.Audi
 				kind, occurredAt, actor, outcome, detailStr)
 		}
 	}
+}
+
+// resolveActorForDisplay returns the human actor label for a single
+// AuditEntryView entry. It enforces the mandatory label-source rule:
+//
+//   - Only BindingVerified entries with a non-empty VerifiedSignerID that
+//     resolves via the ActorResolver are given a label.
+//   - All other cases (non-BindingVerified, empty VerifiedSignerID, nil
+//     resolver, resolver returns ok=false) display "-".
+//   - There is NO fallback to e.Actor under any circumstance.
+func resolveActorForDisplay(ctx context.Context, resolver rotate.ActorResolver, e rotate.AuditEntryView) string {
+	if e.BindingStatus != rotate.BindingVerified {
+		return "-"
+	}
+	if e.VerifiedSignerID == "" {
+		return "-"
+	}
+	if resolver == nil {
+		return "-"
+	}
+	label, ok := resolver.ResolveActorLabel(ctx, e.VerifiedSignerID)
+	if !ok || label == "" {
+		return "-"
+	}
+	return label
 }
 
 // checkAuditShowPolicy enforces the ADMIN-only mode gate for `admin audit show`.

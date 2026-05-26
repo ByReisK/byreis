@@ -130,6 +130,13 @@ type Deps struct {
 	// "not configured" error; the non-verify path continues to use AuditReader.
 	AuditVerifier rotate.AuditVerifier
 
+	// ActorResolver maps a registry-attested signerID (from an anchor-verified
+	// introducing commit's byreis-signer footer) to a human actor label. It is
+	// used exclusively by the audit-show display path to resolve the ACTOR column
+	// for BindingVerified entries. When nil or when the resolver returns ok=false,
+	// the display renders "-". It is never used to resolve the JSONL Actor field.
+	ActorResolver rotate.ActorResolver
+
 	// RunTUISubmit is the function the submit RunE calls when ShouldLaunchTUI
 	// returns true. It encapsulates the full TUI submit flow (huh form +
 	// Submit use-case call) and returns nil on success, ErrTUISubmitAborted on

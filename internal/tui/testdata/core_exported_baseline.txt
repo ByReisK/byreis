@@ -21,6 +21,15 @@
 # engine itself is adapter-confined (no core symbol). This is a reviewed,
 # non-TUI core addition; TUI work must never trigger a baseline reseed.
 #
+# v0.5 S3 reseed (REQ-V05-003, actor identity) under principal-go review: adds
+# exactly the 2 reviewed actor-attribution symbols — the ActorResolver consumer
+# port (the interface counts as one symbol; its sole method ResolveActorLabel is
+# not separately enumerated) and the additive AuditEntryView.VerifiedSignerID
+# field (the anchor-verified signerID threaded core→display; the only permissible
+# resolver input). The resolver engine and the byreis-signer footer parse are
+# adapter-confined (no core symbol). This is a reviewed, non-TUI core addition;
+# TUI work must never trigger a baseline reseed.
+#
 # From this point the baseline is FROZEN for TUI work. Any new exported symbol
 # from internal/core/** not present here fails the ceiling gate. Escalate to
 # principal-go to extend.
@@ -641,6 +650,7 @@ github.com/ByReisK/byreis/internal/core/usecase#VerifiedRecipients.Set
 github.com/ByReisK/byreis/internal/core/usecase#VerifiedRecipients.SourceVerified
 github.com/ByReisK/byreis/internal/core/usecase#VerifiedRecipients.Stale
 github.com/ByReisK/byreis/internal/core/usecase#VerifiedRecipients.TrustedSigners
+github.com/ByReisK/byreis/internal/core/usecase/rotate#ActorResolver
 github.com/ByReisK/byreis/internal/core/usecase/rotate#AuditEntryView
 github.com/ByReisK/byreis/internal/core/usecase/rotate#AuditEntryView.Actor
 github.com/ByReisK/byreis/internal/core/usecase/rotate#AuditEntryView.BindingStatus
@@ -650,6 +660,7 @@ github.com/ByReisK/byreis/internal/core/usecase/rotate#AuditEntryView.Outcome
 github.com/ByReisK/byreis/internal/core/usecase/rotate#AuditEntryView.Project
 github.com/ByReisK/byreis/internal/core/usecase/rotate#AuditEntryView.SafeDetails
 github.com/ByReisK/byreis/internal/core/usecase/rotate#AuditEntryView.Unknown
+github.com/ByReisK/byreis/internal/core/usecase/rotate#AuditEntryView.VerifiedSignerID
 github.com/ByReisK/byreis/internal/core/usecase/rotate#AuditReader
 github.com/ByReisK/byreis/internal/core/usecase/rotate#AuditVerifier
 github.com/ByReisK/byreis/internal/core/usecase/rotate#AuditVerifyResult

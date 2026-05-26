@@ -160,6 +160,48 @@ func TestS1_AuditVerifierWiredWhenRegistryConfigured(t *testing.T) {
 	}
 }
 
+// TestS1_ActorResolverWiredWhenRegistryConfigured is the positive-composition
+// guard for the actor-identity wiring: it asserts deps.ActorResolver is non-nil
+// when a real, SourceVerified registry is configured. It is the sibling of
+// TestS1_AuditVerifierWiredWhenRegistryConfigured and guards the same
+// silent-nil/drop regression class: the ActorResolver is the only sink that
+// turns a registry-attested VerifiedSignerID into a human label on the audit
+// display, so a dropped wiring would silently degrade every actor column to "-"
+// without any negative-direction test catching it.
+//
+// Strategy: reuse the D-1 fixture (a fully-wired ADMIN environment backed by a
+// real file:// registry whose commit is SSH-signed by the anchor pinned in
+// trust.yaml). The composition root wires the resolver only when FetchAdminSet
+// returns a SourceVerified AdminSet; the same fixture already drives ADMIN-mode
+// detection (TestD1_PositiveComposition/PRIMARY/AdminModeDetected), which itself
+// requires a SourceVerified fetch confirming the admin key is registered — so
+// the SourceVerified precondition holds on this path. After BuildProductionDeps,
+// assert deps.ActorResolver != nil.
+func TestS1_ActorResolverWiredWhenRegistryConfigured(t *testing.T) {
+	if d1GitMissing() {
+		t.Fatalf("required binary 'git' is not on PATH — " +
+			"a ship-gate that cannot run must fail, never pass")
+	}
+	if d1SSHKeygenMissing() {
+		t.Fatalf("required binary 'ssh-keygen' is not on PATH — " +
+			"a ship-gate that cannot run must fail, never pass")
+	}
+
+	fx := newD1Fixture(t)
+	fx.applyAdminEnv(t)
+
+	deps, err := app.BuildProductionDeps(context.Background())
+	if err != nil {
+		t.Fatalf("BuildProductionDeps returned error: %v", err)
+	}
+	if deps.ActorResolver == nil {
+		t.Fatalf("deps.ActorResolver is nil when a SourceVerified registry is " +
+			"configured — the ActorResolver wiring at the composition root was " +
+			"silently dropped; the audit display would degrade every actor column " +
+			"to \"-\" (silent-nil regression class)")
+	}
+}
+
 // TestV35_BuildProductionDeps_NoPanic_PartialConfig verifies that
 // BuildProductionDeps never panics regardless of partial / missing
 // configuration. This covers the nil-fallback path for all V-3.5 use-cases.

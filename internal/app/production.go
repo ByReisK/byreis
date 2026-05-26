@@ -368,6 +368,19 @@ func BuildProductionDeps(ctx context.Context) (*cli.Deps, error) {
 		}
 	}
 
+	// Wire the ActorResolver. It requires a SourceVerified AdminSet to map
+	// signerIDs (from anchor-verified commit footers) to human labels. When the
+	// registry is unavailable or the AdminSet is not SourceVerified, the resolver
+	// is nil and the display layer renders "-" for every actor column.
+	// FetchAdminSet is called here with the project ID from the environment; a
+	// failure is non-fatal (the command degrades gracefully to "-" for all actors).
+	var actorResolver rotate.ActorResolver
+	if regClient != nil {
+		if adminSet, resolverErr := regClient.FetchAdminSet(ctx, projectIDFromEnvProd()); resolverErr == nil && adminSet.SourceVerified {
+			actorResolver = registryadapter.NewActorResolverAdapter(adminSet)
+		}
+	}
+
 	// Build the TUI RunTUISubmit factory. The composition root assembles the
 	// SubmitterFactory closure so internal/cli stays free of any internal/tui
 	// import (the cli↛tui boundary). The closure reuses the same shared deps as
@@ -406,6 +419,7 @@ func BuildProductionDeps(ctx context.Context) (*cli.Deps, error) {
 		RequestAccessOpener:   requestAccessOpener,
 		AuditReader:           auditReader,
 		AuditVerifier:         auditVerifier,
+		ActorResolver:         actorResolver,
 		Doctor:                doctor,
 		RotationHistoryDoctor: rotationHistoryDoctor,
 		Submitter:             submitter,

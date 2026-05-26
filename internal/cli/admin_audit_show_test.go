@@ -163,7 +163,11 @@ func TestAdminAuditShow_NilReader_WiredCheckError(t *testing.T) {
 // ---- V8b.CLI.05 — ADMIN happy-path table render ----------------------------
 
 // TestAdminAuditShow_AdminHappyPath_TableRender verifies that an ADMIN with a
-// non-empty AuditReader gets a table with the expected columns.
+// non-empty AuditReader gets a table with the expected columns. Actor attribution
+// cutover: the ACTOR column is always "-" on the non-verify (FetchAuditLog) path
+// because the JSONL Actor field is adversarial input and is never used for display.
+// Only BindingVerified entries (--verify path) with a resolved VerifiedSignerID
+// receive an actor attribution.
 func TestAdminAuditShow_AdminHappyPath_TableRender(t *testing.T) {
 	t.Parallel()
 
@@ -171,9 +175,11 @@ func TestAdminAuditShow_AdminHappyPath_TableRender(t *testing.T) {
 		{
 			Kind:       "rotation",
 			OccurredAt: "2026-01-01T00:00:00Z",
-			Actor:      "admin@example.com",
+			Actor:      "admin@example.com", // JSONL field — adversarial; NEVER displayed
 			Project:    "test-proj",
 			Outcome:    "ok",
+			// BindingStatus is BindingMissing (zero value): non-verify path.
+			// VerifiedSignerID is empty: no anchor-verified signerID on this path.
 		},
 	}
 	deps := makeAuditShowDeps(mode.ModeAdmin, &fakeAuditReader{entries: entries})
@@ -185,8 +191,18 @@ func TestAdminAuditShow_AdminHappyPath_TableRender(t *testing.T) {
 	if !strings.Contains(stdout, "rotation") {
 		t.Errorf("stdout %q must contain %q", stdout, "rotation")
 	}
-	if !strings.Contains(stdout, "admin@example.com") {
-		t.Errorf("stdout %q must contain actor", stdout)
+	// Actor column must be "-": non-BindingVerified entries never show the JSONL
+	// Actor value. The ACTOR header must still appear (column is present).
+	if !strings.Contains(stdout, "ACTOR") {
+		t.Errorf("stdout %q must contain ACTOR column header", stdout)
+	}
+	if strings.Contains(stdout, "admin@example.com") {
+		t.Errorf("stdout %q must NOT contain the raw JSONL Actor value %q — "+
+			"actor attribution is anchor-verified only; FetchAuditLog path always displays \"-\"",
+			stdout, "admin@example.com")
+	}
+	if !strings.Contains(stdout, "-") {
+		t.Errorf("stdout %q must contain \"-\" for the actor column on the non-verify path", stdout)
 	}
 	if !strings.Contains(stdout, "ok") {
 		t.Errorf("stdout %q must contain outcome", stdout)
