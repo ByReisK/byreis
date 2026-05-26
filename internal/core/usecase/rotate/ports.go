@@ -517,6 +517,14 @@ type AuditEntryView struct {
 	// entry, so a newer client that wrote a future event class does not crash
 	// an admin's audit display.
 	Unknown bool
+	// BindingStatus is the per-line verification result: whether this entry was
+	// bound to the signed commit that introduced it. The zero value is
+	// BindingMissing (the unbindable/synthetic state), so a view the verifier
+	// never labelled is never displayed as verified. The non-verifying read path
+	// (FetchAuditLog) leaves this at the zero value; the verifier (VerifyAuditLog)
+	// sets it per line. The render layer surfaces it in a dedicated BINDING
+	// column and as the additive --json binding_status field.
+	BindingStatus BindingStatus
 }
 
 // RequestAccessInput carries the contributor-authored intent for opening a

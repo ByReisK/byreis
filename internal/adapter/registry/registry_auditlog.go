@@ -190,6 +190,90 @@ func parseAuditJSONL(raw []byte, projectID string) ([]rotate.AuditEntryView, err
 	return result, nil
 }
 
+// parseAuditJSONLWithRawLines decodes raw JSONL bytes into []rotate.AuditEntryView
+// and a parallel [][]byte slice of raw line bytes (with the trailing newline
+// included), applying the same bounded-read disciplines as parseAuditJSONL.
+//
+// rawLines[i] is the exact byte slice from the JSONL blob (line + "\n") that
+// produced views[i].  For synthetic rows (malformed-line, truncation-advisory)
+// rawLines[i] is nil — there is no single committed byte sequence to hash.
+// For well-formed entries rawLines[i] is the original committed bytes, so
+// sha256(rawLines[i]) is byte-identical to the audit_entry_sha field the
+// signing path embeds in the commit body.
+//
+// This is the correct hash input for the audit-binding verifier.  Computing
+// the hash from a re-marshalled AuditEntryView is incorrect because the view
+// is a lossy projection (it drops audit.Event.FileName, KeyName, PRRef, and
+// other fields that are NOT surfaced in AuditEntryView).
+func parseAuditJSONLWithRawLines(raw []byte, projectID string) ([]rotate.AuditEntryView, [][]byte, error) {
+	scanner := bufio.NewScanner(bytes.NewReader(raw))
+	scanner.Buffer(make([]byte, maxAuditLineBytes), maxAuditLineBytes)
+
+	var views []rotate.AuditEntryView
+	var rawLines [][]byte
+
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+
+		var e audit.Event
+		if decErr := json.Unmarshal(line, &e); decErr != nil {
+			views = append(views, rotate.AuditEntryView{
+				Kind:       "malformed-line",
+				Project:    projectID,
+				OccurredAt: time.Now().UTC().Format(time.RFC3339),
+				Unknown:    true,
+			})
+			rawLines = append(rawLines, nil) // no canonical bytes for a malformed line
+			continue
+		}
+
+		view := rotate.ProjectAuditEvent(e)
+		view.SafeDetails = applyReadSideDetailGuard(view.SafeDetails)
+		views = append(views, view)
+
+		// Capture the raw line bytes with the trailing newline that the sha256
+		// was computed over.  scanner.Bytes() does not include the newline, so
+		// we append one here — matching the production signing path:
+		//   line := append(raw, '\n'); sha256.Sum256(line)
+		rawLine := make([]byte, len(line)+1)
+		copy(rawLine, line)
+		rawLine[len(line)] = '\n'
+		rawLines = append(rawLines, rawLine)
+	}
+
+	if scanErr := scanner.Err(); scanErr != nil {
+		return nil, nil, fmt.Errorf(
+			"%w: FetchAuditLog: JSONL line exceeded per-line byte cap: %w — "+
+				"run `byreis doctor` to diagnose",
+			coreregistry.ErrCounterStoreUnreadable, scanErr)
+	}
+
+	if len(views) <= maxAuditResultCount {
+		return views, rawLines, nil
+	}
+
+	total := len(views)
+	tailViews := views[total-maxAuditResultCount:]
+	tailRaw := rawLines[total-maxAuditResultCount:]
+	advisory := rotate.AuditEntryView{
+		Kind:       "truncated",
+		OccurredAt: time.Now().UTC().Format(time.RFC3339),
+		Project:    projectID,
+		Outcome:    fmt.Sprintf("showing most recent %d of %d entries", maxAuditResultCount, total),
+		Unknown:    true,
+	}
+	outViews := make([]rotate.AuditEntryView, 0, maxAuditResultCount+1)
+	outViews = append(outViews, advisory)
+	outViews = append(outViews, tailViews...)
+	outRaw := make([][]byte, 0, maxAuditResultCount+1)
+	outRaw = append(outRaw, nil) // advisory has no raw line
+	outRaw = append(outRaw, tailRaw...)
+	return outViews, outRaw, nil
+}
+
 // applyReadSideDetailGuard filters a SafeDetails map by dropping any value
 // that exceeds maxAuditDetailFieldLen bytes or that contains a contiguous
 // base64-alphabet run of maxAuditDetailEntropyRunLen or more characters.

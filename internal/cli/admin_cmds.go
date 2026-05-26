@@ -465,8 +465,15 @@ git: git show audit/<project>.jsonl (and verify with git verify-commit).`,
 // Project, Outcome, and every SafeDetails value) passes
 // collapseLineBreaks(render.SanitizeForTerminal(...)) on the table path.
 // The --json path emits raw fields; encoding/json escapes control bytes.
+//
+// --verify: when supplied, calls AuditVerifier.VerifyAuditLog instead of
+// AuditReader.FetchAuditLog. The result adds a BINDING column in the table
+// and a binding_status/binding_verified field in the --json schema. A
+// tamper outcome exits non-zero (ExitTrustError) with per-line status still
+// rendered so the admin can see the offending line.
 func newAdminAuditShowCmd(deps *Deps, jsonFlag *bool) *cobra.Command {
 	var project string
+	var verifyFlag bool
 
 	cmd := &cobra.Command{
 		Use:   "show",
@@ -478,6 +485,11 @@ Requires ADMIN mode: denied-by-policy before any network touch.
 The registry HEAD must be signature-verified; an unverified HEAD returns an
 error. The registry must be reachable; there is no stale-cache fallback for
 audit-read.
+
+Use --verify to perform a full per-line binding walk: each JSONL line is bound
+to the signed commit that introduced it, proving no line was added, removed,
+or reordered outside the signed-commit discipline. The walk runs under a
+bounded deadline; a tamper outcome exits non-zero and names the offending line.
 
 Contributors can read the audit log directly via git:
   git show audit/<project>.jsonl
@@ -499,6 +511,31 @@ truncated on forward-compat unknowns.`,
 				return pErr
 			}
 
+			ctx := cmd.Context()
+
+			// --verify path: call VerifyAuditLog for per-line binding verification.
+			if verifyFlag {
+				if deps.AuditVerifier == nil {
+					err := fmt.Errorf(
+						"admin audit show --verify not available: the AuditVerifier is not wired — " +
+							"set BYREIS_REGISTRY and run `byreis doctor`")
+					r.PrintErrorClass("general-error", err.Error(),
+						"set BYREIS_REGISTRY and run `byreis doctor`")
+					return &exitError{code: render.ExitGeneralError, cause: err}
+				}
+				result, verifyErr := deps.AuditVerifier.VerifyAuditLog(ctx, project)
+				// Render even on a tamper error (the result still carries per-line status).
+				renderAuditEntries(r, *jsonFlag, result.Entries, true, project)
+				if verifyErr != nil {
+					code := auditFetchExitCode(verifyErr)
+					r.PrintErrorClass(auditExitClass(code), verifyErr.Error(),
+						auditFetchHint(code))
+					return &exitError{code: code, cause: verifyErr}
+				}
+				return nil
+			}
+
+			// Non-verify path: plain FetchAuditLog.
 			if deps.AuditReader == nil {
 				err := fmt.Errorf(
 					"admin audit show not available: the AuditReader is not wired — " +
@@ -508,7 +545,6 @@ truncated on forward-compat unknowns.`,
 				return &exitError{code: render.ExitGeneralError, cause: err}
 			}
 
-			ctx := cmd.Context()
 			entries, err := deps.AuditReader.FetchAuditLog(ctx, project)
 			if err != nil {
 				code := auditFetchExitCode(err)
@@ -516,80 +552,110 @@ truncated on forward-compat unknowns.`,
 					auditFetchHint(code))
 				return &exitError{code: code, cause: err}
 			}
-
-			if *jsonFlag {
-				type jsonEntry struct {
-					Kind        string            `json:"kind"`
-					OccurredAt  string            `json:"occurred_at"`
-					Actor       string            `json:"actor"`
-					Project     string            `json:"project"`
-					Outcome     string            `json:"outcome"`
-					SafeDetails map[string]string `json:"safe_details,omitempty"`
-					Unknown     bool              `json:"unknown,omitempty"`
-				}
-				rows := make([]jsonEntry, len(entries))
-				for i, e := range entries {
-					rows[i] = jsonEntry{
-						Kind:        e.Kind,
-						OccurredAt:  e.OccurredAt,
-						Actor:       e.Actor,
-						Project:     e.Project,
-						Outcome:     e.Outcome,
-						SafeDetails: e.SafeDetails,
-						Unknown:     e.Unknown,
-					}
-				}
-				_ = render.EncodeJSON(r.Out, map[string]any{"entries": rows})
-				return nil
-			}
-
-			// Human table output.
-			if len(entries) == 0 {
-				_, _ = fmt.Fprintf(r.Out, "no audit entries for project %q\n", project)
-				return nil
-			}
-
-			// Header row.
-			_, _ = fmt.Fprintf(r.Out, "%-25s  %-22s  %-20s  %-10s  %s\n",
-				"KIND", "OCCURRED_AT", "ACTOR", "OUTCOME", "DETAILS")
-			_, _ = fmt.Fprintf(r.Out, "%-25s  %-22s  %-20s  %-10s  %s\n",
-				strings.Repeat("-", 25), strings.Repeat("-", 22),
-				strings.Repeat("-", 20), strings.Repeat("-", 10), strings.Repeat("-", 20))
-
-			for _, e := range entries {
-				// Every rendered field — including Kind on an Unknown=true
-				// warning row — passes collapseLineBreaks(SanitizeForTerminal).
-				// Mandatory terminal sanitiser: applied unconditionally to every
-				// rendered field, not only when a value looks suspicious.
-				kind := collapseLineBreaks(render.SanitizeForTerminal(e.Kind))
-				if e.Unknown {
-					kind = "WARN: " + kind
-				}
-				occurredAt := collapseLineBreaks(render.SanitizeForTerminal(e.OccurredAt))
-				actor := collapseLineBreaks(render.SanitizeForTerminal(e.Actor))
-				outcome := collapseLineBreaks(render.SanitizeForTerminal(e.Outcome))
-
-				// Build a compact SafeDetails summary for the table cell.
-				var detailParts []string
-				for k, v := range e.SafeDetails {
-					sk := collapseLineBreaks(render.SanitizeForTerminal(k))
-					sv := collapseLineBreaks(render.SanitizeForTerminal(v))
-					detailParts = append(detailParts, sk+"="+sv)
-				}
-				sort.Strings(detailParts)
-				detailStr := strings.Join(detailParts, " ")
-
-				_, _ = fmt.Fprintf(r.Out, "%-25s  %-22s  %-20s  %-10s  %s\n",
-					kind, occurredAt, actor, outcome, detailStr)
-			}
+			renderAuditEntries(r, *jsonFlag, entries, false, project)
 			return nil
 		},
 	}
 
 	cmd.Flags().StringVar(&project, "project", "", "project ID (required)")
 	_ = cmd.MarkFlagRequired("project")
+	cmd.Flags().BoolVar(&verifyFlag, "verify", false,
+		"perform a full per-line binding walk (requires AuditVerifier; exits non-zero on tamper)")
 
 	return cmd
+}
+
+// renderAuditEntries renders []rotate.AuditEntryView to r as either a JSON
+// object or a human table. showBinding controls whether the BINDING column /
+// binding_status field is included; it is true only on the --verify path.
+func renderAuditEntries(r *render.Renderer, jsonMode bool, entries []rotate.AuditEntryView, showBinding bool, project string) {
+	if jsonMode {
+		type jsonEntry struct {
+			Kind            string            `json:"kind"`
+			OccurredAt      string            `json:"occurred_at"`
+			Actor           string            `json:"actor"`
+			Project         string            `json:"project"`
+			Outcome         string            `json:"outcome"`
+			SafeDetails     map[string]string `json:"safe_details,omitempty"`
+			Unknown         bool              `json:"unknown,omitempty"`
+			BindingStatus   string            `json:"binding_status,omitempty"`
+			BindingVerified bool              `json:"binding_verified,omitempty"`
+		}
+		rows := make([]jsonEntry, len(entries))
+		for i, e := range entries {
+			je := jsonEntry{
+				Kind:        e.Kind,
+				OccurredAt:  e.OccurredAt,
+				Actor:       e.Actor,
+				Project:     e.Project,
+				Outcome:     e.Outcome,
+				SafeDetails: e.SafeDetails,
+				Unknown:     e.Unknown,
+			}
+			if showBinding {
+				je.BindingStatus = e.BindingStatus.String()
+				je.BindingVerified = e.BindingStatus == rotate.BindingVerified
+			}
+			rows[i] = je
+		}
+		_ = render.EncodeJSON(r.Out, map[string]any{"entries": rows})
+		return
+	}
+
+	// Human table output.
+	if len(entries) == 0 {
+		_, _ = fmt.Fprintf(r.Out, "no audit entries for project %q\n", project)
+		return
+	}
+
+	// Header row — BINDING column appended when showBinding is true.
+	if showBinding {
+		_, _ = fmt.Fprintf(r.Out, "%-25s  %-22s  %-20s  %-10s  %-10s  %s\n",
+			"KIND", "OCCURRED_AT", "ACTOR", "OUTCOME", "BINDING", "DETAILS")
+		_, _ = fmt.Fprintf(r.Out, "%-25s  %-22s  %-20s  %-10s  %-10s  %s\n",
+			strings.Repeat("-", 25), strings.Repeat("-", 22),
+			strings.Repeat("-", 20), strings.Repeat("-", 10),
+			strings.Repeat("-", 10), strings.Repeat("-", 20))
+	} else {
+		_, _ = fmt.Fprintf(r.Out, "%-25s  %-22s  %-20s  %-10s  %s\n",
+			"KIND", "OCCURRED_AT", "ACTOR", "OUTCOME", "DETAILS")
+		_, _ = fmt.Fprintf(r.Out, "%-25s  %-22s  %-20s  %-10s  %s\n",
+			strings.Repeat("-", 25), strings.Repeat("-", 22),
+			strings.Repeat("-", 20), strings.Repeat("-", 10), strings.Repeat("-", 20))
+	}
+
+	for _, e := range entries {
+		// Every rendered field — including Kind on an Unknown=true
+		// warning row — passes collapseLineBreaks(SanitizeForTerminal).
+		// Mandatory terminal sanitiser: applied unconditionally to every
+		// rendered field, not only when a value looks suspicious.
+		kind := collapseLineBreaks(render.SanitizeForTerminal(e.Kind))
+		if e.Unknown {
+			kind = "WARN: " + kind
+		}
+		occurredAt := collapseLineBreaks(render.SanitizeForTerminal(e.OccurredAt))
+		actor := collapseLineBreaks(render.SanitizeForTerminal(e.Actor))
+		outcome := collapseLineBreaks(render.SanitizeForTerminal(e.Outcome))
+
+		// Build a compact SafeDetails summary for the table cell.
+		var detailParts []string
+		for k, v := range e.SafeDetails {
+			sk := collapseLineBreaks(render.SanitizeForTerminal(k))
+			sv := collapseLineBreaks(render.SanitizeForTerminal(v))
+			detailParts = append(detailParts, sk+"="+sv)
+		}
+		sort.Strings(detailParts)
+		detailStr := strings.Join(detailParts, " ")
+
+		if showBinding {
+			binding := collapseLineBreaks(render.SanitizeForTerminal(e.BindingStatus.String()))
+			_, _ = fmt.Fprintf(r.Out, "%-25s  %-22s  %-20s  %-10s  %-10s  %s\n",
+				kind, occurredAt, actor, outcome, binding, detailStr)
+		} else {
+			_, _ = fmt.Fprintf(r.Out, "%-25s  %-22s  %-20s  %-10s  %s\n",
+				kind, occurredAt, actor, outcome, detailStr)
+		}
+	}
 }
 
 // checkAuditShowPolicy enforces the ADMIN-only mode gate for `admin audit show`.
@@ -618,12 +684,18 @@ func checkAuditShowPolicy(deps *Deps, r *render.Renderer) error {
 	return &exitError{code: render.ExitPermissionDenied, cause: err}
 }
 
-// auditFetchExitCode maps a FetchAuditLog error to the appropriate exit code.
-// ErrUnsignedRegistry → ExitTrustError; ErrRegistryOffline → ExitVerifyFailure;
+// auditFetchExitCode maps a FetchAuditLog / VerifyAuditLog error to the
+// appropriate exit code.
+// ErrAuditLogTampered → ExitTrustError (per-line binding failure);
+// ErrUnsignedRegistry → ExitTrustError;
+// ErrRegistryOffline  → ExitVerifyFailure;
 // ErrPermissionDenied → ExitPermissionDenied; all others → ExitGeneralError.
 func auditFetchExitCode(err error) render.ExitCode {
 	if errors.Is(err, mode.ErrPermissionDenied) {
 		return render.ExitPermissionDenied
+	}
+	if errors.Is(err, coreregistry.ErrAuditLogTampered) {
+		return render.ExitTrustError
 	}
 	if errors.Is(err, coreregistry.ErrUnsignedRegistry) {
 		return render.ExitTrustError

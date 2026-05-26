@@ -27,6 +27,7 @@ import (
 	manifestsigneradapter "github.com/ByReisK/byreis/internal/adapter/manifestsigner"
 	"github.com/ByReisK/byreis/internal/adapter/modeprobe"
 	registryadapter "github.com/ByReisK/byreis/internal/adapter/registry"
+	"github.com/ByReisK/byreis/internal/adapter/registry/auditverify"
 	"github.com/ByReisK/byreis/internal/adapter/registry/countercache"
 	writesigneradapter "github.com/ByReisK/byreis/internal/adapter/registry/writesigner"
 	"github.com/ByReisK/byreis/internal/adapter/signingkey"
@@ -153,6 +154,16 @@ func BuildProductionDeps(ctx context.Context) (*cli.Deps, error) {
 			regClient = writeRegClient
 		}
 	}
+
+	// Wire the audit-verifier checkpoint store on the finalized registry client.
+	// The checkpoint is a host-local performance cache that amortises cold full
+	// history walks (Approach-A amortisation). It is NOT a trust artefact: a
+	// missing, corrupt, or forged checkpoint can only cause MORE work (a forced
+	// cold re-walk), never less. A construction failure is non-fatal: the verifier
+	// falls back to a cold walk on every call, which is functionally correct.
+	// The checkpoint file lives at ~/.cache/byreis/registry/<prefix>/auditverify_<project>.json,
+	// co-located with the counter cache (ADR-0014 precedent).
+	attachAuditVerifierCheckpointStore(ctx, regClient)
 
 	// Build the AtomicFileWriter rooted at the project repo root.
 	atomicWriter := buildAtomicWriterProd()
@@ -347,6 +358,16 @@ func BuildProductionDeps(ctx context.Context) (*cli.Deps, error) {
 		}
 	}
 
+	// Wire the AuditVerifier. The concrete *registry.Client implements
+	// rotate.AuditVerifier via its VerifyAuditLog method. Type-assert identically
+	// to the AuditReader wiring above; nil is safe (CLI surfaces "not configured").
+	var auditVerifier rotate.AuditVerifier
+	if regClient != nil {
+		if av, ok := regClient.(rotate.AuditVerifier); ok {
+			auditVerifier = av
+		}
+	}
+
 	// Build the TUI RunTUISubmit factory. The composition root assembles the
 	// SubmitterFactory closure so internal/cli stays free of any internal/tui
 	// import (the cli↛tui boundary). The closure reuses the same shared deps as
@@ -384,6 +405,7 @@ func BuildProductionDeps(ctx context.Context) (*cli.Deps, error) {
 		RequestAccessReader:   requestAccessReader,
 		RequestAccessOpener:   requestAccessOpener,
 		AuditReader:           auditReader,
+		AuditVerifier:         auditVerifier,
 		Doctor:                doctor,
 		RotationHistoryDoctor: rotationHistoryDoctor,
 		Submitter:             submitter,
@@ -552,6 +574,39 @@ func buildRegistryClientWithWriteProd(
 		return nil, fmt.Errorf("constructing registry client: %w", err)
 	}
 	return client, nil
+}
+
+// attachAuditVerifierCheckpointStore wires the on-disk checkpoint cache to the
+// registry client's audit verifier. The checkpoint cache amortises cold full
+// history walks: after a clean walk the verified HEAD SHA and line count are
+// persisted; subsequent calls fast-forward from the checkpoint rather than
+// re-walking the full history. The checkpoint is a performance hint only —
+// trust never flows from it. A nil regClient or construction failure is
+// silently skipped (non-fatal: the verifier falls back to a cold walk).
+func attachAuditVerifierCheckpointStore(_ context.Context, regClient coreregistry.RegistryClient) {
+	if regClient == nil {
+		return
+	}
+	concreteClient, ok := regClient.(*registryadapter.Client)
+	if !ok {
+		// Not the production client (test double or future alternate): skip.
+		return
+	}
+	registryURL := os.Getenv("BYREIS_REGISTRY")
+	cacheDir := registryCacheDirProd()
+	if registryURL == "" || cacheDir == "" {
+		return
+	}
+	checkpointStore, storeErr := auditverify.NewStore(cacheDir, registryURL)
+	if storeErr != nil {
+		fmt.Fprintf(os.Stderr,
+			"byreis: warning: cannot construct audit-verifier checkpoint store: %v; "+
+				"audit verify will cold-walk on every call\n", storeErr)
+		return
+	}
+	concreteClient.WithAuditVerifierConfig(registryadapter.AuditVerifierConfig{
+		CheckpointStore: checkpointStore,
+	})
 }
 
 // buildFileOfRecordSourceProd constructs the git-based FileOfRecordSource.

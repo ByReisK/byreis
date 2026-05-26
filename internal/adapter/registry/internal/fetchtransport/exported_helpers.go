@@ -2,6 +2,7 @@ package fetchtransport
 
 import (
 	"context"
+	"crypto/ed25519"
 	"time"
 )
 
@@ -41,4 +42,13 @@ func WithBoundedDeadline(parent context.Context, bound time.Duration) (context.C
 // exitCode > 0 with runErr == nil.
 func (v *HeadVerifier) RunSubprocess(ctx context.Context, dir string, env []string, name string, args ...string) ([]byte, []byte, int, error) {
 	return v.runner.Run(ctx, dir, env, name, args...)
+}
+
+// WriteAllowedSignersForAnchor writes an SSH allowed-signers file containing
+// only the given Ed25519 anchor key with the fixed principal "byreis-anchor".
+// Used by the audit-binding verifier to build its per-commit verify-commit
+// environment using the same trust-root encoding as the HEAD verification path.
+// The file is written with mode 0600 (owner-only read/write).
+func WriteAllowedSignersForAnchor(path string, anchorKey ed25519.PublicKey) error {
+	return writeAllowedSigners(path, anchorKey)
 }

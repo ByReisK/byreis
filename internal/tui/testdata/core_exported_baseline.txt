@@ -11,6 +11,16 @@
 # mode.CommandRequestReject, audit.EventKindReject). This is a reviewed, non-TUI
 # bump; TUI work must never trigger a baseline reseed.
 #
+# v0.5 S1 reseed (REQ-V05-001, per-line audit-binding verifier) under
+# principal-go review: adds exactly the 12 reviewed audit-verification symbols —
+# the ErrAuditLogTampered sentinel; the BindingStatus enum type, its String
+# method, and its four values (BindingMissing/BindingVerified/
+# BindingUnverifiedLegacy/BindingTampered); the additive
+# AuditEntryView.BindingStatus field; the AuditVerifier consumer port; and the
+# AuditVerifyResult type with its Entries and FullWalk fields. The verifier
+# engine itself is adapter-confined (no core symbol). This is a reviewed,
+# non-TUI core addition; TUI work must never trigger a baseline reseed.
+#
 # From this point the baseline is FROZEN for TUI work. Any new exported symbol
 # from internal/core/** not present here fails the ceiling gate. Escalate to
 # principal-go to extend.
@@ -285,6 +295,7 @@ github.com/ByReisK/byreis/internal/core/registry#CommitRotationResult.CommitSHA
 github.com/ByReisK/byreis/internal/core/registry#CommitRotationResult.NewEpoch
 github.com/ByReisK/byreis/internal/core/registry#CounterCacheStore
 github.com/ByReisK/byreis/internal/core/registry#ErrAdminSetUnreadable
+github.com/ByReisK/byreis/internal/core/registry#ErrAuditLogTampered
 github.com/ByReisK/byreis/internal/core/registry#ErrCacheTampered
 github.com/ByReisK/byreis/internal/core/registry#ErrCommitRotationNotImplemented
 github.com/ByReisK/byreis/internal/core/registry#ErrCounterStoreUnreadable
@@ -632,6 +643,7 @@ github.com/ByReisK/byreis/internal/core/usecase#VerifiedRecipients.Stale
 github.com/ByReisK/byreis/internal/core/usecase#VerifiedRecipients.TrustedSigners
 github.com/ByReisK/byreis/internal/core/usecase/rotate#AuditEntryView
 github.com/ByReisK/byreis/internal/core/usecase/rotate#AuditEntryView.Actor
+github.com/ByReisK/byreis/internal/core/usecase/rotate#AuditEntryView.BindingStatus
 github.com/ByReisK/byreis/internal/core/usecase/rotate#AuditEntryView.Kind
 github.com/ByReisK/byreis/internal/core/usecase/rotate#AuditEntryView.OccurredAt
 github.com/ByReisK/byreis/internal/core/usecase/rotate#AuditEntryView.Outcome
@@ -639,6 +651,16 @@ github.com/ByReisK/byreis/internal/core/usecase/rotate#AuditEntryView.Project
 github.com/ByReisK/byreis/internal/core/usecase/rotate#AuditEntryView.SafeDetails
 github.com/ByReisK/byreis/internal/core/usecase/rotate#AuditEntryView.Unknown
 github.com/ByReisK/byreis/internal/core/usecase/rotate#AuditReader
+github.com/ByReisK/byreis/internal/core/usecase/rotate#AuditVerifier
+github.com/ByReisK/byreis/internal/core/usecase/rotate#AuditVerifyResult
+github.com/ByReisK/byreis/internal/core/usecase/rotate#AuditVerifyResult.Entries
+github.com/ByReisK/byreis/internal/core/usecase/rotate#AuditVerifyResult.FullWalk
+github.com/ByReisK/byreis/internal/core/usecase/rotate#BindingMissing
+github.com/ByReisK/byreis/internal/core/usecase/rotate#BindingStatus
+github.com/ByReisK/byreis/internal/core/usecase/rotate#BindingStatus.String
+github.com/ByReisK/byreis/internal/core/usecase/rotate#BindingTampered
+github.com/ByReisK/byreis/internal/core/usecase/rotate#BindingUnverifiedLegacy
+github.com/ByReisK/byreis/internal/core/usecase/rotate#BindingVerified
 github.com/ByReisK/byreis/internal/core/usecase/rotate#BuildRotationAuditEvent
 github.com/ByReisK/byreis/internal/core/usecase/rotate#BuildRotationReversalAuditEvent
 github.com/ByReisK/byreis/internal/core/usecase/rotate#Clock

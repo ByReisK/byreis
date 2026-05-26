@@ -125,6 +125,41 @@ func TestS1_RejecterNilWhenNoToken(t *testing.T) {
 	}
 }
 
+// TestS1_AuditVerifierWiredWhenRegistryConfigured is the positive-composition
+// guard asserting that deps.AuditVerifier is non-nil when a real registry is
+// configured and reachable. This is the counterpart to the nil-fallback tests
+// above: a silently-dropped AuditVerifier wiring (as happened to Reviewer in
+// v0.1/v0.3/v0.4 S3) would never be caught by the negative-direction tests
+// alone.
+//
+// Strategy: reuse the D-1 fixture (a fully-wired ADMIN environment backed by a
+// real file:// registry). The fixture is built lazily inside the test so the
+// shipgate binary requirements (git, ssh-keygen) are checked before calling
+// newD1Fixture. After BuildProductionDeps, assert deps.AuditVerifier != nil.
+func TestS1_AuditVerifierWiredWhenRegistryConfigured(t *testing.T) {
+	if d1GitMissing() {
+		t.Fatalf("required binary 'git' is not on PATH — " +
+			"a ship-gate that cannot run must fail, never pass")
+	}
+	if d1SSHKeygenMissing() {
+		t.Fatalf("required binary 'ssh-keygen' is not on PATH — " +
+			"a ship-gate that cannot run must fail, never pass")
+	}
+
+	fx := newD1Fixture(t)
+	fx.applyAdminEnv(t)
+
+	deps, err := app.BuildProductionDeps(context.Background())
+	if err != nil {
+		t.Fatalf("BuildProductionDeps returned error: %v", err)
+	}
+	if deps.AuditVerifier == nil {
+		t.Fatalf("deps.AuditVerifier is nil when registry is configured — " +
+			"the AuditVerifier wiring at the composition root was silently dropped " +
+			"(v0.1/v0.3/v0.4 regression class)")
+	}
+}
+
 // TestV35_BuildProductionDeps_NoPanic_PartialConfig verifies that
 // BuildProductionDeps never panics regardless of partial / missing
 // configuration. This covers the nil-fallback path for all V-3.5 use-cases.

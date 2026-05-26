@@ -109,6 +109,20 @@ var (
 		"registry cache integrity check failed (counter regressed) — possible tamper; " +
 			"delete the cache and re-fetch: rm -rf ~/.cache/byreis/registry")
 
+	// ErrAuditLogTampered: a registry audit-log line failed per-line binding
+	// verification against the signed commit that introduced it — its content,
+	// ordering, presence, or project no longer matches history (edited, deleted,
+	// reordered, forged-inserted, or cross-project spliced). This is the
+	// content/ordering layer that complements the monotonic-counter anti-rollback
+	// protection; it is orthogonal to it, not a replacement. A hard, fail-closed
+	// error: the wrapped message names the offending line so an admin can locate
+	// it. It is distinct from a decode/parse failure (a malformed line is a
+	// synthetic warning row, not tamper) and from the BindingUnverifiedLegacy
+	// display label (a genuinely pre-binding line is not tamper).
+	ErrAuditLogTampered = errors.New(
+		"registry audit-log binding verification failed (a line does not match its " +
+			"signed commit) — possible tamper; run `byreis doctor` to diagnose")
+
 	// ErrNoTrustedSigner: no trusted manifest signer key is available, or all
 	// keys are invalid. This package is the semantic owner; the adapter boundary
 	// and the verify package both reference this sentinel directly rather than

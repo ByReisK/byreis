@@ -123,6 +123,13 @@ type Deps struct {
 	// client is available. When nil the command returns a "not configured" error.
 	AuditReader rotate.AuditReader
 
+	// AuditVerifier is the narrow read-only port the `admin audit show --verify`
+	// command uses to bind every audit-log line to its introducing signed commit.
+	// It is wired to *registry.Client.VerifyAuditLog at BuildProductionDeps when
+	// the registry client is available. When nil the --verify flag returns a
+	// "not configured" error; the non-verify path continues to use AuditReader.
+	AuditVerifier rotate.AuditVerifier
+
 	// RunTUISubmit is the function the submit RunE calls when ShouldLaunchTUI
 	// returns true. It encapsulates the full TUI submit flow (huh form +
 	// Submit use-case call) and returns nil on success, ErrTUISubmitAborted on

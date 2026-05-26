@@ -328,6 +328,11 @@ type Client struct {
 	// absent from this map means the disk has not been consulted yet — not that
 	// the floor is zero. Protected by mu.
 	epochFloorHydrated map[string]bool
+
+	// verifierCfg holds the optional audit-binding verifier configuration.
+	// Set via WithAuditVerifierConfig at construction time; nil-safe (defaults
+	// to cold-walk-only mode when the CheckpointStore field is nil).
+	verifierCfg AuditVerifierConfig
 }
 
 // New constructs a Client with the given config. Returns an error if the
