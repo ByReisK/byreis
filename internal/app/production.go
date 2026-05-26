@@ -365,7 +365,7 @@ func BuildProductionDeps(ctx context.Context) (*cli.Deps, error) {
 	// submission queue screen when it is available (nil is safe: falls back to
 	// the v0.3 access-request queue).
 	runTUIReview := buildRunTUIReviewProd(
-		pol, currentMode, reviewer, merger, requestAccessReader, projectSubmissionsReader,
+		pol, currentMode, reviewer, merger, rejecter, requestAccessReader, projectSubmissionsReader,
 	)
 
 	return &cli.Deps{
@@ -2527,13 +2527,15 @@ func buildRunTUISubmitProd(
 // When reviewer is nil (e.g. contributor mode or adapters unavailable), the
 // function returns nil so the CLI falls through to the headless "not configured"
 // error path at command time. When reviewer is non-nil, the closure is wired
-// with the Reviewer, Merger, RequestAccessReader, and SubmissionQueueSource
-// ports. Merger and submissionQueueSource are optional (nil is safe).
+// with the Reviewer, Merger, Rejecter, RequestAccessReader, and
+// SubmissionQueueSource ports. Merger, Rejecter, and submissionQueueSource are
+// optional (nil is safe: the TUI omits the corresponding affordance).
 func buildRunTUIReviewProd(
 	pol *mode.Policy,
 	currentMode mode.Mode,
 	reviewer usecase.Reviewer,
 	merger usecase.Merger,
+	rejecter usecase.RequestRejecter,
 	requestAccessReader rotate.RequestAccessReader,
 	submissionQueueSource tui.SubmissionQueueSource,
 ) func(ctx context.Context, out interface{ Write([]byte) (int, error) }, prRef string) error {
@@ -2552,6 +2554,7 @@ func buildRunTUIReviewProd(
 		return tui.RunReview(ctx, tui.Deps{
 			Reviewer:              reviewer,
 			Merger:                merger,
+			Rejecter:              rejecter,
 			RequestAccessReader:   requestAccessReader,
 			SubmissionQueueSource: submissionQueueSource,
 			Policy:                pol,

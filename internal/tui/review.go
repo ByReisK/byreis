@@ -60,6 +60,23 @@ const (
 	// screenApproveSuccess is the terminal acknowledgment shown after a
 	// successful Merge. The admin presses q/Esc to quit.
 	screenApproveSuccess
+
+	// screenConfirmReject is the explicit opt-in confirm step shown before the
+	// irreversible PR close. The detail screen stays read-only by default; the
+	// admin must press 'd' to enter this screen, then provide a reason and
+	// confirm or abort. Abort returns to screenDetail without calling Reject.
+	screenConfirmReject
+
+	// screenRejecting is the transient state while Rejecter.Reject is executing.
+	screenRejecting
+
+	// screenRejectError is shown when the Reject call returns an error. The
+	// admin can press Esc/q to return to the queue or 'r' to review another.
+	screenRejectError
+
+	// screenRejectSuccess is the terminal acknowledgment shown after a
+	// successful Reject. The admin presses q/Esc to quit.
+	screenRejectSuccess
 )
 
 // reviewDetail is the no-plaintext projection of a ReviewResult. It carries
@@ -126,6 +143,27 @@ type mergeErrMsg struct {
 	err error
 }
 
+// rejectApproveMsg is delivered when Rejecter.Reject completes successfully.
+// It carries the closed PR identifier and URL for the acknowledgment view.
+type rejectApproveMsg struct {
+	pr  string
+	url string
+}
+
+// rejectErrMsg is delivered when the Rejecter.Reject call returns an error.
+// The error message is pre-sanitized and carries an actionable hint.
+type rejectErrMsg struct {
+	err error
+}
+
+// rejectConfirmSubmitMsg is an internal bubbletea message emitted by the reject
+// confirm step when the admin submits the reason form. It carries the already-
+// sanitized reason so the doReject closure receives a clean string and does not
+// need to re-sanitize independently of the form lifecycle.
+type rejectConfirmSubmitMsg struct {
+	reason string
+}
+
 // reviewModel is the bubbletea model for the admin review TUI. It manages the
 // access-request triage queue (v0.3, preserved), the submission-PR queue (v0.4
 // augmentation), and the submission detail flow connected by the ref-entry form.
@@ -187,6 +225,20 @@ type reviewModel struct {
 	// approveErrMsg carries the sanitized error string from a failed merge
 	// (screenApproveError state).
 	approveErrMsg string
+
+	// rejectReasonBinding is the reason text bound by the reject confirm form.
+	// It is set during the confirm screen interaction and cleared when leaving
+	// the reject flow. The value is sanitized via render.SanitizeForTerminal
+	// before being passed to Rejecter.Reject.
+	rejectReasonBinding string
+	// rejectReasonForm is the huh input form on the reject confirm screen.
+	rejectReasonForm *huh.Form
+	// rejectResult carries the closed-PR acknowledgment after a successful
+	// Rejecter.Reject call (screenRejectSuccess state).
+	rejectResult rejectApproveMsg
+	// rejectErrMsg carries the sanitized error string from a failed reject
+	// (screenRejectError state).
+	rejectErrMsg string
 }
 
 // newReviewModel constructs the review model. prRef, when non-empty, causes the
@@ -411,6 +463,19 @@ func (m reviewModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				m.screen = screenConfirmApprove
 				return m, nil
+
+			case "d":
+				// 'd' (decline) enters the reject confirm screen. The detail view
+				// is read-only by default; reject is an explicit opt-in. The Rejecter
+				// nil check mirrors the Merger nil check above: when no Rejecter is
+				// wired the affordance hint is not shown and pressing 'd' is a no-op.
+				if m.deps.Rejecter == nil {
+					return m, nil
+				}
+				m.rejectReasonBinding = ""
+				m.rejectReasonForm = buildRejectReasonForm(&m.rejectReasonBinding)
+				m.screen = screenConfirmReject
+				return m, m.rejectReasonForm.Init()
 			}
 		}
 		return m, nil
@@ -467,6 +532,43 @@ func (m reviewModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.detailOK = false
 				m.errMsg = ""
 				m.approveErrMsg = ""
+				m.refBinding = ""
+				m.refForm = buildRefForm(&m.refBinding)
+				m.screen = screenRefEntry
+				return m, m.refForm.Init()
+			}
+		}
+		return m, nil
+
+	case screenConfirmReject:
+		return m.updateConfirmReject(msg)
+
+	case screenRejecting:
+		switch msg := msg.(type) {
+		case rejectApproveMsg:
+			m.rejectResult = msg
+			m.screen = screenRejectSuccess
+			return m, nil
+		case rejectErrMsg:
+			m.rejectErrMsg = sanitizeErr(msg.err)
+			m.screen = screenRejectError
+			return m, nil
+		}
+		return m, nil
+
+	case screenRejectError, screenRejectSuccess:
+		if key, ok := msg.(tea.KeyMsg); ok {
+			switch key.String() {
+			case "q", "esc", "ctrl+c":
+				m.screen = screenDone
+				return m, tea.Quit
+			case "r":
+				m.detail = reviewDetail{}
+				m.detailOK = false
+				m.errMsg = ""
+				m.rejectErrMsg = ""
+				m.rejectReasonBinding = ""
+				m.rejectReasonForm = nil
 				m.refBinding = ""
 				m.refForm = buildRefForm(&m.refBinding)
 				m.screen = screenRefEntry
@@ -675,6 +777,20 @@ func (m reviewModel) View() string {
 				Render("Press r to review another submission  •  q / Esc to quit") + "\n"
 	case screenApproveSuccess:
 		return m.viewApproveSuccess()
+	case screenConfirmReject:
+		return m.viewConfirmReject()
+	case screenRejecting:
+		return reviewHeaderStyle() + "\n" +
+			lipgloss.NewStyle().Foreground(lipgloss.Color("240")).
+				Render("Declining submission…") + "\n"
+	case screenRejectError:
+		return reviewHeaderStyle() + "\n" +
+			lipgloss.NewStyle().Foreground(lipgloss.Color("1")).
+				Render("Reject error: "+m.rejectErrMsg) + "\n\n" +
+			lipgloss.NewStyle().Foreground(lipgloss.Color("240")).
+				Render("Press r to review another submission  •  q / Esc to quit") + "\n"
+	case screenRejectSuccess:
+		return m.viewRejectSuccess()
 	case screenDone:
 		return ""
 	}
@@ -829,6 +945,9 @@ func (m reviewModel) viewDetail() string {
 	sb.WriteString("\n\n")
 
 	hintParts := []string{"r review another", "q / Esc quit"}
+	if m.deps.Rejecter != nil {
+		hintParts = append([]string{"d decline (reject)"}, hintParts...)
+	}
 	if m.deps.Merger != nil {
 		hintParts = append([]string{"a approve (merge)"}, hintParts...)
 	}
@@ -895,6 +1014,179 @@ func (m reviewModel) viewApproveSuccess() string {
 	sb.WriteString("\n")
 
 	return sb.String()
+}
+
+// updateConfirmReject handles messages while the reject confirm screen is active.
+// The screen presents a huh input form for the reason and a public-comment
+// warning. When the form is submitted the reason is sanitized and the Reject
+// call is dispatched. Esc / Ctrl-C / q returns to the detail screen without
+// calling Reject (abort path mirrors the approve confirm abort pattern).
+//
+// The screen also accepts a rejectConfirmSubmitMsg (emitted by tests that
+// bypass the huh form lifecycle) so unit tests can inject a pre-determined
+// reason without constructing a real terminal.
+func (m reviewModel) updateConfirmReject(msg tea.Msg) (tea.Model, tea.Cmd) {
+	// Internal test-injection path: a rejectConfirmSubmitMsg bypasses the huh
+	// form and delivers a reason directly. Tests use this to drive the reject
+	// path without constructing a real terminal session.
+	if submit, ok := msg.(rejectConfirmSubmitMsg); ok {
+		sanitized := render.SanitizeForTerminal(submit.reason)
+		m.screen = screenRejecting
+		return m, m.doReject(sanitized)
+	}
+
+	// Intercept explicit abort keys before the huh form sees them. This mirrors
+	// updateConfirmApprove: any key that signals "cancel" aborts to detail without
+	// a Reject call. The huh form's own StateAborted also maps to the same path.
+	if key, ok := msg.(tea.KeyMsg); ok {
+		switch key.String() {
+		case "esc", "ctrl+c", "q":
+			m.rejectReasonBinding = ""
+			m.rejectReasonForm = nil
+			m.screen = screenDetail
+			return m, nil
+		}
+	}
+
+	if m.rejectReasonForm == nil {
+		return m, nil
+	}
+
+	form, cmd := m.rejectReasonForm.Update(msg)
+	if f, ok := form.(*huh.Form); ok {
+		m.rejectReasonForm = f
+	}
+
+	if m.rejectReasonForm.State == huh.StateAborted {
+		// Abort via huh's own escape handling: return to detail without calling Reject.
+		m.rejectReasonBinding = ""
+		m.rejectReasonForm = nil
+		m.screen = screenDetail
+		return m, nil
+	}
+
+	if m.rejectReasonForm.State == huh.StateCompleted {
+		sanitized := render.SanitizeForTerminal(strings.TrimSpace(m.rejectReasonBinding))
+		m.rejectReasonForm = nil
+		m.screen = screenRejecting
+		return m, m.doReject(sanitized)
+	}
+
+	return m, cmd
+}
+
+// doReject dispatches a Rejecter.Reject call using the RejectInput constructed
+// from the reviewed detail and the admin-supplied reason. The reason has already
+// been sanitized by render.SanitizeForTerminal at the confirm screen; the
+// use-case re-asserts its own core structural constraint as a fail-closed backstop.
+//
+// doReject never decrypts or displays values; it closes the reviewed PR.
+// The no_plaintext_guard AST test confirms no .Plaintext selector appears here.
+func (m reviewModel) doReject(sanitizedReason string) tea.Cmd {
+	ctx := m.ctx
+	deps := m.deps
+	detail := m.detail
+	return func() tea.Msg {
+		res, err := deps.Rejecter.Reject(ctx, usecase.RejectInput{
+			Ref:            detail.Ref,
+			Reason:         sanitizedReason,
+			NonInteractive: false,
+		})
+		if err != nil {
+			return rejectErrMsg{err: fmt.Errorf(
+				"declining %s#%d: %w — "+
+					"check your admin token and PR state; "+
+					"run `byreis doctor` for diagnostics",
+				detail.Ref.Project, detail.Ref.Number, err)}
+		}
+		url := res.URL
+		if url == "" {
+			url = res.PR
+		}
+		return rejectApproveMsg{pr: res.PR, url: url}
+	}
+}
+
+// viewConfirmReject renders the reject reason-input and confirm screen. The
+// screen presents:
+//   - a prominent public-comment warning (the reason will be posted as a
+//     world-readable PR comment; secrets must never appear here),
+//   - the huh reason-input form,
+//   - submission and abort hints.
+func (m reviewModel) viewConfirmReject() string {
+	d := m.detail
+	var sb strings.Builder
+
+	sb.WriteString(reviewHeaderStyle())
+	sb.WriteString("\n")
+
+	warning := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(lipgloss.Color("3")).
+		Render("DECLINE SUBMISSION — reason will be posted as a PUBLIC PR comment")
+	sb.WriteString(warning)
+	sb.WriteString("\n")
+
+	publicNote := lipgloss.NewStyle().Foreground(lipgloss.Color("240")).
+		Render("The reason is visible to anyone who can see the repository. " +
+			"Do not include secrets or sensitive details.")
+	sb.WriteString(publicNote)
+	sb.WriteString("\n\n")
+
+	_, _ = fmt.Fprintf(&sb, "PR:  %s#%d\n", d.Ref.Project, d.Ref.Number)
+	sb.WriteString("\n")
+
+	if m.rejectReasonForm != nil {
+		sb.WriteString(m.rejectReasonForm.View())
+	}
+
+	sb.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("240")).
+		Render("Enter to submit  •  Esc / Ctrl-C to cancel"))
+	sb.WriteString("\n")
+
+	return sb.String()
+}
+
+// viewRejectSuccess renders the reject acknowledgment screen shown after a
+// successful Rejecter.Reject call.
+func (m reviewModel) viewRejectSuccess() string {
+	var sb strings.Builder
+
+	sb.WriteString(reviewHeaderStyle())
+	sb.WriteString("\n")
+
+	ok := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(lipgloss.Color("2")).
+		Render("Submission declined")
+	sb.WriteString(ok)
+	sb.WriteString("\n\n")
+
+	res := m.rejectResult
+	_, _ = fmt.Fprintf(&sb, "pr:     %s\n", render.SanitizeForTerminal(res.pr))
+	_, _ = fmt.Fprintf(&sb, "closed: %s\n", render.SanitizeForTerminal(res.url))
+	sb.WriteString("\n")
+
+	sb.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("240")).
+		Render("r review another  •  q / Esc quit"))
+	sb.WriteString("\n")
+
+	return sb.String()
+}
+
+// buildRejectReasonForm builds the huh form that collects the rejection reason.
+// The reason is contributor-facing (posted as a PR comment) and is not secret.
+// It is sanitized via render.SanitizeForTerminal before use.
+func buildRejectReasonForm(binding *string) *huh.Form {
+	return huh.NewForm(
+		huh.NewGroup(
+			huh.NewInput().
+				Title("Reason for declining").
+				Description("This reason will be posted as a PUBLIC PR comment (max 2000 bytes). " +
+					"Do not include secrets or sensitive details.").
+				Value(binding),
+		),
+	)
 }
 
 // reviewHeaderStyle returns the branded header for the review TUI screens.

@@ -74,6 +74,12 @@ type Deps struct {
 	// (the action returns an error).
 	Merger usecase.Merger
 
+	// Rejecter is the admin Reject use-case. Same instance as cli.Deps.
+	// Used by the in-TUI decline (reject) flow. When nil the 'd' key
+	// affordance is omitted from the detail view and pressing 'd' is a no-op,
+	// mirroring the nil-Merger pattern for approve.
+	Rejecter usecase.RequestRejecter
+
 	// RequestAccessReader is the narrow read-only port used to fetch
 	// contributor request-access PR metadata. Same instance as cli.Deps.
 	RequestAccessReader rotate.RequestAccessReader
