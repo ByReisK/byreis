@@ -42,11 +42,12 @@ test-shipgate:
 
 ## test-docgate: run the docgate suite (forward-secrecy warning verbatim + release-wiring
 ## assertion + V5a R4a CLI emission + V6 request-access honesty contract + V6 admin warning
-## + V-9 v0.3 positioning-honesty release-notes verbatim ring, REQ-V03-011).
+## + V-9 v0.3 positioning-honesty release-notes verbatim ring, REQ-V03-011
+## + v0.4 reviewer-loop positioning-honesty ring + v0.5 audit-binding positioning-honesty ring).
 ## The docgate tag is a non-default sibling lane to shipgate; it is never compiled into a shipped
 ## binary (asserted structurally by shipped_surface_test.go and by the CI release-build-clean check).
 test-docgate:
-	go test $(GO_TEST_FLAGS) -tags docgate -run 'TestForwardSecrecyWarning_VerbatimMatch|TestForwardSecrecyWarning_RunbookPathReferenceIntact|TestReleaseWorkflow_DocgateGateWiringIntact|TestDocGate_ReleaseNotesV03_PositioningHonestyVerbatim|TestDocGate_ReleaseNotesV03_NoGitLabOrMultiProviderLanguage|TestDocGate_ReleaseNotesV04_PositioningHonestyVerbatim|TestDocGate_ReleaseNotesV04_NoForbiddenPositioningLanguage' ./internal/core/usecase/rotate/
+	go test $(GO_TEST_FLAGS) -tags docgate -run 'TestForwardSecrecyWarning_VerbatimMatch|TestForwardSecrecyWarning_RunbookPathReferenceIntact|TestReleaseWorkflow_DocgateGateWiringIntact|TestDocGate_ReleaseNotesV03_PositioningHonestyVerbatim|TestDocGate_ReleaseNotesV03_NoGitLabOrMultiProviderLanguage|TestDocGate_ReleaseNotesV04_PositioningHonestyVerbatim|TestDocGate_ReleaseNotesV04_NoForbiddenPositioningLanguage|TestDocGate_ReleaseNotesV05_PositioningHonestyVerbatim|TestDocGate_ReleaseNotesV05_NoForbiddenPositioningLanguage' ./internal/core/usecase/rotate/
 	go test $(GO_TEST_FLAGS) -tags docgate -run 'TestV5R4aCLI_RotateRemoveDryRunEmitsVerbatimForwardSecrecyWarning|TestV5R4aCLI_RotateRemoveNonDryRunEmitsVerbatimForwardSecrecyWarning|TestDocGate_RequestAccessHelp_VerbatimHonestyContract|TestDocGate_RequestAccessAdminWarning_VerbatimEmitted|TestR4b_DoctorRotationHistory_VerbatimFixtureMatchesConstant|TestR4b_DoctorRotationHistoryEmitsVerbatimForwardSecrecyWarning|TestR4b_DoctorRotationHistoryNoRemovalsNoWarningExitZero|TestR4b_DoctorRotationHistoryPartialRotationDetected|TestR4b_DoctorRotationHistoryReachableInContributorMode' ./internal/cli/
 
 ## test-composability: run the R-005.6 composability scenario (non-release-gating).
