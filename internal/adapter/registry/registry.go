@@ -68,6 +68,17 @@ var ErrRegistryWriteAuth = errors.New(
 	"registry-write credential is missing or has insufficient scope — " +
 		"run `byreis admin register` to add a registry-write token")
 
+// ErrMergeAuditUnsupportedTransport is returned by CommitBump when the input
+// carries a non-empty AuditEntry but the configured transport does not implement
+// the mergeAuditTransport extension. Advancing the counter and silently dropping
+// the audit entry is not acceptable on the merge path; the operation fails closed
+// so the caller can surface an actionable message: upgrade to a build with full
+// merge-audit transport wired, or run `byreis doctor` to diagnose.
+var ErrMergeAuditUnsupportedTransport = errors.New(
+	"merge audit transport not available: the configured transport does not implement " +
+		"CommitCounterWithAudit — upgrade to a build with full merge-audit support or " +
+		"run `byreis doctor` to diagnose")
+
 // ErrRegistryConcurrentWrite is returned by WriteCounter when the push is
 // rejected because the registry HEAD moved between fetch and push (non-fast-
 // forward), indicating a concurrent admin write. The caller must retry by
@@ -819,10 +830,27 @@ func (c *Client) CommitBump(ctx context.Context, in coreregistry.CommitBumpInput
 	}
 
 	if c.cfg.FetchTransport != nil {
-		if err := c.cfg.FetchTransport.CommitCounter(
-			ctx, c.cfg.RegistryURL, in.ProjectID, in.FileName, in.PendingCounter); err != nil {
-			return fmt.Errorf("registry CommitBump: committing counter: %w — "+
-				"run `byreis doctor` to diagnose", err)
+		// When the input carries an audit entry (a merge bump), require the
+		// audit-bearing transport path so the JSONL line and the counter advance
+		// land in the SAME signed commit. If the transport does not implement the
+		// extension, fail closed: advancing the counter and silently dropping the
+		// audit entry is not acceptable on the merge path. The bare CommitCounter
+		// fallback is used only for non-merge bumps (AuditEntry.Kind == "").
+		if in.AuditEntry.Kind != "" {
+			at, ok := c.cfg.FetchTransport.(mergeAuditTransport)
+			if !ok {
+				return fmt.Errorf("%w", ErrMergeAuditUnsupportedTransport)
+			}
+			if err := at.CommitCounterWithAudit(ctx, c.cfg.RegistryURL, in); err != nil {
+				return fmt.Errorf("registry CommitBump: committing counter with audit: %w — "+
+					"run `byreis doctor` to diagnose", err)
+			}
+		} else {
+			if err := c.cfg.FetchTransport.CommitCounter(
+				ctx, c.cfg.RegistryURL, in.ProjectID, in.FileName, in.PendingCounter); err != nil {
+				return fmt.Errorf("registry CommitBump: committing counter: %w — "+
+					"run `byreis doctor` to diagnose", err)
+			}
 		}
 	}
 
@@ -863,6 +891,35 @@ type rotationCommitTransport interface {
 	// N files, clears pending, and records the new rotation_epoch in a single
 	// signed registry commit. repoURL is the registry repository URL.
 	CommitRotationTransport(ctx context.Context, repoURL string, in coreregistry.CommitRotationInput) error
+}
+
+// mergeAuditTransport is a required extension of FetchTransport for the merge
+// path. When CommitBumpInput.AuditEntry is non-zero (a merge bump),
+// Client.CommitBump checks whether the configured transport implements this
+// interface. If it does, CommitCounterWithAudit is called; the transport is
+// responsible for appending the audit JSONL line and staging it in the SAME
+// signed commit as the counter advance (same-commit atomicity). If the
+// transport does NOT implement this interface and AuditEntry.Kind is non-empty,
+// CommitBump returns ErrMergeAuditUnsupportedTransport and refuses to advance
+// the counter — fail closed. The bare CommitCounter path is reserved for
+// non-merge bumps (AuditEntry.Kind == ""), such as legacy test doubles.
+// Production wiring always injects a productionFetchTransport that implements
+// the full interface; the compile-time assertion in production_transport.go
+// enforces this.
+//
+// The interface is intentionally narrow: it exposes only the audit-bearing
+// variant of CommitCounter that the merge path needs. Token acquisition and
+// all git subprocess operations remain inside the transport.
+type mergeAuditTransport interface {
+	// CommitCounterWithAudit atomically advances last_accepted_counter to the
+	// pending counter, clears pending, appends the audit JSONL entry to
+	// audit/<project>.jsonl, and embeds audit_entry_sha = sha256(JSONL line)
+	// in the signed commit body — all in ONE signed git commit and ONE
+	// conditional push. The audit entry in bumpIn MUST pass ValidateEventFields
+	// before signing; a validation failure aborts the commit (no signed orphan).
+	// repoURL is the registry repository URL; bumpIn carries projectID, fileName,
+	// pendingCounter, PRRef, and the non-zero AuditEntry.
+	CommitCounterWithAudit(ctx context.Context, repoURL string, bumpIn coreregistry.CommitBumpInput) error
 }
 
 // FetchRotationEpochs returns the per-file rotation_epoch for all files in a

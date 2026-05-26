@@ -212,6 +212,15 @@ type CommitBumpInput struct {
 	FileName       string
 	PendingCounter uint64 // must match the open pending's pending_counter
 	PRRef          string // audit linkage
+
+	// AuditEntry is the merge audit event to persist in the SAME signed registry
+	// commit as the counter advance, mirroring CommitRotationInput.AuditEntry. It
+	// must carry EventKindMerge. The adapter computes
+	// sha256(canonical-JSONL-bytes-of-AuditEntry) and embeds the hex digest in the
+	// signed commit message body as audit_entry_sha, so the audit append is
+	// structurally inseparable from the counter advance: a CommitBump that does
+	// not land leaves no half-appended remote audit line.
+	AuditEntry audit.Event
 }
 
 // ErrCommitRotationNotImplemented is returned by CommitRotation when the full

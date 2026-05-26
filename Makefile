@@ -32,11 +32,13 @@ test-testhook:
 ## test-shipgate: run the non-skippable asymmetric-access ship-gate suite.
 ## Two packages are covered:
 ##   internal/core/usecase — the §7.1 REQ-B-001 asymmetric-access suite (TestAsymmetryShipGate*)
-##   internal/app          — the D-1 positive real-composition suite (TestD1_PositiveComposition)
-##                           and the V-3.5 nil-fallback wiring tests (TestV35_*)
+##   internal/app          — the D-1 positive real-composition suite (TestD1_PositiveComposition),
+##                           the V-3.5 nil-fallback wiring tests (TestV35_*),
+##                           the S1 rejecter wiring tests (TestS1_*),
+##                           and the S3 bridge mapping tests (TestS3_*)
 test-shipgate:
 	go test $(GO_TEST_FLAGS) -tags shipgate -run TestAsymmetryShipGate ./internal/core/usecase/
-	go test $(GO_TEST_FLAGS) -tags shipgate -run 'TestD1_PositiveComposition|TestV35_|TestS1_' ./internal/app/
+	go test $(GO_TEST_FLAGS) -tags shipgate -run 'TestD1_PositiveComposition|TestV35_|TestS1_|TestS3_' ./internal/app/
 
 ## test-docgate: run the docgate suite (forward-secrecy warning verbatim + release-wiring
 ## assertion + V5a R4a CLI emission + V6 request-access honesty contract + V6 admin warning

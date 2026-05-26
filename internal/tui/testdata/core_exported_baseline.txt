@@ -268,6 +268,7 @@ github.com/ByReisK/byreis/internal/core/registry#AdminSet.SourceVerified
 github.com/ByReisK/byreis/internal/core/registry#AdminSet.Stale
 github.com/ByReisK/byreis/internal/core/registry#AdminSet.StaleReason
 github.com/ByReisK/byreis/internal/core/registry#CommitBumpInput
+github.com/ByReisK/byreis/internal/core/registry#CommitBumpInput.AuditEntry
 github.com/ByReisK/byreis/internal/core/registry#CommitBumpInput.FileName
 github.com/ByReisK/byreis/internal/core/registry#CommitBumpInput.PRRef
 github.com/ByReisK/byreis/internal/core/registry#CommitBumpInput.PendingCounter
@@ -337,6 +338,7 @@ github.com/ByReisK/byreis/internal/core/usecase#AtomicWriteInput.LiveRelPath
 github.com/ByReisK/byreis/internal/core/usecase#AtomicWriteInput.ProjectID
 github.com/ByReisK/byreis/internal/core/usecase#AtomicWriteInput.SignedBytes
 github.com/ByReisK/byreis/internal/core/usecase#CommitBumpInput
+github.com/ByReisK/byreis/internal/core/usecase#CommitBumpInput.AuditEntry
 github.com/ByReisK/byreis/internal/core/usecase#CommitBumpInput.FileName
 github.com/ByReisK/byreis/internal/core/usecase#CommitBumpInput.PRRef
 github.com/ByReisK/byreis/internal/core/usecase#CommitBumpInput.PendingCounter

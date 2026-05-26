@@ -30,7 +30,7 @@ jobs:
         # fully-configured ADMIN environment. Not covered by the core/usecase
         # step above; this step closes that gap so a typed-nil regression in
         # the composition root is caught at release time, not only on PR CI.
-        run: go test -v -race -tags shipgate -timeout=120s -run 'TestD1_PositiveComposition|TestV35_|TestS1_' ./internal/app/
+        run: go test -v -race -tags shipgate -timeout=120s -run 'TestD1_PositiveComposition|TestV35_|TestS1_|TestS3_' ./internal/app/
 
   # The docgate job is the second non-bypassable gating leg, paired with shipgate.
   # It runs the forward-secrecy warning verbatim cross-check and the

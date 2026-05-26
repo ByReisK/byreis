@@ -686,7 +686,7 @@ func (t *productionFetchTransport) WriteCounter(ctx context.Context, repoURL, pr
 		return fmt.Errorf("WriteCounter: pending bump must not be nil")
 	}
 
-	return t.doCounterWrite(ctx, repoURL, projectID, fileName, token, pending, 0, false)
+	return t.doCounterWrite(ctx, repoURL, projectID, fileName, token, pending, 0, false, audit.Event{})
 }
 
 // CommitCounter atomically advances last_accepted_counter to pendingCounter
@@ -719,25 +719,85 @@ func (t *productionFetchTransport) CommitCounter(ctx context.Context, repoURL, p
 		return fmt.Errorf("CommitCounter: invalid fileName: %w", err)
 	}
 
-	return t.doCounterWrite(ctx, repoURL, projectID, fileName, token, nil, pendingCounter, true)
+	return t.doCounterWrite(ctx, repoURL, projectID, fileName, token, nil, pendingCounter, true, audit.Event{})
 }
 
-// doCounterWrite is the shared implementation for WriteCounter and CommitCounter.
-// When commitPhase is false: writes the pending record (WriteCounter).
-// When commitPhase is true:  advances last_accepted and clears pending (CommitCounter).
+// CommitCounterWithAudit atomically advances last_accepted_counter to the
+// pending counter, clears pending, appends an audit JSONL entry to
+// audit/<project>.jsonl, and embeds audit_entry_sha in the signed commit
+// body — all in ONE signed git commit and ONE conditional push.
 //
-// Atomicity: each call produces exactly ONE signed git commit updating the
-// counter file. CommitCounter's single commit simultaneously advances
-// last_accepted_counter AND clears pending to null — never two commits.
+// This is the merge-audit path: bumpIn.AuditEntry carries EventKindMerge and
+// MUST pass audit.ValidateEventFields before signing. A validation failure
+// aborts the entire commit (fail-closed, no signed orphan). The JSONL line is
+// staged in the SAME git-add invocation as the counter blob so the two files
+// are structurally inseparable: a CommitBump that does not land also leaves no
+// half-appended remote audit line.
+//
+// OccurredAt is stamped by the transport at commit-build time (the call-site
+// code in merge.go leaves it zero). A failed CommitBump pushes nothing
+// remotely, so a resumed attempt derives a fresh timestamp against the new
+// clone — there is no half-appended remote line to produce a duplicate.
+func (t *productionFetchTransport) CommitCounterWithAudit(ctx context.Context, repoURL string, bumpIn coreregistry.CommitBumpInput) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return fmt.Errorf("CommitCounterWithAudit: context already cancelled: %w", ctxErr)
+	}
+	if t.writeCfg == nil || t.writeCfg.Signer == nil || t.writeCfg.TokenProvider == nil {
+		return fmt.Errorf("%w: CommitCounterWithAudit: no write configuration provided — "+
+			"run `byreis admin register` to add a registry-write token",
+			ErrRegistryWriteAuth)
+	}
+
+	token, tokenErr := t.writeCfg.TokenProvider.RegistryWriteToken(ctx, repoURL)
+	if tokenErr != nil {
+		return fmt.Errorf("%w: CommitCounterWithAudit: retrieving registry-write token: %v",
+			ErrRegistryWriteAuth, tokenErr)
+	}
+
+	if err := fetchtransport.ValidateProjectID(bumpIn.ProjectID); err != nil {
+		return fmt.Errorf("CommitCounterWithAudit: invalid projectID: %w", err)
+	}
+	if err := fetchtransport.ValidateFileName(bumpIn.FileName); err != nil {
+		return fmt.Errorf("CommitCounterWithAudit: invalid fileName: %w", err)
+	}
+
+	return t.doCounterWrite(ctx, repoURL, bumpIn.ProjectID, bumpIn.FileName, token, nil, bumpIn.PendingCounter, true, bumpIn.AuditEntry)
+}
+
+// doCounterWrite is the shared implementation for WriteCounter, CommitCounter,
+// and CommitCounterWithAudit.
+//
+// When commitPhase is false: writes the pending record (WriteCounter).
+// When commitPhase is true:  advances last_accepted and clears pending
+// (CommitCounter / CommitCounterWithAudit).
+//
+// When auditEntry.Kind is non-empty AND commitPhase is true, the audit JSONL
+// line is built, appended to audit/<project>.jsonl in the clone, and staged in
+// the SAME git-add invocation as the counter blob — the two files are
+// structurally inseparable. audit_entry_sha = sha256(JSONL line) is embedded
+// in the signed commit message body. ValidateEventFields runs before any signing;
+// a validation failure aborts the commit (no signed orphan).
+//
+// OccurredAt is stamped by this function at the moment the commit message body
+// is built, so the timestamp matches the commit exactly. The caller in merge.go
+// leaves OccurredAt zero; the transport owns timestamping. A failed push leaves
+// no remote state, so a CAS-retry rebuild starts from a fresh clone and derives
+// a new timestamp — there is no half-appended remote line.
+//
+// Atomicity: each call produces exactly ONE signed git commit. CommitCounter's
+// single commit simultaneously advances last_accepted_counter AND clears pending
+// (and optionally appends the audit line) — never two commits.
 //
 // CAS: push uses --force-with-lease on the expected parent SHA. A non-fast-
-// forward push returns ErrRegistryConcurrentWrite so the spine can retry.
+// forward push returns ErrRegistryConcurrentWrite so the spine can retry;
+// on retry the audit append is rebuilt against the FRESH re-clone.
 func (t *productionFetchTransport) doCounterWrite(
 	ctx context.Context,
 	repoURL, projectID, fileName, token string,
 	pending *countertypes.PendingBump,
 	pendingCounter uint64,
 	commitPhase bool,
+	auditEntry audit.Event,
 ) error {
 	// Create an isolated 0700 workspace for all git operations.
 	tmpDir, mkErr := os.MkdirTemp("", "byreis-counter-write-*")
@@ -893,6 +953,46 @@ func (t *productionFetchTransport) doCounterWrite(
 		return fmt.Errorf("doCounterWrite: building counter JSON: %w", jsonErr)
 	}
 
+	// Step 4a: when this is a merge CommitBump carrying an audit entry, build
+	// the JSONL line and embed audit_entry_sha in the commit message body BEFORE
+	// any file write or git operation. Fail-closed on validation: a malformed
+	// event aborts here with no signed orphan and no partial state.
+	//
+	// OccurredAt is stamped at this moment — the transport owns timestamping, and
+	// the caller (merge.go) deliberately leaves it zero to delegate that
+	// responsibility here. The timestamp matches the actual commit time.
+	//
+	// Idempotency on resume: a failed push leaves no remote state, so a CAS-retry
+	// re-enters doCounterWrite from a fresh clone. The fresh clone has no
+	// half-appended audit line, and the fresh call derives a new timestamp. This
+	// is correct: the winning JSONL is the one that rides the winning commit.
+	var auditJSONLBytes []byte
+	var auditFilePath string
+	var auditBlobPath string
+	if commitPhase && auditEntry.Kind != "" {
+		// Stamp OccurredAt at commit-build time.
+		auditEntry.OccurredAt = time.Now().UTC()
+
+		var auditSHA string
+		var auditErr error
+		auditJSONLBytes, auditSHA, auditErr = buildAuditJSONLEntry(auditEntry)
+		if auditErr != nil {
+			return fmt.Errorf("doCounterWrite: building audit JSONL entry: %w — "+
+				"verify the audit-event producer constructs canonical-typed Details values",
+				auditErr)
+		}
+
+		// Append audit_entry_sha to the commit message body so the signed payload
+		// binds the counter advance to the specific audit line. This mirrors the
+		// rotation commit body (buildRotationCommitMessageBody) which embeds the
+		// same field. The line is appended after the body so existing body parsers
+		// remain forward-compatible.
+		commitMsgBody = commitMsgBody + "audit_entry_sha: " + auditSHA + "\n"
+
+		auditBlobPath = "audit/" + projectID + ".jsonl"
+		auditFilePath = filepath.Join(cloneDir, filepath.FromSlash(auditBlobPath))
+	}
+
 	// Step 5: write the updated counter file to the clone.
 	counterDir := filepath.Dir(counterFilePath)
 	if mkdirErr := os.MkdirAll(counterDir, 0o700); mkdirErr != nil {
@@ -904,13 +1004,54 @@ func (t *productionFetchTransport) doCounterWrite(
 			"check filesystem permissions: run `byreis doctor`", writeErr)
 	}
 
-	// Step 6: stage the counter file.
+	// Step 5a: when carrying an audit entry, write (append or create) the JSONL
+	// line to audit/<project>.jsonl in the clone. The file is created on first
+	// merge. The write happens BEFORE git add so the file is in the working tree
+	// for the combined stage in step 6.
+	if len(auditJSONLBytes) > 0 {
+		auditDir := filepath.Dir(auditFilePath)
+		if mkdirErr := os.MkdirAll(auditDir, 0o700); mkdirErr != nil {
+			return fmt.Errorf("doCounterWrite: creating audit directory: %w — "+
+				"check filesystem permissions: run `byreis doctor`", mkdirErr)
+		}
+		auditFile, openErr := os.OpenFile(auditFilePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600) //nolint:gosec // 0600 for audit file: owner-only
+		if openErr != nil {
+			return fmt.Errorf("doCounterWrite: opening audit file for append: %w — "+
+				"check filesystem permissions: run `byreis doctor`", openErr)
+		}
+		_, appendErr := auditFile.Write(auditJSONLBytes)
+		closeErr := auditFile.Close()
+		if appendErr != nil {
+			return fmt.Errorf("doCounterWrite: appending to audit file: %w — "+
+				"check filesystem permissions: run `byreis doctor`", appendErr)
+		}
+		if closeErr != nil {
+			return fmt.Errorf("doCounterWrite: closing audit file: %w — "+
+				"check filesystem permissions: run `byreis doctor`", closeErr)
+		}
+	}
+
+	// Step 6: stage all modified files in a single git add invocation.
+	//
+	// When an audit entry is present, BOTH the counter blob AND the audit file
+	// must be staged in the SAME git add call. Staging them separately risks a
+	// counter-advanced-but-no-audit orphan if the second add fails or is skipped.
+	// Using a single invocation with explicit paths makes the atomicity visible
+	// in the subprocess log and removes the two-step window entirely.
 	addCtx, addCancel := fetchtransport.WithBoundedDeadline(ctx, 10*time.Second)
 	defer addCancel()
 
+	var addArgs []string
+	if auditBlobPath != "" {
+		// Stage counter blob and audit file together — inseparable.
+		addArgs = []string{"add", "--", blobPath, auditBlobPath}
+	} else {
+		addArgs = []string{"add", "--", blobPath}
+	}
+
 	_, addStderr, addExit, addErr := t.verifier.RunSubprocess(
 		addCtx, cloneDir, hardenedEnv(),
-		"git", "add", "--", blobPath,
+		"git", addArgs...,
 	)
 	if addErr != nil {
 		return fmt.Errorf("doCounterWrite: git add exec error: %w — run `byreis doctor`", addErr)
@@ -2596,5 +2737,11 @@ func (t *productionFetchTransport) ReadAuditLog(ctx context.Context, repoURL, he
 	return raw, nil
 }
 
-// Compile-time assertion: productionFetchTransport satisfies FetchTransport.
+// Compile-time assertions: productionFetchTransport satisfies both
+// FetchTransport and the mergeAuditTransport extension. The merge path
+// dispatches to CommitCounterWithAudit via a runtime interface assertion;
+// this assertion ensures that if the method is ever removed or renamed
+// the build fails before any test can silently fall through to the
+// bare-CommitCounter path.
 var _ FetchTransport = (*productionFetchTransport)(nil)
+var _ mergeAuditTransport = (*productionFetchTransport)(nil)

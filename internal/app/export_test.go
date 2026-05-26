@@ -12,6 +12,7 @@ import (
 	"github.com/ByReisK/byreis/internal/core/crypto/identity"
 	coregit "github.com/ByReisK/byreis/internal/core/git"
 	"github.com/ByReisK/byreis/internal/core/mode"
+	coreregistry "github.com/ByReisK/byreis/internal/core/registry"
 	"github.com/ByReisK/byreis/internal/core/usecase"
 	"github.com/ByReisK/byreis/internal/core/usecase/submit"
 )
@@ -78,6 +79,14 @@ type SubmitSharedDepsForTest struct {
 	ResumeStore submit.ResumeStore
 	Validator   submit.ValueValidator
 	Clock       submit.Clock
+}
+
+// NewProdCounterStoreBridgeForTest wraps client in a prodRegistryCounterStoreBridge
+// and returns it as a usecase.CounterStore. Tests use this to drive CommitBump
+// through the production bridge and assert that every field — including AuditEntry —
+// is forwarded to the underlying coreregistry.RegistryClient unchanged.
+func NewProdCounterStoreBridgeForTest(client coreregistry.RegistryClient) usecase.CounterStore {
+	return &prodRegistryCounterStoreBridge{client: client}
 }
 
 // BuildSubmitSharedDepsProdForTest calls buildSubmitSharedDepsProd so that the

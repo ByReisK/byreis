@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 
+	"github.com/ByReisK/byreis/internal/core/audit"
 	"github.com/ByReisK/byreis/internal/core/crypto/artifact"
 	"github.com/ByReisK/byreis/internal/core/crypto/manifest"
 	"github.com/ByReisK/byreis/internal/core/mode"
@@ -109,6 +110,16 @@ type CommitBumpInput struct {
 	FileName       string
 	PendingCounter uint64
 	PRRef          string
+
+	// AuditEntry is the merge audit event to persist in the SAME signed registry
+	// commit as the counter advance, mirroring CommitRotationInput.AuditEntry.
+	// This makes the durable merge record structurally inseparable from the
+	// counter commit-bump: a CommitBump that does not land also writes no audit
+	// entry. It carries EventKindMerge with the same PendingCounter this input
+	// advances to, so the recorded counter and the committed counter are one
+	// value. The transport validates it with audit.ValidateEventFields before
+	// signing; the merge use-case constructs it to pass that validation.
+	AuditEntry audit.Event
 }
 
 // ManifestSigner is the consumer-defined admin Ed25519 signing port. The

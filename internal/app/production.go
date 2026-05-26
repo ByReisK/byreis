@@ -1615,6 +1615,7 @@ func (b *prodRegistryCounterStoreBridge) CommitBump(ctx context.Context, in usec
 		FileName:       in.FileName,
 		PendingCounter: in.PendingCounter,
 		PRRef:          in.PRRef,
+		AuditEntry:     in.AuditEntry,
 	})
 }
 

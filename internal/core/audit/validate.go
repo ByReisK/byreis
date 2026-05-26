@@ -6,6 +6,10 @@
 // this helper before persisting an Event.
 //
 // The validator rejects:
+//   - A non-empty top-level Event.KeyName whose value does not match the strict
+//     leaf key-name format ^[a-zA-Z0-9._-]{1,256}$ (no slash, no control bytes,
+//     no whitespace) — the key name is contributor-influenced and reaches the
+//     durable signed write.
 //   - Age recipient fields (key contains "pubkey", "recipient", or "age_key")
 //     whose values do not match the canonical age1<58 bech32 chars> format.
 //   - Project-ID or file-name fields (key contains "project", "file", or
@@ -44,6 +48,15 @@ var agePubkeyRE = regexp.MustCompile(`^age1[0-9a-z]{58}$`)
 // alphanumeric plus . _ / - characters, 1 to 256 characters.
 var projectIDOrFileNameRE = regexp.MustCompile(`^[a-zA-Z0-9._\-/]{1,256}$`)
 
+// keyNameRE matches a canonical secret key NAME (never the secret value):
+// alphanumeric plus . _ - characters, 1 to 256 characters. Unlike a project or
+// file name, a key name MUST NOT contain a slash — a key is a leaf identifier,
+// not a path — so this is a deliberately stricter pattern than
+// projectIDOrFileNameRE. The trailing position of '-' inside the class keeps it
+// a literal hyphen, never a character range. Control bytes, whitespace, and
+// path separators are all rejected.
+var keyNameRE = regexp.MustCompile(`^[a-zA-Z0-9._-]{1,256}$`)
+
 // shaHexRE matches canonical lowercase hex SHA-style digests: 1 to 128
 // hexadecimal characters. Audit-event fields carrying SHAs (commit SHAs,
 // content SHAs, blob SHAs, audit-entry SHAs) are typed: only canonical hex
@@ -72,6 +85,17 @@ var prURLRE = regexp.MustCompile(`^[A-Za-z0-9._\-/]{1,256}#[0-9]+$`)
 // terminal-render is the only operator-facing surface where that bytes live.
 // A future code path that accidentally added the field would be caught here.
 func ValidateEventFields(e Event) error {
+	// Top-level KeyName is a contributor-influenced field (it carries the secret
+	// key NAME a submission targets) and reaches the durable signed write, so it
+	// is validated here independently of Details. The rule fires only when a key
+	// name is present; a leaf key identifier may not contain a slash, control
+	// byte, or whitespace.
+	if e.KeyName != "" && !keyNameRE.MatchString(e.KeyName) {
+		return fmt.Errorf(
+			"%w: event KeyName does not match the key-name format (^[a-zA-Z0-9._-]{1,256}$, no slash): %q",
+			ErrAuditEventInvalidField, truncate(e.KeyName))
+	}
+
 	for k, v := range e.Details {
 		lk := strings.ToLower(k)
 		if strings.HasPrefix(lk, "from_request_yaml_just") {

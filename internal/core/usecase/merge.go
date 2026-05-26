@@ -478,11 +478,39 @@ func (m *mergeUseCase) Merge(ctx context.Context, in MergeInput) (MergeResult, e
 	if err := checkRotationGuardBeforeCommitBump(ctx, m.d.RotationGuard, in.ExpectedProjectID, in.ExpectedFileName); err != nil {
 		return MergeResult{}, err
 	}
+
+	// The successful-merge audit record rides the SAME signed registry commit as
+	// the counter advance via CommitBumpInput.AuditEntry — it is the SINGLE
+	// durable source of truth for a merge, with no host-local shadow copy. The
+	// counter in the event is the SAME `next` value CommitBump advances to (one
+	// value feeds both). The event is constructed to pass
+	// audit.ValidateEventFields, which the transport invokes before signing; the
+	// top-level KeyName comes from the contributor submission and is now validated
+	// there.
+	//
+	// Determinism on resume: OccurredAt is deliberately left zero here. Only the
+	// JSONL that lands inside the signed CommitBump commit is canonical, and a
+	// failed CommitBump pushes nothing — so a resume re-derives a fresh event with
+	// no half-appended remote line. The transport owns timestamping at the moment
+	// the signed commit is built.
+	mergeAudit := audit.Event{
+		Kind:      audit.EventKindMerge,
+		ProjectID: in.ExpectedProjectID,
+		FileName:  in.ExpectedFileName,
+		KeyName:   sub.Meta.Key,
+		PRRef:     prRef,
+		Outcome:   "ok",
+		Details: map[string]string{
+			"counter":      fmt.Sprintf("%d", next),
+			"re_encrypted": fmt.Sprintf("%t", reEncrypted),
+		},
+	}
 	if err := m.d.Counter.CommitBump(ctx, CommitBumpInput{
 		ProjectID:      in.ExpectedProjectID,
 		FileName:       in.ExpectedFileName,
 		PendingCounter: next,
 		PRRef:          prRef,
+		AuditEntry:     mergeAudit,
 	}); err != nil {
 		return MergeResult{}, fmt.Errorf(
 			"the secrets merge landed but the counter commit-bump failed — "+
@@ -520,22 +548,11 @@ func (m *mergeUseCase) Merge(ctx context.Context, in MergeInput) (MergeResult, e
 		}, fmt.Errorf("%w: %v", ErrMergePostIntegrity, pErr)
 	}
 
-	if aErr := m.d.Audit.Append(ctx, audit.Event{
-		Kind:      audit.EventKindMerge,
-		ProjectID: in.ExpectedProjectID,
-		FileName:  in.ExpectedFileName,
-		KeyName:   sub.Meta.Key,
-		PRRef:     prRef,
-		Outcome:   "ok",
-		Details: map[string]string{
-			"counter":      fmt.Sprintf("%d", next),
-			"re_encrypted": fmt.Sprintf("%t", reEncrypted),
-		},
-	}); aErr != nil {
-		m.d.Log.Log(ctx, logging.LevelWarn,
-			"merge completed but audit append failed",
-			"project", in.ExpectedProjectID, "error", aErr.Error())
-	}
+	// No host-local success emit: the durable merge record is the audit entry
+	// that rode the signed CommitBump commit above (CommitBumpInput.AuditEntry),
+	// the single source of truth. The host-local logger is reserved for the
+	// post-merge failure ALARM below, which is distinguishable by its non-"ok"
+	// outcome.
 
 	return MergeResult{
 		MergedCommit:        mr.MergedCommit,

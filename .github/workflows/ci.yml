@@ -159,7 +159,7 @@ jobs:
         # fully-configured ADMIN environment. Not covered by the core/usecase
         # step above; this step closes that gap so a typed-nil regression in
         # the composition root is caught in CI, not only locally.
-        run: go test -v -race -tags shipgate -timeout=120s -run 'TestD1_PositiveComposition|TestV35_|TestS1_' ./internal/app/
+        run: go test -v -race -tags shipgate -timeout=120s -run 'TestD1_PositiveComposition|TestV35_|TestS1_|TestS3_' ./internal/app/
 
   docgate:
     name: Doc Gate (forward-secrecy warning + release-wiring)
