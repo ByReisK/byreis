@@ -14,12 +14,14 @@ import (
 // to CONTRIBUTOR — the expected fail-closed result in tests).
 const noKeychainKeyFile = "/nonexistent-byreis-test-key.age"
 
-// TestBuildProductionDeps_MissingRegistry_Errors verifies that
-// BuildProductionDeps with no BYREIS_REGISTRY returns an error (the
-// read-path ports cannot be wired, so the use-cases are unavailable). This
-// mirrors the original buildDeps → os.Exit path: the caller (main) calls
-// os.Exit; the function returns the error rather than calling os.Exit itself.
-func TestBuildProductionDeps_MissingRegistry_Errors(t *testing.T) {
+// TestBuildProductionDeps_MissingRegistry_NilUseCases verifies that
+// BuildProductionDeps with no BYREIS_REGISTRY succeeds (returns non-nil deps,
+// nil error) but leaves all read-path use-cases nil. This is the correct
+// first-run UX behaviour: `byreis --help`, `byreis version`, and
+// `byreis completion` all succeed in an unconfigured environment; each command
+// that actually needs a configured registry surfaces its own "not configured"
+// error at command time (fail-closed posture is unchanged, merely deferred).
+func TestBuildProductionDeps_MissingRegistry_NilUseCases(t *testing.T) {
 	t.Setenv("BYREIS_REGISTRY", "")
 	t.Setenv("BYREIS_PROJECT", "")
 	t.Setenv("BYREIS_GITHUB_TOKEN", "")
@@ -27,31 +29,48 @@ func TestBuildProductionDeps_MissingRegistry_Errors(t *testing.T) {
 	t.Setenv("BYREIS_CONFIG", t.TempDir())
 	t.Setenv("BYREIS_KEY_FILE", noKeychainKeyFile) // prevent keychain stub panic
 
-	_, err := app.BuildProductionDeps(context.Background())
-	// Without registry or file-of-record source, BuildReadPathDeps requires
-	// all base ports non-nil and returns an error when some are nil.
-	// BuildProductionDeps propagates that error.
-	if err == nil {
-		t.Fatal("BuildProductionDeps without registry must return an error (not os.Exit)")
+	deps, err := app.BuildProductionDeps(context.Background())
+	if err != nil {
+		t.Fatalf("BuildProductionDeps without registry must succeed (deferred fail-closed): %v", err)
+	}
+	if deps == nil {
+		t.Fatal("BuildProductionDeps must return non-nil deps even without registry")
+	}
+	// All read-path use-cases must be nil when registry is absent (fail-closed
+	// at command time, not at startup).
+	if deps.Getter != nil {
+		t.Error("deps.Getter must be nil without a registry")
+	}
+	if deps.Decryptor != nil {
+		t.Error("deps.Decryptor must be nil without a registry")
+	}
+	if deps.Editor != nil {
+		t.Error("deps.Editor must be nil without a registry")
 	}
 }
 
-// TestBuildProductionDeps_BadRegistryURL_Errors verifies that a badly-formed
-// registry URL causes BuildProductionDeps to return a non-nil error (the
-// file-of-record source also fails, so BuildReadPathDeps fails with nil ports).
-func TestBuildProductionDeps_BadRegistryURL_Errors(t *testing.T) {
+// TestBuildProductionDeps_BadRegistryURL_NilUseCases verifies that a
+// badly-formed registry URL causes BuildProductionDeps to succeed (return
+// non-nil deps) but leave all read-path use-cases nil. The fail-closed
+// posture is maintained at command time when those nil use-cases are invoked.
+func TestBuildProductionDeps_BadRegistryURL_NilUseCases(t *testing.T) {
 	t.Setenv("BYREIS_REGISTRY", "not-a-valid-github-url.example.com/foo")
 	t.Setenv("BYREIS_PROJECT", "myorg/myproject")
 	t.Setenv("BYREIS_GITHUB_TOKEN", "fake-token-for-parse-test")
 	t.Setenv("BYREIS_CONFIG", t.TempDir())
 	t.Setenv("BYREIS_KEY_FILE", noKeychainKeyFile)
 
-	_, err := app.BuildProductionDeps(context.Background())
-	// Registry client fails (bad URL) AND file-of-record source also fails
-	// (no project token path works), so BuildReadPathDeps gets nil ports and
-	// returns an error. BuildProductionDeps propagates that error.
-	if err == nil {
-		t.Fatal("bad registry URL with no valid file-of-record source must return error")
+	deps, err := app.BuildProductionDeps(context.Background())
+	if err != nil {
+		t.Fatalf("BuildProductionDeps with bad registry URL must succeed (deferred fail-closed): %v", err)
+	}
+	if deps == nil {
+		t.Fatal("BuildProductionDeps must return non-nil deps even with a bad registry URL")
+	}
+	// Read-path use-cases are nil because the registry client and
+	// file-of-record source could not be constructed.
+	if deps.Getter != nil {
+		t.Error("deps.Getter must be nil when registry URL is invalid")
 	}
 }
 
@@ -98,8 +117,8 @@ func TestBuildProductionDeps_EnvBoolVariants(t *testing.T) {
 }
 
 // TestBuildProductionDeps_ConfigDir_BYREIS_CONFIG_Honored verifies that the
-// BYREIS_CONFIG env override is parsed and used before the error from missing
-// registry/ports is returned. This confirms env-var precedence is preserved.
+// BYREIS_CONFIG env override is reflected in the returned deps.ConfigDir.
+// BuildProductionDeps now succeeds (nil error) even without a registry.
 func TestBuildProductionDeps_ConfigDir_BYREIS_CONFIG_Honored(t *testing.T) {
 	customDir := t.TempDir()
 	t.Setenv("BYREIS_CONFIG", customDir)
@@ -109,19 +128,16 @@ func TestBuildProductionDeps_ConfigDir_BYREIS_CONFIG_Honored(t *testing.T) {
 	t.Setenv("GITHUB_TOKEN", "")
 	t.Setenv("BYREIS_KEY_FILE", noKeychainKeyFile)
 
-	// BuildProductionDeps will return an error (no registry wired), but the
-	// BYREIS_CONFIG override must have been consumed before that error fires.
-	// We cannot inspect ConfigDir on an errored call, but we can confirm the
-	// call does not panic and returns a non-nil error (not a nil-dep panic).
 	deps, err := app.BuildProductionDeps(context.Background())
-	if err == nil {
-		// If deps are unexpectedly returned, verify ConfigDir.
-		if deps != nil && deps.ConfigDir != customDir {
-			t.Errorf("ConfigDir = %q, want %q", deps.ConfigDir, customDir)
-		}
+	if err != nil {
+		t.Fatalf("BuildProductionDeps must succeed in unconfigured environment: %v", err)
 	}
-	// Either outcome (deps with correct ConfigDir, or error) is acceptable.
-	// What is NOT acceptable is a panic.
+	if deps == nil {
+		t.Fatal("BuildProductionDeps returned nil deps")
+	}
+	if deps.ConfigDir != customDir {
+		t.Errorf("ConfigDir = %q, want %q", deps.ConfigDir, customDir)
+	}
 }
 
 // TestBuildProductionDeps_ContextCancelled_NoPanic verifies that a
@@ -141,10 +157,11 @@ func TestBuildProductionDeps_ContextCancelled_NoPanic(t *testing.T) {
 	_, _ = app.BuildProductionDeps(ctx)
 }
 
-// TestBuildProductionDeps_ErrorWrapped verifies that the error returned by
-// BuildProductionDeps is non-nil (not swallowed) and contains an actionable
-// diagnostic message suitable for the CLI to surface.
-func TestBuildProductionDeps_ErrorWrapped(t *testing.T) {
+// TestBuildProductionDeps_UnconfiguredSucceedsWithNilUseCases verifies that
+// BuildProductionDeps returns non-nil deps (nil error) even when no env is set.
+// Individual use-cases are nil; each command's RunE surfaces its own actionable
+// "not configured" message, preserving the fail-closed posture at command time.
+func TestBuildProductionDeps_UnconfiguredSucceedsWithNilUseCases(t *testing.T) {
 	t.Setenv("BYREIS_REGISTRY", "")
 	t.Setenv("BYREIS_PROJECT", "")
 	t.Setenv("BYREIS_GITHUB_TOKEN", "")
@@ -152,11 +169,19 @@ func TestBuildProductionDeps_ErrorWrapped(t *testing.T) {
 	t.Setenv("BYREIS_CONFIG", t.TempDir())
 	t.Setenv("BYREIS_KEY_FILE", noKeychainKeyFile)
 
-	_, err := app.BuildProductionDeps(context.Background())
-	if err == nil {
-		t.Fatal("expected error when required ports are not configured")
+	deps, err := app.BuildProductionDeps(context.Background())
+	if err != nil {
+		t.Fatalf("BuildProductionDeps must succeed in unconfigured environment: %v", err)
 	}
-	if len(err.Error()) < 10 {
-		t.Errorf("error message too short to be actionable: %q", err.Error())
+	if deps == nil {
+		t.Fatal("BuildProductionDeps must return non-nil deps in unconfigured environment")
+	}
+	// Read-path use-cases are nil — commands will surface "not configured" at
+	// command time. This is the intentional fail-closed-at-command-time posture.
+	if deps.Getter != nil {
+		t.Error("Getter must be nil in an unconfigured environment")
+	}
+	if deps.Merger != nil {
+		t.Error("Merger must be nil in an unconfigured environment")
 	}
 }

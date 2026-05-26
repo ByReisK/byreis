@@ -995,3 +995,26 @@ var _ cli.RotatePreFlightReader = (*fakePreFlight)(nil)
 
 // Compile-time: time package used for fakeClock (avoids "imported and not used").
 var _ = time.Now
+
+// TestRotate_AdminNilRotatorFailsClosed is the fail-closed regression test for
+// the first-run UX contract change (v0.5.1). After BuildProductionDeps was made
+// tolerant of an unconfigured environment, read/write use-cases can be nil at
+// command time. The `rotate` verb dereferences deps.Rotator directly; an ADMIN
+// operator whose write-side dependency is unwired (nil Rotator) must get an
+// actionable "not available" error with a non-zero exit code — never a nil-deref
+// panic and never a silent no-op. This mirrors TestFirstRunUX_FailClosed_Get*.
+func TestRotate_AdminNilRotatorFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	// ADMIN mode (so the policy gate passes) but Rotator is nil (write-path
+	// unwired). The guard must fire before any pre-flight or Rotate call.
+	deps := makeRotateDeps(mode.ModeAdmin, nil)
+
+	_, _, err := runRotateCmd(deps, []string{"rotate", "--project", "test-proj", "--dry-run"}, "")
+	if err == nil {
+		t.Fatal("rotate with a nil Rotator must fail closed; got nil error (silent success/no-op or panic averted into success)")
+	}
+	if code := cli.ExitCodeOf(err); code == 0 {
+		t.Errorf("rotate with a nil Rotator must return a non-zero exit code; got 0")
+	}
+}

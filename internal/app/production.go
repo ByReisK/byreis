@@ -68,6 +68,16 @@ import (
 func BuildProductionDeps(ctx context.Context) (*cli.Deps, error) {
 	configDir := configDirFromEnvProd()
 
+	// anyConfigured is true when at least one environment variable that points
+	// at external infrastructure is set. Startup warnings about unavailable
+	// adapters are only emitted when some configuration is present — a
+	// completely unconfigured environment (first run, --help, version, completion)
+	// prints nothing; errors surface at command time.
+	anyConfigured := os.Getenv("BYREIS_REGISTRY") != "" ||
+		os.Getenv("BYREIS_PROJECT_REPO") != "" ||
+		os.Getenv("BYREIS_KEY") != "" ||
+		os.Getenv("BYREIS_KEY_FILE") != ""
+
 	// Build the codec first: it has no external dependencies and is needed by
 	// both the bridge (mode detection) and the read-path use-cases.
 	codec := artifactcodec.NewPortAdapter(artifactcodec.New())
@@ -197,30 +207,46 @@ func BuildProductionDeps(ctx context.Context) (*cli.Deps, error) {
 		counter = &prodRegistryCounterStoreBridge{client: regClient}
 	}
 
-	getter, decryptor, editorUC, buildErr := BuildReadPathDeps(
-		forSource,      // FileOfRecordSource
-		codec,          // ArtifactCodec: real YAML codec
-		decrypt.New(),  // decrypt.Decryptor: real age decryptor
-		idLoader,       // identity.Loader: keychain/file/env loader
-		verify.New(),   // verify.VerifierOfRecord: pure crypto
-		recips,         // RecipientSource: registry-backed wrapper
-		counter,        // CounterStore: registry client
-		gate,           // ModeGate: real policy gate
-		encrypt.New(),  // encrypt.Encryptor: pure age encryptor
-		manifestSigner, // usecase.ManifestSigner: Ed25519 signer (nil if unavailable)
-		atomicWriter,   // usecase.AtomicFileWriter: repo-rooted atomic writer
-		editorAdapter,  // usecase.Editor: $EDITOR adapter (or sentinel)
-	)
-
-	if buildErr != nil {
-		return nil, fmt.Errorf(
-			"byreis: unexpected failure constructing read-path use-cases "+
-				"(this is a programming error at the composition root, not a missing "+
-				"adapter): %w", buildErr)
+	// Build the read-path use-cases only when the required base ports are
+	// available. When any required port is nil (e.g. registry not configured,
+	// project repo not set) the use-cases are left nil and each command's RunE
+	// surfaces a "not configured" message — the fail-closed posture is unchanged.
+	//
+	// BuildReadPathDeps is only called when every base port is non-nil so that
+	// the "nil ports" sentinel in BuildReadPathDeps is never reached in normal
+	// operation. A non-nil error from BuildReadPathDeps with non-nil ports is a
+	// genuine programming error at the composition root and is still fatal.
+	var getter usecase.Getter
+	var decryptor usecase.DecryptUseCase
+	var editorUC usecase.EditUseCase
+	if forSource != nil && recips != nil && counter != nil {
+		var buildErr error
+		getter, decryptor, editorUC, buildErr = BuildReadPathDeps(
+			forSource,      // FileOfRecordSource
+			codec,          // ArtifactCodec: real YAML codec
+			decrypt.New(),  // decrypt.Decryptor: real age decryptor
+			idLoader,       // identity.Loader: keychain/file/env loader
+			verify.New(),   // verify.VerifierOfRecord: pure crypto
+			recips,         // RecipientSource: registry-backed wrapper
+			counter,        // CounterStore: registry client
+			gate,           // ModeGate: real policy gate
+			encrypt.New(),  // encrypt.Encryptor: pure age encryptor
+			manifestSigner, // usecase.ManifestSigner: Ed25519 signer (nil if unavailable)
+			atomicWriter,   // usecase.AtomicFileWriter: repo-rooted atomic writer
+			editorAdapter,  // usecase.Editor: $EDITOR adapter (or sentinel)
+		)
+		if buildErr != nil {
+			return nil, fmt.Errorf(
+				"byreis: unexpected failure constructing read-path use-cases "+
+					"(this is a programming error at the composition root, not a missing "+
+					"adapter): %w", buildErr)
+		}
 	}
 
-	for _, w := range constructionWarnings {
-		fmt.Fprintf(os.Stderr, "byreis: warning: %s\n", w)
+	if anyConfigured {
+		for _, w := range constructionWarnings {
+			fmt.Fprintf(os.Stderr, "byreis: warning: %s\n", w)
+		}
 	}
 
 	// Build the Merger use-case (admin merge path). When any required port is
@@ -295,14 +321,14 @@ func BuildProductionDeps(ctx context.Context) (*cli.Deps, error) {
 		ghClient := ghClientProd(token)
 		if pr, prErr := gitadapter.NewProjectSubmissionsReader(ghClient, gitProjectSlug); prErr == nil {
 			projectSubmissionsReader = pr
-		} else {
+		} else if anyConfigured {
 			fmt.Fprintf(os.Stderr,
 				"byreis: warning: submission queue reader unavailable: %v\n", prErr)
 		}
 	}
 
 	gitProvider, gpErr := buildGitProviderProd(token, gitProjectSlug, baseBranch)
-	if gpErr != nil {
+	if gpErr != nil && anyConfigured {
 		fmt.Fprintf(os.Stderr, "byreis: warning: git provider unavailable: %v\n", gpErr)
 	}
 
@@ -327,15 +353,23 @@ func BuildProductionDeps(ctx context.Context) (*cli.Deps, error) {
 	// these independently in each builder is the maintenance hazard eliminated
 	// by this single construction site.
 	submitShared, submitSharedErr := buildSubmitSharedDepsProd(forSource, codec, cacheDirProd())
-	if submitSharedErr != nil {
+	if submitSharedErr != nil && anyConfigured {
 		fmt.Fprintf(os.Stderr, "byreis: warning: submit shared deps unavailable: %v\n", submitSharedErr)
+	}
+	if forSource == nil && anyConfigured {
+		// File-of-record source is not configured: the key-existence probe
+		// cannot distinguish ADD from REPLACE, so every submission is treated
+		// as a new key. Emitted only when the operator has started configuring
+		// an environment (suppressed for bare first-run / help / version invocations).
+		fmt.Fprintln(os.Stderr, "byreis: warning: file-of-record source not configured; "+
+			"submit cannot detect existing keys (all submissions treated as new)")
 	}
 
 	// Build the Submitter use-case (all modes).
 	submitter, submitGitPort, subErr := buildSubmitterProd(
 		wrapper, gitProvider, codec, submitShared,
 	)
-	if subErr != nil {
+	if subErr != nil && anyConfigured {
 		fmt.Fprintf(os.Stderr, "byreis: warning: submit use-case unavailable: %v\n", subErr)
 	}
 
@@ -2470,11 +2504,8 @@ func buildSubmitSharedDepsProd(
 	} else {
 		// File-of-record source is not configured: the key-existence probe
 		// cannot distinguish ADD from REPLACE, so every submission is treated
-		// as a new key. Operators who see unexpected ADD actions when they
-		// expected REPLACE should verify that the file-of-record source is
-		// wired in their registry configuration.
-		fmt.Fprintln(os.Stderr, "byreis: warning: file-of-record source not configured; "+
-			"submit cannot detect existing keys (all submissions treated as new)")
+		// as a new key. The caller emits the diagnostic only when the operator
+		// has started configuring an environment (suppressed for bare first-run).
 		keyProbe = &prodNoopKeyProbe{}
 	}
 

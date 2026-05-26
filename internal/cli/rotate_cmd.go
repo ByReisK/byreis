@@ -79,6 +79,23 @@ immediately before Phase-1 starts.`,
 				return pErr
 			}
 
+			// Rotator must be wired before any pre-flight, --from-request fetch,
+			// or plan computation. The Rotator can be nil even in ADMIN mode when
+			// a required write-side dependency is unavailable (no registry-write
+			// token, no attested signing key, BYREIS_PROJECT_REPO unset, or the
+			// SourceVerified admin set could not be fetched). Fail closed here so
+			// the command never dereferences a nil Rotator (panic) nor runs the
+			// pre-flight decrypt/network work it could never complete.
+			if deps.Rotator == nil {
+				err := fmt.Errorf(
+					"rotate not available: the rotation write-path is not wired — " +
+						"set BYREIS_PROJECT_REPO and the registry-write/signing credential, " +
+						"then run `byreis doctor` to verify your admin mode")
+				r.PrintErrorClass("general-error", err.Error(),
+					"run `byreis doctor` to verify your admin mode and registry-write credential")
+				return &exitError{code: render.ExitGeneralError, cause: err}
+			}
+
 			// --from-request: absorb a contributor's request-access PR.
 			var fromRequestMeta *rotate.FromRequestPRMeta
 			if fromRequest != "" {
