@@ -42,6 +42,31 @@ type SubmissionQueueSource interface {
 	ListSubmissionsBounded(ctx context.Context) ([]rotate.OpenRequestSummary, bool, error)
 }
 
+// Clock is the injected time source used to render the AGE column. It is
+// defined here in the tui package (consumer-defined, per the Clean Architecture
+// dependency rule) so the renderer never reads a real clock directly and the
+// rendered age is deterministic under test. It mirrors the core use-case Clock
+// shape (Now() time.Time) so the composition root can wire the same instance.
+type Clock interface {
+	Now() time.Time
+}
+
+// realClock is the production Clock used when Deps.Clock is left nil. It reads
+// the wall clock; it is never used in unit tests, which inject a fixed Clock.
+type realClock struct{}
+
+func (realClock) Now() time.Time { return time.Now() }
+
+// now returns the current time from the injected clock, falling back to the
+// real wall clock when no Clock was wired. The fallback keeps existing
+// composition roots working unchanged while tests inject a deterministic clock.
+func (m reviewModel) now() time.Time {
+	if m.deps.Clock != nil {
+		return m.deps.Clock.Now()
+	}
+	return realClock{}.Now()
+}
+
 // ─── messages ────────────────────────────────────────────────────────────────
 
 // queueSubmissionsLoadedMsg is delivered when ListSubmissionsBounded completes.
@@ -201,7 +226,7 @@ func (m reviewModel) viewSubmissionQueue() string {
 		sb.WriteString(strings.Repeat("-", 118))
 		sb.WriteString("\n")
 
-		now := time.Now()
+		now := m.now()
 		for i, s := range m.submissionSummaries {
 			prStr := fmt.Sprintf("%s#%d", s.PRRef.Project, s.PRRef.Number)
 			// Key/action columns are derived from the PR title by convention. The

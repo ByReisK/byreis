@@ -124,6 +124,13 @@ type Deps struct {
 	// package symbol is added: the return type rotate.OpenRequestSummary is
 	// the existing shared DTO already used by the access-request queue.
 	SubmissionQueueSource SubmissionQueueSource
+
+	// Clock is the injected time source for the submission-queue AGE column.
+	// It is the same instance the composition root wires into the core use-cases
+	// (Now() time.Time). When nil the renderer falls back to the real wall clock,
+	// so existing composition roots are unaffected; unit tests inject a fixed
+	// clock so the rendered age is deterministic.
+	Clock Clock
 }
 
 // Run launches the interactive TUI program for non-submit verbs (review queue,
