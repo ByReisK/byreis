@@ -274,6 +274,22 @@ func BuildProductionDeps(ctx context.Context) (*cli.Deps, error) {
 	baseBranch := baseBranchFromEnvProd()
 	token := githubTokenProd()
 
+	// Build the ProjectSubmissionsReader for the TUI submission queue (ADMIN-only).
+	// It lists open submission PRs on the project secrets repo and is threaded
+	// into the review TUI via buildRunTUIReviewProd. When the mode is not admin,
+	// or the project-repo slug or GitHub token are unavailable, it is nil and the
+	// review TUI falls back to the v0.3 access-request queue screen.
+	var projectSubmissionsReader tui.SubmissionQueueSource
+	if (currentMode == mode.ModeAdmin || currentMode == mode.ModeSuper) && gitProjectSlug != "" && token != "" {
+		ghClient := ghClientProd(token)
+		if pr, prErr := gitadapter.NewProjectSubmissionsReader(ghClient, gitProjectSlug); prErr == nil {
+			projectSubmissionsReader = pr
+		} else {
+			fmt.Fprintf(os.Stderr,
+				"byreis: warning: submission queue reader unavailable: %v\n", prErr)
+		}
+	}
+
 	gitProvider, gpErr := buildGitProviderProd(token, gitProjectSlug, baseBranch)
 	if gpErr != nil {
 		fmt.Fprintf(os.Stderr, "byreis: warning: git provider unavailable: %v\n", gpErr)
@@ -345,8 +361,11 @@ func BuildProductionDeps(ctx context.Context) (*cli.Deps, error) {
 	// internal/cli stays free of any internal/tui import (cli↛tui boundary).
 	// Review is only available in ADMIN mode; a nil reviewer means the TUI
 	// review path is not wired (the cli surfaces "not configured" at command time).
+	// projectSubmissionsReader is threaded in so the TUI can open on the
+	// submission queue screen when it is available (nil is safe: falls back to
+	// the v0.3 access-request queue).
 	runTUIReview := buildRunTUIReviewProd(
-		pol, currentMode, reviewer, merger, requestAccessReader,
+		pol, currentMode, reviewer, merger, requestAccessReader, projectSubmissionsReader,
 	)
 
 	return &cli.Deps{
@@ -2508,15 +2527,15 @@ func buildRunTUISubmitProd(
 // When reviewer is nil (e.g. contributor mode or adapters unavailable), the
 // function returns nil so the CLI falls through to the headless "not configured"
 // error path at command time. When reviewer is non-nil, the closure is wired
-// with the Reviewer, Merger, and RequestAccessReader ports from the production
-// deps. Merger is optional: when nil, the in-TUI approve action is disabled
-// (the detail screen renders without the 'a' hint).
+// with the Reviewer, Merger, RequestAccessReader, and SubmissionQueueSource
+// ports. Merger and submissionQueueSource are optional (nil is safe).
 func buildRunTUIReviewProd(
 	pol *mode.Policy,
 	currentMode mode.Mode,
 	reviewer usecase.Reviewer,
 	merger usecase.Merger,
 	requestAccessReader rotate.RequestAccessReader,
+	submissionQueueSource tui.SubmissionQueueSource,
 ) func(ctx context.Context, out interface{ Write([]byte) (int, error) }, prRef string) error {
 	if reviewer == nil {
 		// No reviewer: TUI review path is not available in this mode / configuration.
@@ -2531,11 +2550,12 @@ func buildRunTUIReviewProd(
 			w = os.Stdout
 		}
 		return tui.RunReview(ctx, tui.Deps{
-			Reviewer:            reviewer,
-			Merger:              merger,
-			RequestAccessReader: requestAccessReader,
-			Policy:              pol,
-			CurrentMode:         currentMode,
+			Reviewer:              reviewer,
+			Merger:                merger,
+			RequestAccessReader:   requestAccessReader,
+			SubmissionQueueSource: submissionQueueSource,
+			Policy:                pol,
+			CurrentMode:           currentMode,
 		}, w, prRef)
 	}
 }

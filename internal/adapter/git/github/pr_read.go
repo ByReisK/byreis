@@ -305,6 +305,163 @@ func (r *RequestAccessReader) ListOpenRequests(
 	return summaries, err
 }
 
+// ─── project-repo submission reader ─────────────────────────────────────────
+
+// submissionBranchPrefixes is the set of head-branch prefixes that identify
+// a PR as a byreis submission. These are the same prefixes used by the submit
+// use-case when naming submission branches (byreis/add-*, byreis/replace-*,
+// byreis/bulk-*). A PR whose head branch matches any of these prefixes is a
+// submission PR; all other PRs (access-request branches, feature branches,
+// etc.) are excluded.
+var submissionBranchPrefixes = []string{
+	"byreis/add-",
+	"byreis/replace-",
+	"byreis/bulk-",
+}
+
+// isSubmissionBranch returns true when the given branch name starts with one of
+// the submission branch prefixes.
+func isSubmissionBranch(branch string) bool {
+	for _, prefix := range submissionBranchPrefixes {
+		if strings.HasPrefix(branch, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// ProjectSubmissionsReader lists open submission PRs on the project secrets
+// repository. It is the project-repo counterpart of RequestAccessReader (which
+// reads the registry repo). The two types are intentionally separate: they are
+// bound to different repos, carry different scopes, and never share a client
+// instance at the composition root.
+//
+// Closed-world boundary: this type exposes ONLY read methods. No write methods
+// (CreateFile, CreateRef, CloseWithComment) are present.
+type ProjectSubmissionsReader struct {
+	client *ghsdk.Client
+	owner  string
+	repo   string
+}
+
+// NewProjectSubmissionsReader constructs a ProjectSubmissionsReader bound to
+// the given project secrets repository. projectRepo must be "owner/repo".
+// Returns an error when the client is nil or the project string is malformed.
+func NewProjectSubmissionsReader(client *ghsdk.Client, projectRepo string) (*ProjectSubmissionsReader, error) {
+	if client == nil {
+		return nil, fmt.Errorf(
+			"NewProjectSubmissionsReader: github client must not be nil")
+	}
+	parts := strings.SplitN(projectRepo, "/", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return nil, fmt.Errorf(
+			"%w: NewProjectSubmissionsReader: project repo %q is not in owner/repo form",
+			coregit.ErrInvalidProject, projectRepo)
+	}
+	if strings.Contains(parts[1], "/") {
+		return nil, fmt.Errorf(
+			"%w: NewProjectSubmissionsReader: project repo part %q must not contain '/'",
+			coregit.ErrInvalidProject, projectRepo)
+	}
+	return &ProjectSubmissionsReader{
+		client: client,
+		owner:  parts[0],
+		repo:   parts[1],
+	}, nil
+}
+
+// ListSubmissionsBounded lists open submission PRs on the project repo,
+// filtering to head branches that match the byreis submission prefix set
+// (byreis/add-*, byreis/replace-*, byreis/bulk-*). It mirrors
+// ListOpenRequestsBounded in shape: at most maxOpenRequestPages pages are
+// walked, at most maxOpenRequestSummaries summaries are returned, and when
+// either bound is reached before all pages are consumed, truncated is set to
+// true so the caller MUST surface a visible truncation affordance.
+//
+// An empty result with truncated=false is the valid "no pending submissions"
+// outcome. All context cancellations and deadlines are honored.
+//
+// SDK types are mapped to the existing rotate.OpenRequestSummary domain type at
+// the boundary; no SDK field leaks into the returned slice.
+func (r *ProjectSubmissionsReader) ListSubmissionsBounded(
+	ctx context.Context,
+) (summaries []rotate.OpenRequestSummary, truncated bool, err error) {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, false, fmt.Errorf("ListSubmissionsBounded cancelled: %w", ctxErr)
+	}
+
+	var out []rotate.OpenRequestSummary
+	opts := &ghsdk.PullRequestListOptions{
+		State:       "open",
+		ListOptions: ghsdk.ListOptions{PerPage: 100},
+	}
+	for page := 0; ; page++ {
+		if page >= maxOpenRequestPages {
+			return out, true, nil
+		}
+
+		prs, resp, listErr := r.client.PullRequests.List(ctx, r.owner, r.repo, opts)
+		if listErr != nil {
+			return nil, false, r.wrapReadErr("ListSubmissionsBounded/List", listErr)
+		}
+		for _, pr := range prs {
+			branchName := pr.GetHead().GetRef()
+			if !isSubmissionBranch(branchName) {
+				continue
+			}
+			if len(out) >= maxOpenRequestSummaries {
+				return out, true, nil
+			}
+			var authorLogin string
+			if pr.GetUser() != nil {
+				authorLogin = strings.ToLower(pr.GetUser().GetLogin())
+			}
+			out = append(out, rotate.OpenRequestSummary{
+				PRRef: coregit.PRRef{
+					Project: r.owner + "/" + r.repo,
+					Number:  pr.GetNumber(),
+				},
+				AuthorLogin: authorLogin,
+				Title:       pr.GetTitle(),
+				CreatedAt:   pr.GetCreatedAt().Format(time.RFC3339),
+				HeadSHA:     pr.GetHead().GetSHA(),
+			})
+		}
+		if resp == nil || resp.NextPage == 0 {
+			break
+		}
+		opts.Page = resp.NextPage
+	}
+	return out, false, nil
+}
+
+// wrapReadErr maps GitHub API errors to domain errors with actionable hints for
+// the project-repo reader. This is the project-repo counterpart of
+// RequestAccessReader.wrapReadErr; both use the same error-hint vocabulary.
+func (r *ProjectSubmissionsReader) wrapReadErr(op string, err error) error {
+	if err == nil {
+		return nil
+	}
+	var ghErr *ghsdk.ErrorResponse
+	if isErrorResponse(err, &ghErr) {
+		switch ghErr.Response.StatusCode {
+		case http.StatusUnauthorized:
+			return fmt.Errorf(
+				"GitHub auth expired for %s/%s — run `byreis auth login` to re-authenticate: %w",
+				r.owner, r.repo, err)
+		case http.StatusForbidden:
+			return fmt.Errorf(
+				"GitHub access denied for %s/%s — check repo permissions and run `byreis auth login` if expired: %w",
+				r.owner, r.repo, err)
+		case http.StatusNotFound:
+			return fmt.Errorf(
+				"GitHub resource not found in %s/%s — check the PR number and project name: %w",
+				r.owner, r.repo, err)
+		}
+	}
+	return fmt.Errorf("GitHub API error in %q for %s/%s: %w", op, r.owner, r.repo, err)
+}
+
 // ─── internal helpers ────────────────────────────────────────────────────────
 
 // listPRFiles returns the file paths changed in the given PR (filenames only,

@@ -105,6 +105,19 @@ type Deps struct {
 	// the same adapter deps as the CLI's Submitter; only the Prompter differs.
 	// When nil the TUI submit screen returns an error (adapters not configured).
 	SubmitterFactory SubmitterFactory
+
+	// SubmissionQueueSource is the narrow read-only port that lists open
+	// submission PRs on the project repo. When non-nil the review TUI opens
+	// on the submission queue screen (screenSubmissionQueue); when nil it falls
+	// back to the v0.3 access-request queue screen. The source is constructed
+	// at the composition root from BYREIS_PROJECT_REPO and the GitHub token;
+	// it is nil in contributor mode or when project-repo config is absent.
+	//
+	// This is an adapter-layer interface defined here in the tui package
+	// (consumer-defined per the Clean Architecture dependency rule). No core
+	// package symbol is added: the return type rotate.OpenRequestSummary is
+	// the existing shared DTO already used by the access-request queue.
+	SubmissionQueueSource SubmissionQueueSource
 }
 
 // Run launches the interactive TUI program for non-submit verbs (review queue,

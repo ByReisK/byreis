@@ -127,8 +127,8 @@ type mergeErrMsg struct {
 }
 
 // reviewModel is the bubbletea model for the admin review TUI. It manages the
-// triage queue (screen 1) and the submission detail (screen 2), connected by a
-// free-text PR ref entry form.
+// access-request triage queue (v0.3, preserved), the submission-PR queue (v0.4
+// augmentation), and the submission detail flow connected by the ref-entry form.
 //
 // Design constraints:
 //   - reviewDetail has NO Plaintext field. The review call site copies only
@@ -139,20 +139,36 @@ type mergeErrMsg struct {
 //   - All contributor-authored strings are sanitized via render.SanitizeForTerminal
 //     before rendering. Justification is additionally collapsed via collapseLineBreaks.
 //   - The mode gate is enforced in RunReview before constructing this model.
+//   - The access-request queue (screenQueue) and the submission queue
+//     (screenSubmissionQueue) are SEPARATE screens with separate state. The v0.3
+//     access-request behavior is fully preserved; the v0.4 submission queue
+//     augments it on a distinct screen.
 type reviewModel struct {
 	ctx  context.Context
 	deps Deps
 
 	screen reviewScreen
 
-	// Queue state.
+	// Access-request queue state (screenQueue — v0.3 preserved).
 	summaries []rotate.OpenRequestSummary
 	truncated bool
 	queueErr  error
-	// selectedIdx is the index of the currently highlighted queue row.
+	// selectedIdx is the index of the currently highlighted access-request row.
 	selectedIdx int
-	// selectedRef is the PRRef of the highlighted queue entry (display only).
+	// selectedRef is the PRRef of the highlighted access-request entry (display only).
 	selectedRef string
+
+	// Submission-queue state (screenSubmissionQueue — v0.4 augmentation).
+	// These fields are entirely separate from the access-request queue fields so
+	// the two screens do not share mutable state.
+	submissionSummaries   []rotate.OpenRequestSummary
+	submissionTruncated   bool
+	submissionQueueErr    error
+	submissionSelectedIdx int
+	// enteredFromSubmissionQueue records that the current review/detail/error
+	// flow was initiated from the submission queue. When true, the 'r' shortcut
+	// returns to screenSubmissionQueue instead of opening the ref-entry form.
+	enteredFromSubmissionQueue bool
 
 	// Ref-entry form for the detail screen.
 	refForm    *huh.Form
@@ -174,28 +190,38 @@ type reviewModel struct {
 }
 
 // newReviewModel constructs the review model. prRef, when non-empty, causes the
-// model to skip the queue entirely and jump directly to ref-entry (or even
-// directly to review if a fully-specified ref is supplied). For the typical TUI
-// launch (bare `review` at a TTY), prRef is empty and the queue loads first.
+// model to skip both queues entirely and jump directly to reviewing the named
+// submission. For the typical TUI launch (bare `review` at a TTY without --pr),
+// prRef is empty.
+//
+// Screen selection when prRef is empty:
+//   - If a SubmissionQueueSource is configured in deps, start on the submission
+//     queue (screenSubmissionQueue) — the v0.4 headline screen.
+//   - Otherwise fall back to the access-request triage queue (screenQueue) to
+//     preserve the v0.3 behavior for unconfigured submission sources.
 func newReviewModel(ctx context.Context, deps Deps, prRef string) reviewModel {
 	m := reviewModel{
 		ctx:  ctx,
 		deps: deps,
 	}
 	if prRef != "" {
-		// A ref was pre-supplied (e.g. a future `review --pr <ref>` at a TTY).
-		// Seed the binding and jump directly to reviewing.
 		m.refBinding = prRef
 		m.screen = screenReviewing
+	} else if deps.SubmissionQueueSource != nil {
+		m.screen = screenSubmissionQueue
 	} else {
 		m.screen = screenQueue
 	}
 	return m
 }
 
-// Init starts the queue load (or the review if a pre-supplied ref is available).
+// Init starts the appropriate initial command based on the opening screen.
+// For screenSubmissionQueue it loads the submission list; for screenQueue it
+// loads the access-request list; for screenReviewing it starts the Review call.
 func (m reviewModel) Init() tea.Cmd {
 	switch m.screen {
+	case screenSubmissionQueue:
+		return m.loadSubmissionQueue()
 	case screenQueue:
 		return m.loadQueue()
 	case screenReviewing:
@@ -335,6 +361,9 @@ func parseReviewRef(prRef string) (git.PRRef, error) {
 func (m reviewModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch m.screen {
 
+	case screenSubmissionQueue:
+		return m.updateSubmissionQueue(msg)
+
 	case screenQueue:
 		return m.updateQueue(msg)
 
@@ -397,6 +426,13 @@ func (m reviewModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.detailOK = false
 				m.errMsg = ""
 				m.refBinding = ""
+				// Return to the submission queue when the error was triggered from
+				// there; otherwise fall back to the ref-entry form.
+				if m.enteredFromSubmissionQueue {
+					m.enteredFromSubmissionQueue = false
+					m.screen = screenSubmissionQueue
+					return m, m.loadSubmissionQueue()
+				}
 				m.refForm = buildRefForm(&m.refBinding)
 				m.screen = screenRefEntry
 				return m, m.refForm.Init()
@@ -484,6 +520,15 @@ func (m reviewModel) updateQueue(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.refForm = buildRefForm(&m.refBinding)
 			m.screen = screenRefEntry
 			return m, m.refForm.Init()
+
+		case "s":
+			// 's' switches to the submission queue screen. Trigger a load if the
+			// submission summaries have not been loaded yet this session.
+			m.screen = screenSubmissionQueue
+			if m.submissionSummaries == nil && m.submissionQueueErr == nil {
+				return m, m.loadSubmissionQueue()
+			}
+			return m, nil
 
 		case "enter":
 			// Enter on a queue row surfaces the ref and a next-step hint.
@@ -598,6 +643,8 @@ func (m reviewModel) doApprove() tea.Cmd {
 // View renders the current review model state.
 func (m reviewModel) View() string {
 	switch m.screen {
+	case screenSubmissionQueue:
+		return m.viewSubmissionQueue()
 	case screenQueue:
 		return m.viewQueue()
 	case screenRefEntry:
@@ -649,7 +696,8 @@ func (m reviewModel) viewQueue() string {
 	sb.WriteString(label)
 	sb.WriteString("\n")
 	sb.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("240")).
-		Render("These are contributor access-request PRs. To review a submission, press r."))
+		Render("Contributor access-request PRs. Press r to review a submission directly.  " +
+			"Press s to switch to the submission queue screen."))
 	sb.WriteString("\n\n")
 
 	if m.queueErr != nil {
@@ -704,7 +752,7 @@ func (m reviewModel) viewQueue() string {
 
 	sb.WriteString("\n")
 	sb.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("240")).
-		Render("↑/↓ navigate  •  Enter select  •  r review a submission  •  q / Esc quit"))
+		Render("↑/↓ navigate  •  Enter select  •  r review a submission  •  s submissions  •  q / Esc quit"))
 	sb.WriteString("\n")
 
 	return sb.String()
