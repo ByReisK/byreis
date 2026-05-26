@@ -49,7 +49,16 @@ jobs:
           cache: true
       - name: Run docgate suite (forward-secrecy warning + release-wiring)
         # Non-skippable. A red result means the build does not ship.
-        run: go test -v -race -tags docgate -timeout=120s ./internal/core/usecase/rotate/
+        # Both packages are run UNFILTERED (no -run flag) so every current and
+        # future docgate-tagged test in either package auto-gates without
+        # requiring a workflow edit:
+        # (a) rotate leg: forward-secrecy warning verbatim and release-wiring
+        #     integrity (the wiring assertion itself verifies this job stays in
+        #     the release needs array).
+        # (b) CLI leg: request-access honesty contract, admin-warning verbatim
+        #     emission, rotate CLI emission, and doctor rotation-history verbatim
+        #     fixture tests.
+        run: go test -v -race -tags docgate -timeout=120s ./internal/core/usecase/rotate/ ./internal/cli/
 
   release:
     name: Release

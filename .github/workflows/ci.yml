@@ -173,12 +173,15 @@ jobs:
       - name: Run docgate suite (verbatim forward-secrecy warning + release-wiring integrity)
         # This job is non-skippable on CI; the matching release-pipeline job in
         # release.yml is the release-blocking half (needs both shipgate and
-        # docgate). Verifies (a) the production rotate.ForwardSecrecyWarning
-        # constant matches the canonical verbatim warning block byte-for-byte,
-        # and (b) the release workflow's needs list still carries BOTH the
-        # shipgate AND docgate legs so the docgate gate cannot be silently
-        # dropped.
-        run: go test -v -race -tags docgate -timeout=120s ./internal/core/usecase/rotate/
+        # docgate). Both packages are run UNFILTERED (no -run flag) so every
+        # current and future docgate-tagged test in either package auto-gates
+        # without requiring a workflow edit:
+        # (a) rotate leg: forward-secrecy warning verbatim, release-wiring
+        #     integrity, and positioning-honesty release-notes rings.
+        # (b) CLI leg: request-access honesty contract, admin-warning verbatim
+        #     emission, rotate CLI emission, and doctor rotation-history verbatim
+        #     fixture tests.
+        run: go test -v -race -tags docgate -timeout=120s ./internal/core/usecase/rotate/ ./internal/cli/
 
   tui-core-ceiling:
     name: TUI Core Ceiling (zero-new-core gate)
