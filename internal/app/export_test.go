@@ -109,3 +109,10 @@ func BuildSubmitSharedDepsProdForTest(
 		Clock:       sd.clock,
 	}, nil
 }
+
+// BuildModeDowngradeWarningForTest exposes buildModeDowngradeWarning so that
+// app_test package tests can drive the helper directly without relying on
+// full production wiring.
+var BuildModeDowngradeWarningForTest = func(detResult mode.Result, detErr error) string {
+	return buildModeDowngradeWarning(detResult, detErr)
+}

@@ -4,6 +4,8 @@
 package cli
 
 import (
+	"fmt"
+
 	"github.com/spf13/cobra"
 
 	"github.com/ByReisK/byreis/internal/cli/render"
@@ -33,6 +35,32 @@ without ever being able to read them. Admins hold private keys; contributors
 hold only public keys.`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
+		// PersistentPreRunE fires once before any real subcommand's RunE. It
+		// emits the mode-downgrade warning when a private key is present but
+		// failed to grant admin (bad permissions or unregistered key). Meta-
+		// commands (version, completion and its sub-shells, help) are explicitly
+		// excluded so they stay clean regardless of the key configuration on the
+		// host. The check uses CommandPath to catch `completion bash` (whose
+		// cmd.Name() is "bash", not "completion").
+		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
+			if deps.ModeDowngradeWarning == "" {
+				return nil
+			}
+			name := cmd.Name()
+			switch name {
+			case "version", "help":
+				return nil
+			}
+			// Exclude the completion tree: `byreis completion`, `byreis completion bash`, etc.
+			if cmd.Parent() != nil && cmd.Parent().Name() == "completion" {
+				return nil
+			}
+			if name == "completion" {
+				return nil
+			}
+			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "byreis: warning: %s\n", deps.ModeDowngradeWarning)
+			return nil
+		},
 	}
 
 	root.PersistentFlags().BoolVar(&jsonFlag, "json", false, "emit machine-readable JSON output")

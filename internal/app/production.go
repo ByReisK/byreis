@@ -110,13 +110,22 @@ func BuildProductionDeps(ctx context.Context) (*cli.Deps, error) {
 	det := realDetectorProd(configDir, probeBridge)
 	pol := &mode.Policy{}
 
-	detResult, err := det.Detect(ctx, projectIDFromEnvProd())
+	detResult, detErr := det.Detect(ctx, projectIDFromEnvProd())
 	var currentMode mode.Mode
-	if err != nil {
+	if detErr != nil {
 		currentMode = mode.ModeContributor
 	} else {
 		currentMode = detResult.Mode
 	}
+
+	// Compute the downgrade warning only when a key is present but failed to
+	// grant admin. The warning is stashed on Deps and emitted lazily by the root
+	// command's PersistentPreRunE so that meta-commands (version/--help/completion)
+	// that run before configuration is loaded are never polluted. An empty string
+	// means "no warning applies" (no key present, or legitimate admin, or registry
+	// unreachable — the last case cannot confirm the key is unregistered, so we
+	// stay silent to avoid false positives).
+	modeDowngradeWarning := buildModeDowngradeWarning(detResult, detErr)
 
 	gate := &prodPolicyModeGate{pol: pol, m: currentMode}
 
@@ -462,6 +471,7 @@ func BuildProductionDeps(ctx context.Context) (*cli.Deps, error) {
 		RunTUISubmit:          runTUISubmit,
 		RunTUIReview:          runTUIReview,
 		ErrTUISubmitAborted:   tui.ErrSubmitAborted,
+		ModeDowngradeWarning:  modeDowngradeWarning,
 	}, nil
 }
 
@@ -529,6 +539,34 @@ func buildDoctorProd(
 	}
 
 	return baseDoc, rhDoc
+}
+
+// buildModeDowngradeWarning returns a non-empty, actionable warning message
+// when a private key IS present on disk but failed to grant admin. Two causes:
+//
+//  1. Key file exists but permissions are not 0600 (detErr wraps
+//     mode.ErrKeyPermissions AND the underlying error is not os.ErrNotExist).
+//  2. Key can decrypt a project file but public key is not in the verified
+//     admin registry (detResult.Warning == mode.WarningKeyUnregistered).
+//
+// Returns "" in all other cases: no key, legitimate admin, registry
+// unreachable (cannot assert "unregistered" without reaching the registry),
+// or a configured key path that simply does not exist yet. Wording mirrors the
+// doctor use-case's detectMode() output so operators see consistent language
+// across both surfaces.
+func buildModeDowngradeWarning(detResult mode.Result, detErr error) string {
+	if errors.Is(detErr, mode.ErrKeyPermissions) && !errors.Is(detErr, os.ErrNotExist) {
+		// The key file exists but its permission bits are wrong. Distinguish from
+		// a path that is configured but whose file does not exist yet: the latter
+		// surfaces through `byreis doctor`, not a startup warning.
+		return "admin key present but has insecure permissions (must be exactly 0600) — " +
+			"run: chmod 600 <path-to-key>; run `byreis doctor` for the full diagnosis"
+	}
+	if detErr == nil && detResult.Warning == mode.WarningKeyUnregistered {
+		return "admin key can decrypt but its public key is not registered in the verified " +
+			"admin registry — running as contributor; run `byreis doctor` for the full diagnosis"
+	}
+	return ""
 }
 
 // ghClientProd constructs a *github.Client authenticated with the given token.

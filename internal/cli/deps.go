@@ -192,6 +192,19 @@ type Deps struct {
 	// integration test setups where a real pre-flight is unnecessary. Production
 	// wiring sets this to the real pre-flight adapter at BuildProductionDeps.
 	RotatePreFlight RotatePreFlightReader
+
+	// ModeDowngradeWarning is a non-empty human-readable message when the user
+	// was silently downgraded to CONTRIBUTOR because a private key IS present but
+	// either (a) the key file has incorrect permissions (not 0600) or (b) the key
+	// can decrypt a project file but its public key is not registered in the
+	// verified admin registry. The message is emitted to stderr once by the root
+	// command's PersistentPreRunE before any subcommand runs.
+	//
+	// Empty when: no key is configured at all (bare contributor), the user is a
+	// legitimate admin (mode==ADMIN), or mode detection failed for a reason other
+	// than key presence (e.g. registry unreachable). This avoids noisy warnings
+	// for unconfigured environments and meta-commands (version/help/completion).
+	ModeDowngradeWarning string
 }
 
 // RotatePreFlightReader is the narrow consumer-defined port the rotate command
