@@ -30,6 +30,7 @@ import (
 	"strings"
 	"unsafe"
 
+	"github.com/ByReisK/byreis/internal/adapter/pluginidentity"
 	coreidentity "github.com/ByReisK/byreis/internal/core/crypto/identity"
 	"github.com/ByReisK/byreis/internal/core/trust"
 )
@@ -263,12 +264,34 @@ func loadFromFile(path string) (coreidentity.Identity, error) {
 }
 
 // parseAndZeroize converts a raw key byte slice to an identity, zeroizes the
-// slice immediately after parse, and returns the identity. buf must be a
-// freshly-allocated slice not aliased anywhere else.
+// slice immediately after parse (for X25519 secrets), and returns the identity.
+// buf must be a freshly-allocated slice not aliased anywhere else.
+//
+// Dispatch: if the content begins with "AGE-PLUGIN-" (case-insensitive), the
+// buffer is routed to pluginidentity.New, which handles AGE-PLUGIN-<NAME>-1…
+// identity strings for hardware-backed admin identities (YubiKey, TPM, etc.).
+// Plugin identity strings are public descriptors (not secret material) and do
+// not require zeroization — this function still zeroes the buffer after making
+// a copy for cleanliness. For X25519 (AGE-SECRET-KEY-1…) strings the unsafe
+// zero-copy path and immediate zeroization are preserved.
 func parseAndZeroize(buf []byte) (coreidentity.Identity, error) {
-	// Build the string view without a second allocation using unsafe.
-	// The string is valid only until ZeroizeBuffer is called; identity.Parse
-	// must finish before we wipe the buffer.
+	// Detect plugin identity string without allocating a full uppercase copy.
+	if isPluginIdentityBytes(buf) {
+		// Make a copy for pluginidentity.New (the buf will be zeroed below).
+		idStr := string(buf)
+		id, err := pluginidentity.New(pluginidentity.Options{
+			IdentityStr: idStr,
+		})
+		ZeroizeBuffer(buf)
+		if err != nil {
+			return nil, fmt.Errorf("plugin identity load: %w — run `byreis doctor`", err)
+		}
+		return id, nil
+	}
+
+	// X25519 path: build the string view without a second allocation using
+	// unsafe. The string is valid only until ZeroizeBuffer is called;
+	// identity.Parse must finish before we wipe the buffer.
 	s := bytesToStringUnsafe(buf)
 	id, err := coreidentity.Parse(s)
 	// Zeroize the backing buffer immediately; the string header s is now invalid
@@ -278,6 +301,26 @@ func parseAndZeroize(buf []byte) (coreidentity.Identity, error) {
 		return nil, err
 	}
 	return id, nil
+}
+
+// isPluginIdentityBytes reports whether buf begins with the "AGE-PLUGIN-"
+// prefix (case-insensitive, ASCII). This is a pure ASCII prefix check with no
+// allocation; Unicode folding is not needed because the prefix is ASCII-only.
+func isPluginIdentityBytes(buf []byte) bool {
+	const prefix = "AGE-PLUGIN-"
+	if len(buf) < len(prefix) {
+		return false
+	}
+	for i := 0; i < len(prefix); i++ {
+		c := buf[i]
+		if c >= 'a' && c <= 'z' {
+			c -= 32 // to uppercase
+		}
+		if c != prefix[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // bytesToStringUnsafe converts []byte to string without copying the backing

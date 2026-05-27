@@ -534,7 +534,7 @@ func TestAC5_WrongLengthSignerKey_ReachesErrNoTrustedSigner(t *testing.T) {
 
 	shortKey := make([]byte, 16)
 	shortKeyB64 := base64.StdEncoding.EncodeToString(shortKey)
-	badYAML := validAdminsYAML("admin-a", "age1abc123", shortKeyB64)
+	badYAML := validAdminsYAML("admin-a", realX25519Recipient(t), shortKeyB64)
 
 	_, fetchErr := exerciseParseAdminsYAML(t, badYAML)
 	if fetchErr == nil {
@@ -552,7 +552,7 @@ func TestAC5_WrongLengthSignerKey_ReachesErrNoTrustedSigner(t *testing.T) {
 func TestAC6_NonBase64SignerKey_FailClosed(t *testing.T) {
 	t.Parallel()
 
-	badYAML := []byte("admins:\n  - id: admin-a\n    age_key: age1abc123\n    signer_key: NOT_VALID_BASE64!!!\n")
+	badYAML := validAdminsYAML("admin-a", realX25519Recipient(t), "NOT_VALID_BASE64!!!")
 
 	_, fetchErr := exerciseParseAdminsYAML(t, badYAML)
 	if fetchErr == nil {
@@ -569,7 +569,7 @@ func TestAC6_AllZeroSignerKey_FailClosed(t *testing.T) {
 
 	zeroKey := make([]byte, ed25519.PublicKeySize)
 	zeroKeyB64 := base64.StdEncoding.EncodeToString(zeroKey)
-	badYAML := validAdminsYAML("admin-a", "age1abc123", zeroKeyB64)
+	badYAML := validAdminsYAML("admin-a", realX25519Recipient(t), zeroKeyB64)
 
 	_, fetchErr := exerciseParseAdminsYAML(t, badYAML)
 	if fetchErr == nil {
@@ -877,7 +877,7 @@ func TestHappyPath_YAML_RoundTrip_ViaGitReader(t *testing.T) {
 
 	key := newEd25519Key(t)
 	keyB64 := base64.StdEncoding.EncodeToString(key)
-	yaml := validAdminsYAML("admin-bob", "age1xyz987abc", keyB64)
+	yaml := validAdminsYAML("admin-bob", realX25519Recipient(t), keyB64)
 
 	data, fetchErr := exerciseParseAdminsYAML(t, yaml)
 	if fetchErr != nil {
@@ -905,7 +905,7 @@ func TestAC3_CloneAndReadEnvHardened(t *testing.T) {
 
 	key := newEd25519Key(t)
 	keyB64 := base64.StdEncoding.EncodeToString(key)
-	yaml := validAdminsYAML("admin-env", "age1env123", keyB64)
+	yaml := validAdminsYAML("admin-env", realX25519Recipient(t), keyB64)
 
 	runner := &fakeRunnerPT{
 		steps: []fakeStep{
@@ -995,7 +995,7 @@ func TestAC9_OneClonePerFetchAdminSet(t *testing.T) {
 
 	key := newEd25519Key(t)
 	keyB64 := base64.StdEncoding.EncodeToString(key)
-	yaml := validAdminsYAML("admin-once", "age1once123", keyB64)
+	yaml := validAdminsYAML("admin-once", realX25519Recipient(t), keyB64)
 
 	runner := &fakeRunnerPT{
 		steps: []fakeStep{
@@ -1134,7 +1134,7 @@ func TestAC5_ReadProjectConfig_Absent_Advisory(t *testing.T) {
 
 	key := newEd25519Key(t)
 	keyB64 := base64.StdEncoding.EncodeToString(key)
-	yaml := validAdminsYAML("admin-proj", "age1proj123", keyB64)
+	yaml := validAdminsYAML("admin-proj", realX25519Recipient(t), keyB64)
 
 	runner := &fakeRunnerPT{
 		steps: []fakeStep{

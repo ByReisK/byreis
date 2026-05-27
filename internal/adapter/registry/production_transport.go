@@ -51,6 +51,7 @@ import (
 	coreregistry "github.com/ByReisK/byreis/internal/core/registry"
 	"github.com/ByReisK/byreis/internal/core/registry/countertypes"
 	"github.com/ByReisK/byreis/internal/core/registry/rectypes"
+	"github.com/ByReisK/byreis/internal/core/validator"
 )
 
 // maxAdminYAMLBytes is the pre-decode size bound for admins.yaml and
@@ -2094,11 +2095,15 @@ func parseAdminsYAML(raw []byte, commitHint string) (parsedAdminsIntermediate, e
 					"each admin entry must have a non-empty age_key; run `byreis doctor`",
 				coreregistry.ErrAdminSetUnreadable, entry.ID, commitHint)
 		}
-		if !strings.HasPrefix(entry.AgeKey, "age1") {
+		// Admit a recipient iff its backend is a member of the closed admit-set
+		// (native X25519 or a supported age-plugin backend). This validates the
+		// bech32 encoding and the backend discriminator, rejecting both malformed
+		// keys and well-formed keys for unsupported backends fail-closed — a
+		// loose "age1" prefix is no longer sufficient.
+		if _, classErr := validator.ClassifyRecipient(entry.AgeKey); classErr != nil {
 			return parsedAdminsIntermediate{}, fmt.Errorf(
-				"%w: admin %q in admins.yaml at commit %q has an invalid age_key "+
-					"(must start with \"age1\") — run `byreis doctor`",
-				coreregistry.ErrAdminSetUnreadable, entry.ID, commitHint)
+				"%w: admin %q in admins.yaml at commit %q has an unsupported age_key: %v",
+				coreregistry.ErrAdminSetUnreadable, entry.ID, commitHint, classErr)
 		}
 		fp := ageKeyFingerprint(entry.AgeKey)
 		recipients = append(recipients, rectypes.Recipient{

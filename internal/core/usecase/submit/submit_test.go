@@ -189,7 +189,7 @@ func newSUT(t *testing.T, d submit.Deps) submit.Submitter {
 		d.Recipients = fakeRecips{out: verifiedRecips()}
 	}
 	if d.Encryptor == nil {
-		d.Encryptor = encrypt.New()
+		d.Encryptor = encrypt.New(encrypt.NewX25519Parser())
 	}
 	if d.Validator == nil {
 		d.Validator = fakeValidator{}

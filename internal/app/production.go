@@ -26,6 +26,7 @@ import (
 	"github.com/ByReisK/byreis/internal/adapter/keychain"
 	manifestsigneradapter "github.com/ByReisK/byreis/internal/adapter/manifestsigner"
 	"github.com/ByReisK/byreis/internal/adapter/modeprobe"
+	"github.com/ByReisK/byreis/internal/adapter/recipientbuild"
 	registryadapter "github.com/ByReisK/byreis/internal/adapter/registry"
 	"github.com/ByReisK/byreis/internal/adapter/registry/auditverify"
 	"github.com/ByReisK/byreis/internal/adapter/registry/countercache"
@@ -239,15 +240,15 @@ func BuildProductionDeps(ctx context.Context) (*cli.Deps, error) {
 	if forSource != nil && recips != nil && counter != nil {
 		var buildErr error
 		getter, decryptor, editorUC, buildErr = BuildReadPathDeps(
-			forSource,      // FileOfRecordSource
-			codec,          // ArtifactCodec: real YAML codec
-			decrypt.New(),  // decrypt.Decryptor: real age decryptor
-			idLoader,       // identity.Loader: keychain/file/env loader
-			verify.New(),   // verify.VerifierOfRecord: pure crypto
-			recips,         // RecipientSource: registry-backed wrapper
-			counter,        // CounterStore: registry client
-			gate,           // ModeGate: real policy gate
-			encrypt.New(),  // encrypt.Encryptor: pure age encryptor
+			forSource,     // FileOfRecordSource
+			codec,         // ArtifactCodec: real YAML codec
+			decrypt.New(), // decrypt.Decryptor: real age decryptor
+			idLoader,      // identity.Loader: keychain/file/env loader
+			verify.New(),  // verify.VerifierOfRecord: pure crypto
+			recips,        // RecipientSource: registry-backed wrapper
+			counter,       // CounterStore: registry client
+			gate,          // ModeGate: real policy gate
+			encrypt.New(recipientbuild.New(recipientbuild.Options{})), // encrypt.Encryptor: X25519 + plugin dispatch
 			manifestSigner, // usecase.ManifestSigner: Ed25519 signer (nil if unavailable)
 			atomicWriter,   // usecase.AtomicFileWriter: repo-rooted atomic writer
 			editorAdapter,  // usecase.Editor: $EDITOR adapter (or sentinel)
@@ -273,7 +274,7 @@ func BuildProductionDeps(ctx context.Context) (*cli.Deps, error) {
 	// without the cli package importing internal/adapter directly.
 	merger, mergeExitCode := buildMergerProd(
 		ctx, configDir, currentMode, regClient, gate, manifestSigner,
-		decrypt.New(), encrypt.New(), idLoader, codec, recips, counter,
+		decrypt.New(), encrypt.New(recipientbuild.New(recipientbuild.Options{})), idLoader, codec, recips, counter,
 		buildAuditSinkProd(configDir),
 	)
 
@@ -283,7 +284,7 @@ func BuildProductionDeps(ctx context.Context) (*cli.Deps, error) {
 	// Reconciler is wired via RotationReverserAdapter for both probe and reverser.
 	rotator, rotateExitCode := buildRotatorProd(
 		ctx, currentMode, regClient, writeTokenProvider, manifestSigner,
-		decrypt.New(), encrypt.New(), idLoader, codec,
+		decrypt.New(), encrypt.New(recipientbuild.New(recipientbuild.Options{})), idLoader, codec,
 	)
 	reconciler := buildRotationReconcilerProd(
 		currentMode, writeSigner, writeTokenProvider,
@@ -460,6 +461,15 @@ func BuildProductionDeps(ctx context.Context) (*cli.Deps, error) {
 	runTUIReview := buildRunTUIReviewProd(
 		pol, currentMode, reviewer, merger, rejecter, requestAccessReader, projectSubmissionsReader,
 	)
+
+	// Scrub BYREIS_* secret variables from the process environment. All reads of
+	// BYREIS_KEY, BYREIS_KEY_FILE, BYREIS_SIGN_KEY, BYREIS_SIGN_KEY_FILE, and
+	// BYREIS_GITHUB_TOKEN were completed above (synchronously, before this point).
+	// Removing them now ensures that any child process spawned later — including
+	// age plugin subprocesses — does not inherit them. Non-secret BYREIS_* vars
+	// (BYREIS_REGISTRY, BYREIS_PROJECT, BYREIS_PROJECT_REPO, etc.) are kept because
+	// they are re-read by CLI command handlers after this function returns.
+	ScrubSecretEnvVars()
 
 	return &cli.Deps{
 		Policy:                pol,
@@ -1108,7 +1118,24 @@ func realDetectorProd(configDir string, fetcher modeprobe.ArtifactFetcher) *mode
 		},
 	}
 
-	probe := modeprobe.NewKeyProbe(idCfg, fetcher)
+	// Determine whether the resolved CLI command requires admin decrypt capability.
+	// We inspect os.Args[1:] (before cobra runs) because mode detection must
+	// complete before the command tree is dispatched. Using mode.NeedsDecryptProbe
+	// ensures the probe-suppression decision is derived from the same permission
+	// matrix that governs command gating — a single source of truth.
+	//
+	// Fallback policy: when no recognisable command is found (no args, only flags
+	// like --help, or a test harness invocation), probeNeeded defaults to TRUE.
+	// This is deliberately conservative: a superfluous probe on an unrecognised
+	// invocation is harmless (worst case it touches the token once on --help if
+	// the identity happens to be plugin-backed), while suppressing a probe on an
+	// admin command would falsely downgrade a real admin to CONTRIBUTOR.
+	resolvedCommand, commandRecognised := resolveCommandFromArgsProd(os.Args[1:])
+	probeNeeded := !commandRecognised || mode.NeedsDecryptProbe(resolvedCommand)
+
+	probe := modeprobe.NewKeyProbe(idCfg, fetcher, modeprobe.KeyProbeOptions{
+		NeedsDecryptProbe: probeNeeded,
+	})
 
 	regTrust := buildRegistryTrustProd(idCfg, configDir)
 	auditSink := buildAuditSinkProd(configDir)
@@ -1607,6 +1634,33 @@ func contribGitHubTokenProd() string {
 func envBoolProd(name string) bool {
 	v := os.Getenv(name)
 	return v == "1" || v == "true" || v == "yes"
+}
+
+// secretEnvVars is the exhaustive list of BYREIS_* environment variable names
+// that carry secret material. These are read once during BuildProductionDeps
+// (synchronous construction phase) and must not be inherited by child processes.
+// Non-secret BYREIS_* vars (BYREIS_REGISTRY, BYREIS_PROJECT, etc.) are
+// intentionally omitted; they are re-read by CLI command handlers at runtime.
+var secretEnvVars = []string{
+	"BYREIS_KEY",
+	"BYREIS_KEY_FILE",
+	"BYREIS_SIGN_KEY",
+	"BYREIS_SIGN_KEY_FILE",
+	"BYREIS_GITHUB_TOKEN",
+}
+
+// ScrubSecretEnvVars removes the BYREIS_* secret variables from the current
+// process environment. It is called once by BuildProductionDeps after all
+// env reads are complete, ensuring that any child process spawned later
+// (including age plugin subprocesses) does not inherit plaintext key material
+// or GitHub tokens.
+//
+// The function is exported for testing only; production code must call it
+// exclusively from BuildProductionDeps.
+func ScrubSecretEnvVars() {
+	for _, name := range secretEnvVars {
+		_ = os.Unsetenv(name)
+	}
 }
 
 // ─── registry bridge: maps *registry.Client to modeprobe.AdminSetFetcher ───
@@ -2632,7 +2686,7 @@ func buildSubmitterProd(
 
 	submitter, newErr := submit.New(submit.Deps{
 		Recipients: recipsWrapper,
-		Encryptor:  encrypt.New(),
+		Encryptor:  encrypt.New(recipientbuild.New(recipientbuild.Options{})),
 		Validator:  shared.validator,
 		KeyProbe:   shared.keyProbe,
 		Git:        gitPort,
@@ -2677,7 +2731,7 @@ func buildRunTUISubmitProd(
 	factory := tui.SubmitterFactory(func(p submit.Prompter) (submit.Submitter, error) {
 		return submit.New(submit.Deps{
 			Recipients: recipsWrapper,
-			Encryptor:  encrypt.New(),
+			Encryptor:  encrypt.New(recipientbuild.New(recipientbuild.Options{})),
 			Validator:  shared.validator,
 			KeyProbe:   shared.keyProbe,
 			Git:        gitPort,
@@ -2775,6 +2829,87 @@ func (a *forSourceBytesAdapter) FileOfRecordBytes(ctx context.Context, projectID
 		return nil, err
 	}
 	return rec.Bytes, nil
+}
+
+// resolveCommandFromArgsProd inspects the raw os.Args slice (passed as args,
+// without the program name) and returns the mode.Command that best matches
+// the first non-flag argument, plus a bool indicating whether a known command
+// was recognised. It handles top-level verbs ("get", "submit", "run", …) and
+// the "admin" sub-tree ("admin get", "admin export", …).
+//
+// The result is used exclusively to compute mode.NeedsDecryptProbe: the real
+// command routing happens inside cobra after BuildProductionDeps returns.
+// When no command is recognisable (bare --help, completion, unknown verb, no
+// args, or a test harness invocation), the function returns ("", false) and
+// the caller applies the conservative default (probe=true).
+func resolveCommandFromArgsProd(args []string) (mode.Command, bool) {
+	// Collect the first two non-flag tokens.
+	var tokens []string
+	for _, a := range args {
+		if len(tokens) >= 2 {
+			break
+		}
+		if !strings.HasPrefix(a, "-") {
+			tokens = append(tokens, a)
+		}
+	}
+	if len(tokens) == 0 {
+		return "", false
+	}
+
+	// The "admin" sub-tree: the real command is the second token.
+	if strings.EqualFold(tokens[0], "admin") && len(tokens) >= 2 {
+		cmd := mapVerbToCommand(tokens[1])
+		return cmd, cmd != ""
+	}
+
+	cmd := mapVerbToCommand(tokens[0])
+	return cmd, cmd != ""
+}
+
+// mapVerbToCommand maps a cobra verb string (lowercase) to its mode.Command
+// constant. Returns "" for unrecognised verbs (fail-safe default).
+func mapVerbToCommand(verb string) mode.Command {
+	switch strings.ToLower(verb) {
+	case "version":
+		return mode.CommandVersion
+	case "init":
+		return mode.CommandInit
+	case "doctor":
+		return mode.CommandDoctor
+	case "submit":
+		return mode.CommandSubmit
+	case "review":
+		return mode.CommandReview
+	case "merge":
+		return mode.CommandMerge
+	case "get":
+		return mode.CommandGet
+	case "decrypt":
+		return mode.CommandDecrypt
+	case "edit":
+		return mode.CommandEdit
+	case "rotate":
+		return mode.CommandRotate
+	case "rotation-reconcile":
+		return mode.CommandRotationReconcile
+	case "request-access":
+		return mode.CommandRequestAccess
+	case "request-list":
+		return mode.CommandRequestList
+	case "audit-show":
+		return mode.CommandAuditShow
+	case "request-reject":
+		return mode.CommandRequestReject
+	case "audit-verify":
+		return mode.CommandAuditVerify
+	case "export":
+		return mode.CommandExport
+	case "run":
+		return mode.CommandRun
+	default:
+		return ""
+	}
 }
 
 // ─── compile-time assertions ─────────────────────────────────────────────────

@@ -60,7 +60,7 @@ func buildSigned(t *testing.T, counter uint64, vals map[string]string) fixture {
 	// Use real age recipients so encrypt produces real ciphertext.
 	r1 := realRecipient(t)
 	r2 := realRecipient(t)
-	u, err := encrypt.New().Encrypt(context.Background(), encrypt.EncryptInput{
+	u, err := encrypt.New(encrypt.NewX25519Parser()).Encrypt(context.Background(), encrypt.EncryptInput{
 		ProjectID: projID, LogicalFileName: fileName, Counter: counter,
 		Recipients: []rectypes.Recipient{r1, r2}, Values: vals,
 	})
@@ -325,7 +325,7 @@ func TestVerifyOfRecord_ReadOnlyDoesNotMutateAuthority(t *testing.T) {
 func TestVerifySubmission_StructuralOnly_NeverOfRecord(t *testing.T) {
 	r1 := realRecipient(t)
 	r2 := realRecipient(t)
-	u, err := encrypt.New().Encrypt(context.Background(), encrypt.EncryptInput{
+	u, err := encrypt.New(encrypt.NewX25519Parser()).Encrypt(context.Background(), encrypt.EncryptInput{
 		ProjectID: projID, LogicalFileName: fileName, Counter: 1,
 		Recipients: []rectypes.Recipient{r1, r2},
 		Values:     map[string]string{"DB": "x", "API": "y"},
@@ -369,7 +369,7 @@ func TestVerifySubmission_StructuralNegatives(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			r1 := realRecipient(t)
-			u, err := encrypt.New().Encrypt(context.Background(), encrypt.EncryptInput{
+			u, err := encrypt.New(encrypt.NewX25519Parser()).Encrypt(context.Background(), encrypt.EncryptInput{
 				ProjectID: projID, LogicalFileName: fileName, Counter: 1,
 				Recipients: []rectypes.Recipient{r1},
 				Values:     map[string]string{"DB": "x"},
@@ -399,7 +399,7 @@ func TestVerifySubmission_StructuralNegatives(t *testing.T) {
 // checks structure + recipient-set shape.
 func TestVerifySubmission_DoesNotCatch(t *testing.T) {
 	r1 := realRecipient(t)
-	u, err := encrypt.New().Encrypt(context.Background(), encrypt.EncryptInput{
+	u, err := encrypt.New(encrypt.NewX25519Parser()).Encrypt(context.Background(), encrypt.EncryptInput{
 		ProjectID: projID, LogicalFileName: fileName,
 		Counter:    999999, // attacker-chosen; submission cannot gate on this
 		Recipients: []rectypes.Recipient{r1},

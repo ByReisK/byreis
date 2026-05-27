@@ -206,7 +206,7 @@ func baseMergeDeps(t *testing.T) (
 	rec, id, _ := mkRecipient(t)
 	g := &stubGit{}
 	dec := &stubDecryptor{out: map[string]string{"API_KEY": "plaintext-secret"}}
-	enc := &encryptorReal{inner: encrypt.New()}
+	enc := &encryptorReal{inner: encrypt.New(encrypt.NewX25519Parser())}
 	ctr := &stubCounter{auth: witnessedAuthority(0, nil)}
 	sgn := &stubSigner{signerID: "admin-1"}
 	codec := &stubCodec{}
@@ -658,7 +658,7 @@ func TestMerge_C4_ReEncryptIsFreshWholeFileZeroPriorCiphertext(t *testing.T) {
 		merge: git.MergeResult{MergedCommit: "c", SignedFileCommitted: true, SignedFileCommitSHA: "sf"},
 	}
 	dec := &stubDecryptor{out: map[string]string{"API_KEY": "the-only-plaintext"}}
-	enc := &encryptorReal{inner: encrypt.New()}
+	enc := &encryptorReal{inner: encrypt.New(encrypt.NewX25519Parser())}
 	ctr := &stubCounter{auth: witnessedAuthority(0, nil)}
 	sgn := &stubSigner{signerID: "admin-1"}
 	codec := &stubCodec{unsigned: uns}
@@ -1017,7 +1017,7 @@ func TestMerge_EndToEnd_SharedContentSHAReachesOKResume(t *testing.T) {
 	}
 	ctr := &recordingCounter{lastAccepted: 0}
 	m, _ := usecase.NewMerger(usecase.MergeDeps{
-		Git: g, Decryptor: realDecryptor(), Encryptor: encrypt.New(),
+		Git: g, Decryptor: realDecryptor(), Encryptor: encrypt.New(encrypt.NewX25519Parser()),
 		IDLoader:      &stubIDLoader{id: id},
 		ArtifactCodec: codec,
 		Recipients: &stubRecipients{

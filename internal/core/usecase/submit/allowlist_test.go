@@ -50,6 +50,12 @@ var explicitlyForbiddenSubmit = map[string]bool{
 	module + "/internal/core/registry":              true, // carries SignerKey=ed25519.PublicKey / CounterStore
 	module + "/internal/core/registry/countertypes": true, // counter authority — not on Submit path
 	"golang.org/x/crypto/ed25519":                   true, // alias to crypto/ed25519
+	// filippo.io/age/plugin (recipient-v1/identity-v1 protocol + os/exec plugin
+	// subprocess) is the admin read-path's recipient/identity construction
+	// surface, behind an adapter. It must never reach the contributor submit
+	// path, or the write-only wedge gains a compile-time route to backend
+	// identity construction. The negative test below proves the guard fires.
+	"filippo.io/age/plugin": true,
 }
 
 // allowedByreisPkgsSubmit enumerates the byreis-module packages permitted in
@@ -295,6 +301,70 @@ func TestAllowlist_Submit_NegativeTest_ForbiddenImportFails(t *testing.T) {
 			"Fix: ensure checkAllowlistSubmit rejects registry/countertypes.")
 	} else {
 		t.Logf("PASS (part C): checkAllowlistSubmit correctly rejected registry/countertypes\nviolations: %v", violations3)
+	}
+
+	// --- Part D: inject filippo.io/age/plugin (forbidden — admin read-path
+	// recipient/identity construction surface; must never reach submit) ---
+	//
+	// Proves the guard FIRES on the plugin package by NAME, not merely that it
+	// is absent today.
+	injectedPlugin := []string{
+		module + "/internal/core/usecase/submit",
+		module + "/internal/core/crypto/encrypt",
+		"filippo.io/age",
+		"filippo.io/age/plugin", // FORBIDDEN — must cause a violation
+	}
+	pluginViolations := checkAllowlistSubmit(injectedPlugin)
+	if len(pluginViolations) == 0 {
+		t.Errorf("NEGATIVE TEST FAIL: checkAllowlistSubmit silently accepted filippo.io/age/plugin\n" +
+			"The plugin protocol/os-exec surface must never reach the contributor submit\n" +
+			"path. Fix: ensure checkAllowlistSubmit rejects it.")
+	} else {
+		found := false
+		for _, v := range pluginViolations {
+			if strings.Contains(v, "filippo.io/age/plugin") {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("NEGATIVE TEST FAIL: violations detected but filippo.io/age/plugin not among them: %v", pluginViolations)
+		} else {
+			t.Logf("PASS (part D): checkAllowlistSubmit correctly detected forbidden import filippo.io/age/plugin\nviolations: %v", pluginViolations)
+		}
+	}
+
+	// --- Part E: inject the plugin-backend ADAPTERS (byreis pkgs NOT on the
+	// Submit allowlist). They import filippo.io/age/plugin and are adapters,
+	// never core; if they leaked into the submit transitive set they must trip
+	// the "byreis pkg not on Submit allowlist" branch. ---
+	for _, adapter := range []string{
+		module + "/internal/adapter/recipientbuild",
+		module + "/internal/adapter/pluginidentity",
+	} {
+		injectedAdapter := []string{
+			module + "/internal/core/usecase/submit",
+			adapter, // byreis pkg NOT on Submit allowlist — must cause a violation
+		}
+		av := checkAllowlistSubmit(injectedAdapter)
+		if len(av) == 0 {
+			t.Errorf("NEGATIVE TEST FAIL: checkAllowlistSubmit silently accepted adapter %s\n"+
+				"The plugin-backend adapters must never appear in the contributor submit\n"+
+				"transitive set. Fix: ensure non-allowlisted byreis pkgs are rejected.", adapter)
+			continue
+		}
+		found := false
+		for _, v := range av {
+			if strings.Contains(v, adapter) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("NEGATIVE TEST FAIL: violations detected but %s not among them: %v", adapter, av)
+		} else {
+			t.Logf("PASS (part E): checkAllowlistSubmit correctly rejected non-allowlisted adapter %s\nviolations: %v", adapter, av)
+		}
 	}
 }
 

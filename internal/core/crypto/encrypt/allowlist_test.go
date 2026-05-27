@@ -44,6 +44,15 @@ var explicitlyForbidden = map[string]bool{
 	module + "/internal/core/crypto/decrypt":  true, // admin decrypt path
 	module + "/internal/core/registry":        true, // carries SignerKey=ed25519.PublicKey / CounterStore
 	"golang.org/x/crypto/ed25519":             true, // alias to crypto/ed25519
+	// filippo.io/age/plugin speaks the recipient-v1/identity-v1 plugin protocol
+	// and runs an os/exec plugin subprocess. It is the admin read-path's
+	// recipient/identity construction surface and lives behind an adapter; it
+	// must never reach the contributor encrypt path, or the write-only wedge
+	// gains a compile-time route to backend identity construction. The
+	// X25519-default RecipientParser stays in-package and imports only
+	// filippo.io/age, so this package's transitive set excludes the plugin
+	// package; the negative test below proves the guard fires if it appears.
+	"filippo.io/age/plugin": true,
 }
 
 // allowedByreisPkgs enumerates the byreis-module packages permitted in the
@@ -299,6 +308,74 @@ func TestAllowlist_NegativeTest_ForbiddenImportFails(t *testing.T) {
 			"Fix: ensure checkAllowlist rejects internal/core/registry.")
 	} else {
 		t.Logf("PASS (part B): checkAllowlist correctly rejected internal/core/registry\nviolations: %v", violations2)
+	}
+
+	// --- Part C1-a: inject filippo.io/age/plugin (forbidden — admin read-path
+	// recipient/identity construction surface; must never reach encrypt) ---
+	//
+	// This proves the guard FIRES on the plugin package, not merely that it is
+	// absent from the real transitive set today. Mirrors the crypto/ed25519
+	// Part-A pattern: the violation must NAME filippo.io/age/plugin.
+	injectedPlugin := []string{
+		module + "/internal/core/crypto/encrypt",
+		module + "/internal/core/crypto/manifest",
+		module + "/internal/core/registry/rectypes",
+		"context",
+		"filippo.io/age",
+		"filippo.io/age/plugin", // FORBIDDEN — must cause a violation
+	}
+	pluginViolations := checkAllowlist(injectedPlugin)
+	if len(pluginViolations) == 0 {
+		t.Errorf("NEGATIVE TEST FAIL: checkAllowlist silently accepted filippo.io/age/plugin\n" +
+			"The guard is broken — the plugin protocol/os-exec surface must never reach\n" +
+			"the contributor encrypt path. Fix: ensure checkAllowlist rejects it.\n" +
+			"(A guard that silently passes a forbidden import is itself a defect.)")
+	} else {
+		found := false
+		for _, v := range pluginViolations {
+			if strings.Contains(v, "filippo.io/age/plugin") {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("NEGATIVE TEST FAIL: violations detected but filippo.io/age/plugin not among them: %v", pluginViolations)
+		} else {
+			t.Logf("PASS (part C1-a): checkAllowlist correctly detected forbidden import filippo.io/age/plugin\nviolations: %v", pluginViolations)
+		}
+	}
+
+	// --- Part C1-b: inject the plugin-backend ADAPTERS (byreis pkgs NOT on the
+	// allowlist). recipientbuild/pluginidentity import filippo.io/age/plugin;
+	// they are adapters, never core, so they must trip the "byreis pkg not on
+	// allowlist" branch if they ever leak into the encrypt transitive set. ---
+	for _, adapter := range []string{
+		module + "/internal/adapter/recipientbuild",
+		module + "/internal/adapter/pluginidentity",
+	} {
+		injectedAdapter := []string{
+			module + "/internal/core/crypto/encrypt",
+			adapter, // byreis pkg NOT on allowlist — must cause a violation
+		}
+		av := checkAllowlist(injectedAdapter)
+		if len(av) == 0 {
+			t.Errorf("NEGATIVE TEST FAIL: checkAllowlist silently accepted adapter %s\n"+
+				"The plugin-backend adapters must never appear in the contributor encrypt\n"+
+				"transitive set. Fix: ensure non-allowlisted byreis pkgs are rejected.", adapter)
+			continue
+		}
+		found := false
+		for _, v := range av {
+			if strings.Contains(v, adapter) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("NEGATIVE TEST FAIL: violations detected but %s not among them: %v", adapter, av)
+		} else {
+			t.Logf("PASS (part C1-b): checkAllowlist correctly rejected non-allowlisted adapter %s\nviolations: %v", adapter, av)
+		}
 	}
 
 	// --- Part C: end-to-end with a real temp package (skipped in -short) ---

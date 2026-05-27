@@ -182,7 +182,7 @@ func TestN2_NoKey_ProbeReturnsEmpty(t *testing.T) {
 	t.Parallel()
 
 	cfg := buildIdentityConfig(&fakeKeychain{secret: "", err: nil}, "", "", "")
-	probe := modeprobe.NewKeyProbe(cfg, nil)
+	probe := modeprobe.NewKeyProbe(cfg, nil, modeprobe.KeyProbeOptions{})
 
 	ctx := context.Background()
 	path := probe.KeyFilePath(ctx)
@@ -197,7 +197,7 @@ func TestN2_KeychainError_ProbeFailClosed(t *testing.T) {
 	t.Parallel()
 
 	cfg := buildIdentityConfig(&fakeKeychain{secret: "", err: errors.New("keychain backend gone")}, "", "", "")
-	probe := modeprobe.NewKeyProbe(cfg, nil)
+	probe := modeprobe.NewKeyProbe(cfg, nil, modeprobe.KeyProbeOptions{})
 
 	ctx := context.Background()
 	path := probe.KeyFilePath(ctx)
@@ -211,7 +211,7 @@ func TestN2_NilKeychain_ProbeFailClosed(t *testing.T) {
 	t.Parallel()
 
 	cfg := buildIdentityConfig(nil, "", "", "")
-	probe := modeprobe.NewKeyProbe(cfg, nil)
+	probe := modeprobe.NewKeyProbe(cfg, nil, modeprobe.KeyProbeOptions{})
 
 	ctx := context.Background()
 	// Must not panic.
@@ -229,7 +229,7 @@ func TestN2_KeychainPresent_MarkerNonEmpty(t *testing.T) {
 
 	key := generateKey(t)
 	cfg := buildIdentityConfig(&fakeKeychain{secret: key.String(), err: nil}, "", "", "")
-	probe := modeprobe.NewKeyProbe(cfg, nil)
+	probe := modeprobe.NewKeyProbe(cfg, nil, modeprobe.KeyProbeOptions{})
 
 	ctx := context.Background()
 	path := probe.KeyFilePath(ctx)
@@ -248,7 +248,7 @@ func TestN2_EnvKey_MarkerNonEmpty(t *testing.T) {
 
 	key := generateKey(t)
 	cfg := buildIdentityConfig(nil, key.String(), "", "")
-	probe := modeprobe.NewKeyProbe(cfg, nil)
+	probe := modeprobe.NewKeyProbe(cfg, nil, modeprobe.KeyProbeOptions{})
 
 	ctx := context.Background()
 	path := probe.KeyFilePath(ctx)
@@ -267,7 +267,7 @@ func TestN2_CtxCancel_KeychainProbeHonored(t *testing.T) {
 	t.Parallel()
 
 	cfg := buildIdentityConfig(&blockingKeychain{}, "", "", "")
-	probe := modeprobe.NewKeyProbe(cfg, nil)
+	probe := modeprobe.NewKeyProbe(cfg, nil, modeprobe.KeyProbeOptions{})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // cancel immediately
@@ -295,7 +295,7 @@ func TestN2_MarkerOnlyWhenKeyPresent_ConsistentWithIdentity(t *testing.T) {
 
 	// Case A: no key → both return "".
 	cfgNoKey := buildIdentityConfig(&fakeKeychain{secret: "", err: nil}, "", "", "")
-	probeNoKey := modeprobe.NewKeyProbe(cfgNoKey, nil)
+	probeNoKey := modeprobe.NewKeyProbe(cfgNoKey, nil, modeprobe.KeyProbeOptions{})
 	if got := probeNoKey.KeyFilePath(context.Background()); got != "" {
 		t.Errorf("N-2 resolver-consistency: probe returned %q, shared resolver would return empty", got)
 	}
@@ -306,7 +306,7 @@ func TestN2_MarkerOnlyWhenKeyPresent_ConsistentWithIdentity(t *testing.T) {
 	// Case B: BYREIS_KEY set → both return the same non-empty marker.
 	key := generateKey(t)
 	cfgEnvKey := buildIdentityConfig(nil, key.String(), "", "")
-	probeEnvKey := modeprobe.NewKeyProbe(cfgEnvKey, nil)
+	probeEnvKey := modeprobe.NewKeyProbe(cfgEnvKey, nil, modeprobe.KeyProbeOptions{})
 	probeResult := probeEnvKey.KeyFilePath(context.Background())
 	sharedResult := identityadapter.ResolvedPath(cfgEnvKey)
 	if probeResult != sharedResult {
@@ -329,7 +329,7 @@ func TestN1_WrongPerm_KeyFilePerms_HardError(t *testing.T) {
 	p := writeKeyFile(t, tmp, "admin.key", key.String(), 0o644) //nolint:gosec // intentionally wrong perm for test
 
 	cfg := buildIdentityConfig(nil, "", p, "")
-	probe := modeprobe.NewKeyProbe(cfg, nil)
+	probe := modeprobe.NewKeyProbe(cfg, nil, modeprobe.KeyProbeOptions{})
 
 	ctx := context.Background()
 	_, err := probe.KeyFilePerms(ctx)
@@ -348,7 +348,7 @@ func TestN1_CorrectPerm_KeyFilePerms_Returns0600(t *testing.T) {
 	p := writeKeyFile(t, tmp, "admin.key", key.String(), 0o600)
 
 	cfg := buildIdentityConfig(nil, "", p, "")
-	probe := modeprobe.NewKeyProbe(cfg, nil)
+	probe := modeprobe.NewKeyProbe(cfg, nil, modeprobe.KeyProbeOptions{})
 
 	ctx := context.Background()
 	perms, err := probe.KeyFilePerms(ctx)
@@ -368,7 +368,7 @@ func TestN1_InProcessMarker_KeyFilePerms_Returns0600(t *testing.T) {
 
 	key := generateKey(t)
 	cfg := buildIdentityConfig(nil, key.String(), "", "") // BYREIS_KEY → marker path
-	probe := modeprobe.NewKeyProbe(cfg, nil)
+	probe := modeprobe.NewKeyProbe(cfg, nil, modeprobe.KeyProbeOptions{})
 
 	ctx := context.Background()
 	path := probe.KeyFilePath(ctx)
@@ -395,7 +395,7 @@ func TestN1_SingleSharedResolverInvariant(t *testing.T) {
 	p := filepath.Join(tmp, "admin.key")
 
 	cfg := buildIdentityConfig(nil, "", p, "")
-	probe := modeprobe.NewKeyProbe(cfg, nil)
+	probe := modeprobe.NewKeyProbe(cfg, nil, modeprobe.KeyProbeOptions{})
 
 	probeResult := probe.KeyFilePath(context.Background())
 	sharedResult := identityadapter.ResolvedPath(cfg)
@@ -425,7 +425,7 @@ func TestN4_FullPromotion_ADMIN_Audited(t *testing.T) {
 	fileSource := &fakeFileOfRecordSource{art: art}
 
 	cfg := buildIdentityConfig(nil, ageID.String(), "", "")
-	probe := modeprobe.NewKeyProbe(cfg, fileSource)
+	probe := modeprobe.NewKeyProbe(cfg, fileSource, modeprobe.KeyProbeOptions{NeedsDecryptProbe: true})
 
 	registry := fakeRegistryTrust{registered: true}
 	sink := &recordingSink{}
@@ -463,7 +463,7 @@ func TestN4_AuditFailure_Blocks_Promotion(t *testing.T) {
 	fileSource := &fakeFileOfRecordSource{art: art}
 
 	cfg := buildIdentityConfig(nil, ageID.String(), "", "")
-	probe := modeprobe.NewKeyProbe(cfg, fileSource)
+	probe := modeprobe.NewKeyProbe(cfg, fileSource, modeprobe.KeyProbeOptions{NeedsDecryptProbe: true})
 
 	registry := fakeRegistryTrust{registered: true}
 	sink := &recordingSink{failOn: true}
@@ -498,7 +498,7 @@ func TestN4_CanDecryptAny_NoPlaintextLeak(t *testing.T) {
 	fileSource := &fakeFileOfRecordSource{art: art}
 
 	cfg := buildIdentityConfig(nil, ageID.String(), "", "")
-	probe := modeprobe.NewKeyProbe(cfg, fileSource)
+	probe := modeprobe.NewKeyProbe(cfg, fileSource, modeprobe.KeyProbeOptions{NeedsDecryptProbe: true})
 
 	ctx := context.Background()
 	canDecrypt, err := probe.CanDecryptAny(ctx, "proj-1")
@@ -524,7 +524,7 @@ func TestN4_CanDecryptAny_WrongKey_ReturnsFalseNotError(t *testing.T) {
 	fileSource := &fakeFileOfRecordSource{art: art}
 
 	cfg := buildIdentityConfig(nil, differentID.String(), "", "")
-	probe := modeprobe.NewKeyProbe(cfg, fileSource)
+	probe := modeprobe.NewKeyProbe(cfg, fileSource, modeprobe.KeyProbeOptions{NeedsDecryptProbe: true})
 
 	ctx := context.Background()
 	// Not a recipient: either (false, nil) or (false, err) is acceptable fail-closed
@@ -554,7 +554,7 @@ func TestN3_KeyDecrypts_NotRegistered_ContributorWithWarning(t *testing.T) {
 	fileSource := &fakeFileOfRecordSource{art: art}
 
 	cfg := buildIdentityConfig(nil, ageID.String(), "", "")
-	probe := modeprobe.NewKeyProbe(cfg, fileSource)
+	probe := modeprobe.NewKeyProbe(cfg, fileSource, modeprobe.KeyProbeOptions{NeedsDecryptProbe: true})
 
 	// Registry says "not registered".
 	registry := fakeRegistryTrust{registered: false}
@@ -593,7 +593,7 @@ func TestN3_RegistryError_FailClosed_Contributor(t *testing.T) {
 	fileSource := &fakeFileOfRecordSource{art: art}
 
 	cfg := buildIdentityConfig(nil, ageID.String(), "", "")
-	probe := modeprobe.NewKeyProbe(cfg, fileSource)
+	probe := modeprobe.NewKeyProbe(cfg, fileSource, modeprobe.KeyProbeOptions{NeedsDecryptProbe: true})
 
 	// Registry returns an error.
 	registry := fakeRegistryTrust{err: errors.New("registry backend unavailable")}
@@ -641,7 +641,7 @@ func TestN3_ForgedSourceVerified_NeverAdmin(t *testing.T) {
 	art := buildSignedArtifact(t, ageID)
 	fileSource := &fakeFileOfRecordSource{art: art}
 	cfg := buildIdentityConfig(nil, ageID.String(), "", "")
-	probe := modeprobe.NewKeyProbe(cfg, fileSource)
+	probe := modeprobe.NewKeyProbe(cfg, fileSource, modeprobe.KeyProbeOptions{NeedsDecryptProbe: true})
 
 	det := &mode.Detector{
 		Probe:    probe,

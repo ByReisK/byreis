@@ -6,6 +6,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"io"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -49,7 +51,7 @@ func baseInput(recips ...rectypes.Recipient) encrypt.EncryptInput {
 
 func TestEncrypt_NoRecipients(t *testing.T) {
 	t.Parallel()
-	enc := encrypt.New()
+	enc := encrypt.New(encrypt.NewX25519Parser())
 	in := baseInput()
 	_, err := enc.Encrypt(context.Background(), in)
 	if !errors.Is(err, encrypt.ErrNoRecipients) {
@@ -60,7 +62,7 @@ func TestEncrypt_NoRecipients(t *testing.T) {
 func TestEncrypt_BadFormatInputs(t *testing.T) {
 	t.Parallel()
 	r, _ := testRecipient(t)
-	enc := encrypt.New()
+	enc := encrypt.New(encrypt.NewX25519Parser())
 
 	cases := []struct {
 		name   string
@@ -88,7 +90,7 @@ func TestEncrypt_UnsignedArtifact_RoundTrip(t *testing.T) {
 	t.Parallel()
 	r1, id1 := testRecipient(t)
 	r2, id2 := testRecipient(t)
-	enc := encrypt.New()
+	enc := encrypt.New(encrypt.NewX25519Parser())
 
 	art, err := enc.Encrypt(context.Background(), baseInput(r1, r2))
 	if err != nil {
@@ -138,7 +140,7 @@ func TestEncrypt_UnsignedArtifact_RoundTrip(t *testing.T) {
 func TestEncrypt_FreshCiphertextPerValue_NoReuse(t *testing.T) {
 	t.Parallel()
 	r, _ := testRecipient(t)
-	enc := encrypt.New()
+	enc := encrypt.New(encrypt.NewX25519Parser())
 
 	in := baseInput(r)
 	// Two keys with the SAME plaintext must still get distinct ciphertext
@@ -171,7 +173,7 @@ func TestEncrypt_WrongRecipientCannotDecrypt(t *testing.T) {
 	t.Parallel()
 	r, _ := testRecipient(t)
 	_, wrongID := testRecipient(t) // not in the recipient set
-	enc := encrypt.New()
+	enc := encrypt.New(encrypt.NewX25519Parser())
 
 	art, err := enc.Encrypt(context.Background(), baseInput(r))
 	if err != nil {
@@ -181,4 +183,139 @@ func TestEncrypt_WrongRecipientCannotDecrypt(t *testing.T) {
 	if _, err := age.Decrypt(ar, wrongID); err == nil {
 		t.Fatalf("a non-recipient identity decrypted the value — fail-closed broken")
 	}
+}
+
+// stubParser is a RecipientParser test double that lets a test observe what the
+// encrypt path hands to the parser and inject an arbitrary age.Recipient or
+// error in its place. It models the adapter-supplied parser (e.g. a plugin-aware
+// one) without importing any backend package into the core test.
+type stubParser struct {
+	gotRecipients []rectypes.Recipient
+	delegate      func(rectypes.Recipient) (age.Recipient, error)
+}
+
+func (s *stubParser) ParseRecipient(_ context.Context, r rectypes.Recipient) (age.Recipient, error) {
+	s.gotRecipients = append(s.gotRecipients, r)
+	return s.delegate(r)
+}
+
+// TestEncrypt_InjectedParser_DrivesRecipientConstruction asserts the seam:
+// Encrypt consumes the injected RecipientParser for every recipient rather than
+// constructing the recipient itself, and the age.Recipient values the parser
+// returns are the ones wrapped by age.Encrypt with zero call-site changes
+// (AC-001-c). The stub returns a real X25519 recipient parsed independently, so
+// the round-trip still succeeds — proving the value flowed through the seam.
+func TestEncrypt_InjectedParser_DrivesRecipientConstruction(t *testing.T) {
+	t.Parallel()
+	r, id := testRecipient(t)
+	parser := &stubParser{
+		delegate: func(rr rectypes.Recipient) (age.Recipient, error) {
+			return age.ParseX25519Recipient(rr.AgePubKey)
+		},
+	}
+	enc := encrypt.New(parser)
+
+	art, err := enc.Encrypt(context.Background(), baseInput(r))
+	if err != nil {
+		t.Fatalf("Encrypt with injected parser: %v", err)
+	}
+	if len(parser.gotRecipients) != 1 || parser.gotRecipients[0].AgePubKey != r.AgePubKey {
+		t.Fatalf("encrypt did not route recipients through the injected parser: got %+v", parser.gotRecipients)
+	}
+
+	// The value must decrypt with the recipient identity — proving the parser's
+	// age.Recipient is what age.Encrypt actually wrapped to.
+	ar := armor.NewReader(strings.NewReader(string(art.Values["API_KEY"])))
+	dec, err := age.Decrypt(ar, id)
+	if err != nil {
+		t.Fatalf("decrypt value built via injected parser: %v", err)
+	}
+	if _, err := io.Copy(io.Discard, dec); err != nil {
+		t.Fatalf("drain plaintext: %v", err)
+	}
+}
+
+// TestEncrypt_InjectedParser_ErrorFailsClosed asserts a parser error aborts the
+// whole encrypt with no artifact (the per-recipient construction error is the
+// fail-closed point for AC-003-b / C3 when a later slice's plugin parser fails).
+func TestEncrypt_InjectedParser_ErrorFailsClosed(t *testing.T) {
+	t.Parallel()
+	r, _ := testRecipient(t)
+	sentinel := errors.New("parser refused this recipient")
+	parser := &stubParser{
+		delegate: func(rectypes.Recipient) (age.Recipient, error) { return nil, sentinel },
+	}
+	enc := encrypt.New(parser)
+
+	art, err := enc.Encrypt(context.Background(), baseInput(r))
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("Encrypt err = %v, want wrapped sentinel from parser", err)
+	}
+	if len(art.Values) != 0 {
+		t.Fatalf("fail-closed broken: artifact produced despite parser error: %+v", art)
+	}
+}
+
+// TestX25519Parser_MalformedKey asserts the in-core default parser wraps a
+// malformed recipient string with the actionable doctor hint and does not panic.
+func TestX25519Parser_MalformedKey(t *testing.T) {
+	t.Parallel()
+	p := encrypt.NewX25519Parser()
+	_, err := p.ParseRecipient(context.Background(), rectypes.Recipient{
+		Label:     "broken",
+		AgePubKey: "age1notavalidrecipient",
+	})
+	if err == nil {
+		t.Fatalf("malformed recipient: want error, got nil")
+	}
+	if !strings.Contains(err.Error(), "byreis doctor") {
+		t.Fatalf("error missing actionable hint: %v", err)
+	}
+}
+
+// TestRecipientParser_ReflectionInvariant is the AC-001-d guard: an age.Recipient
+// returned by the in-core X25519 parser must expose no field or method that
+// yields an age.Identity / *age.X25519Identity (a private-key route). The
+// contributor path consumes only this interface; if a Recipient could reflect
+// down to an identity, the write-only wedge would be defeated.
+func TestRecipientParser_ReflectionInvariant(t *testing.T) {
+	t.Parallel()
+	r, _ := testRecipient(t)
+	rec, err := encrypt.NewX25519Parser().ParseRecipient(context.Background(), r)
+	if err != nil {
+		t.Fatalf("parse recipient: %v", err)
+	}
+
+	identityType := reflect.TypeOf((*age.Identity)(nil)).Elem()
+	x25519IDType := reflect.TypeOf((*age.X25519Identity)(nil))
+
+	v := reflect.ValueOf(rec)
+	if assignableToIdentity(v.Type(), identityType, x25519IDType) {
+		t.Fatalf("recipient type %s is itself assignable to an identity — private-key route", v.Type())
+	}
+	// Walk exported fields one level (the X25519Recipient is an opaque struct;
+	// this guards against a future parser returning a recipient that embeds or
+	// exposes identity material).
+	rv := reflect.Indirect(v)
+	if rv.Kind() == reflect.Struct {
+		for i := 0; i < rv.NumField(); i++ {
+			ft := rv.Type().Field(i)
+			if !ft.IsExported() {
+				continue
+			}
+			if assignableToIdentity(ft.Type, identityType, x25519IDType) {
+				t.Fatalf("recipient exposes field %q of identity-bearing type %s", ft.Name, ft.Type)
+			}
+		}
+	}
+}
+
+func assignableToIdentity(t, iface, concrete reflect.Type) bool {
+	if t == concrete {
+		return true
+	}
+	if iface.Kind() == reflect.Interface && t.Implements(iface) {
+		return true
+	}
+	return false
 }

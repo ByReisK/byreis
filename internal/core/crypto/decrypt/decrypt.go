@@ -110,9 +110,12 @@ func (d *decryptor) RoundTripAll(
 }
 
 // decryptValue decrypts ONE armored age ciphertext with the given identity.
-// The plaintext is read fully into memory; the caller is responsible for
-// zeroizing the returned string's backing where practical.
-func decryptValue(armored string, id *age.X25519Identity) (string, error) {
+// id is the age.Identity interface: age.Decrypt accepts it directly, so any
+// backend (native X25519 or a hardware-token-backed identity) decrypts through
+// the same path with no concrete-type coupling. The plaintext is read fully
+// into memory; the caller is responsible for zeroizing the returned string's
+// backing where practical.
+func decryptValue(armored string, id age.Identity) (string, error) {
 	ar := armor.NewReader(strings.NewReader(armored))
 	r, err := age.Decrypt(ar, id)
 	if err != nil {

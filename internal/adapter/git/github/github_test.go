@@ -116,7 +116,7 @@ func buildSignedArtifact(t *testing.T) (artifact.Signed, []byte) {
 	t.Helper()
 	r := realRecipient(t)
 
-	encOut, err := encrypt.New().Encrypt(context.Background(), encrypt.EncryptInput{
+	encOut, err := encrypt.New(encrypt.NewX25519Parser()).Encrypt(context.Background(), encrypt.EncryptInput{
 		ProjectID:       "test-proj",
 		LogicalFileName: "secrets/prod.yaml",
 		Counter:         1,

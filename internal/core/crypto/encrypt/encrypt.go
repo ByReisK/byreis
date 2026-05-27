@@ -107,12 +107,56 @@ type Encryptor interface {
 	Encrypt(ctx context.Context, in EncryptInput) (artifact.Unsigned, error)
 }
 
-// New returns the concrete Encryptor implementation.
-func New() Encryptor {
-	return &encryptor{}
+// RecipientParser maps a pure rectypes.Recipient (a public recipient string
+// plus its fingerprint) to an age.Recipient. The contributor encrypt path
+// consumes ONLY this interface: it never constructs a concrete recipient and
+// never imports any recipient-backend package. This is the consumer-defined
+// seam that lets a backend-specific recipient (e.g. a hardware-token recipient)
+// be supplied by an outer adapter while this package stays provably free of any
+// private-key or backend import.
+//
+// Implementations live where their import cost belongs: the X25519 default is
+// in this package (it needs only filippo.io/age); a backend-aware
+// implementation lives in an adapter outside this compilation unit.
+type RecipientParser interface {
+	// ParseRecipient returns an age.Recipient for r, or a wrapped error carrying
+	// an actionable hint. It must touch NO private key and make NO network call.
+	ParseRecipient(ctx context.Context, r rectypes.Recipient) (age.Recipient, error)
 }
 
-type encryptor struct{}
+// New returns the concrete Encryptor implementation, constructing recipients via
+// the injected parser. Callers that only need native X25519 recipients pass
+// NewX25519Parser(); the composition root supplies a backend-aware parser when
+// the admin set may include non-X25519 recipients.
+func New(parser RecipientParser) Encryptor {
+	return &encryptor{parser: parser}
+}
+
+type encryptor struct {
+	parser RecipientParser
+}
+
+// x25519Parser is the in-package default RecipientParser. It wraps
+// age.ParseX25519Recipient and imports only filippo.io/age, so it stays inside
+// the contributor import allowlist and preserves the exact native-X25519
+// behaviour the contributor path has always had.
+type x25519Parser struct{}
+
+// NewX25519Parser returns the native-X25519 RecipientParser. It is the default
+// the composition root wires when no backend recipient is present and what every
+// X25519-only test injects.
+func NewX25519Parser() RecipientParser { return x25519Parser{} }
+
+func (x25519Parser) ParseRecipient(_ context.Context, r rectypes.Recipient) (age.Recipient, error) {
+	pk, err := age.ParseX25519Recipient(r.AgePubKey)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"invalid age recipient public key (label %q): %w — "+
+				"the registry returned a malformed recipient; re-run after `byreis doctor`",
+			r.Label, err)
+	}
+	return pk, nil
+}
 
 // Encrypt builds an UNSIGNED contributor artifact. Each value is an
 // independent multi-recipient age ciphertext from a FRESH age.Encrypt call to
@@ -131,18 +175,16 @@ func (e *encryptor) Encrypt(ctx context.Context, in EncryptInput) (artifact.Unsi
 		return artifact.Unsigned{}, fmt.Errorf("encrypt cancelled: %w", err)
 	}
 
-	// Parse all recipient public keys up front (public-key only — no identity
-	// type is reachable here by construction).
+	// Parse all recipient public keys up front via the injected parser
+	// (public-key only — no identity type is reachable here by construction).
+	// The parser owns the actionable hint on a malformed/unsupported recipient.
 	ageRecips := make([]age.Recipient, 0, len(in.Recipients))
 	for _, r := range in.Recipients {
-		pk, err := age.ParseX25519Recipient(r.AgePubKey)
+		rec, err := e.parser.ParseRecipient(ctx, r)
 		if err != nil {
-			return artifact.Unsigned{}, fmt.Errorf(
-				"invalid age recipient public key (label %q): %w — "+
-					"the registry returned a malformed recipient; re-run after `byreis doctor`",
-				r.Label, err)
+			return artifact.Unsigned{}, err
 		}
-		ageRecips = append(ageRecips, pk)
+		ageRecips = append(ageRecips, rec)
 	}
 
 	values := make(map[string]artifact.EncryptedValue, len(in.Values))

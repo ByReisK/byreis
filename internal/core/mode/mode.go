@@ -389,6 +389,43 @@ var matrix = map[Command]map[Mode]bool{
 // channels can grant admin. This is the single enforcement point — ad-hoc
 // per-command checks are forbidden.
 func (p *Policy) Allow(m Mode, cmd Command) error {
+	return allowFromMatrix(m, cmd)
+}
+
+// NeedsDecryptProbe reports whether the given command requires admin-level
+// decrypt capability, as determined by the permission matrix. A command
+// needs the decrypt probe iff the matrix denies it to ModeContributor and
+// admits it to ModeAdmin (or ModeSuper). Commands that are permitted in
+// contributor mode (submit, version, init, doctor, audit-verify, …) never
+// exercise admin decrypt, so the probe is wasteful and, for plugin-backed
+// identities, would touch the hardware token unnecessarily.
+//
+// Deriving the result from the same permission matrix as Allow ensures the
+// probe-suppression set and the permission-denial set are always identical:
+// if a command is added to the matrix in the future, its probe requirement
+// is automatically correct without any manual second list.
+//
+// Pre-flight safety invariant: NeedsDecryptProbe returning false can only
+// suppress a probe on commands that the matrix already classifies as not
+// requiring admin decrypt. It can NEVER suppress a probe on a command that
+// the matrix grants to admin only — those always return true.
+func NeedsDecryptProbe(cmd Command) bool {
+	modes, known := matrix[cmd]
+	if !known {
+		// Unknown commands are not permitted in any mode, so no decrypt probe
+		// is needed (the matrix gate will deny before any decrypt executes).
+		return false
+	}
+	// A command needs the decrypt probe iff it is admitted for ModeAdmin
+	// but NOT admitted for ModeContributor. Commands like submit, version,
+	// doctor, init, and audit-verify are admitted to contributors — they must
+	// not trigger a probe. Commands like get, decrypt, export, run, edit, etc.
+	// are admin-only — they must trigger a probe so mode detection works.
+	return modes[ModeAdmin] && !modes[ModeContributor]
+}
+
+// allowFromMatrix is the shared lookup used by Allow.
+func allowFromMatrix(m Mode, cmd Command) error {
 	modes, known := matrix[cmd]
 	if !known {
 		return fmt.Errorf("unknown command %q: %w", cmd, ErrPermissionDenied)

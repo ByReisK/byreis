@@ -435,6 +435,82 @@ Classifies partial rotation state (none / Phase-1-only / Phase-2-midflight /
 inconsistent) and, when safe, reverts Phase-1 side effects in a single signed
 registry commit. See `docs/rotation-runbook.md` for the full procedure.
 
+### Plugin-backed admin identities (YubiKey)
+
+byreis supports admin identities backed by hardware security tokens via the age
+plugin protocol. **Only `age-plugin-yubikey` is certified in this release.**
+TPM, FIDO2, and Secure Enclave are admitted by format but are not certified or
+tested; treat them as unsupported unless you are deliberately experimenting.
+
+#### Enrolling a YubiKey identity
+
+1. Install `age-plugin-yubikey` from its official release page on your admin
+   machine.
+
+2. Generate a new key slot on your YubiKey:
+   ```bash
+   age-plugin-yubikey --generate
+   ```
+   The tool prints an `age1yubikey1…` recipient string (the public identity you
+   register) and an `AGE-PLUGIN-YUBIKEY-1…` identity string (the private-side
+   handle you keep).
+
+3. Register the `age1yubikey1…` recipient string in your admin registry entry
+   (the `admins.yaml` field for your identity — the same field used for a plain
+   `age1…` X25519 public key). Commit and push the registry change through the
+   normal admin workflow.
+
+4. Run `byreis doctor` to confirm the registry now shows the plugin recipient
+   and that your identity resolves to ADMIN mode with the plugin key.
+
+#### What contributors install
+
+Contributors submitting to a project with plugin-backed admins need
+`age-plugin-yubikey` on PATH but do NOT need a YubiKey. The plugin binary
+handles the age recipient protocol on the contributor's machine during
+encryption; the YubiKey hardware is needed only at the admin's machine during
+decryption.
+
+If the binary is absent when a contributor runs `byreis submit`, the command
+fails immediately with an error naming the missing binary and an install hint,
+before any secret value is collected. Install `age-plugin-yubikey` from the
+official repository to resolve this.
+
+#### Linux prerequisite: `pcscd`
+
+On Linux, `age-plugin-yubikey` requires the `pcscd` smart card daemon to be
+running when the YubiKey is touched during decryption. Start it with:
+
+```bash
+sudo systemctl start pcscd
+```
+
+The contributor path does NOT touch the YubiKey and is not affected by `pcscd`.
+Only the admin decrypt path — and the startup mode-probe on an admin machine
+configured with a plugin identity — requires `pcscd`. If it is absent, the
+mode-probe fails closed and byreis downgrades to CONTRIBUTOR mode with a warning.
+
+#### Version skew
+
+Recipient strings (the `age1yubikey1…` string in the registry) do not encode
+the plugin version. If you re-enroll a token slot, the new recipient string
+differs from the old one. The old string in the registry becomes stale; update
+the registry entry to use the new string and rotate so existing files are
+re-encrypted to the new recipient. `byreis doctor` does not automatically detect
+this skew.
+
+#### PATH trust and no code-signature verification
+
+byreis invokes `age-plugin-*` binaries from your PATH and cannot verify their
+authenticity; a hostile binary earlier on PATH sees the file key — install
+plugins from trusted sources only. This applies on the contributor encrypt path
+as well as the admin decrypt path: a malicious plugin on a contributor's machine
+can observe the plaintext file key as it passes through the recipient protocol.
+Always obtain `age-plugin-yubikey` from the official repository and verify the
+download.
+
+---
+
 ### List access requests
 
 ```bash

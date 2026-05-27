@@ -16,18 +16,21 @@ import (
 // ErrParseIdentity is returned when an age private key string cannot be parsed.
 var ErrParseIdentity = errors.New("could not parse age identity (admin private key)")
 
-// Identity represents an admin's age X25519 private key. The private-key
-// material is held inside an age.X25519Identity; callers obtain the age
-// identity only via AgeIdentity, used by the admin decrypt path.
+// Identity represents an admin's private key material. The key is held behind
+// the age.Identity interface; callers obtain it only via AgeIdentity, used by
+// the admin decrypt path.
 type Identity interface {
 	// Recipient returns the corresponding age recipient public key string
 	// ("age1…"). Safe to log/display — it is public-key material only.
 	Recipient() string
 
-	// AgeIdentity returns the underlying age X25519 identity for decryption.
-	// Only the admin decrypt path calls this; the contributor path cannot
-	// reach this package (import allowlist).
-	AgeIdentity() *age.X25519Identity
+	// AgeIdentity returns the underlying age identity for decryption, as the
+	// age.Identity interface. The concrete backend (native X25519, or a
+	// hardware-token-backed identity supplied by an outer adapter) is opaque to
+	// consumers: age.Decrypt accepts the interface directly. Only the admin
+	// decrypt path calls this; the contributor path cannot reach this package
+	// (import allowlist).
+	AgeIdentity() age.Identity
 }
 
 // x25519Identity is the concrete admin identity. It wraps an age X25519
@@ -39,7 +42,10 @@ type x25519Identity struct {
 
 func (x *x25519Identity) Recipient() string { return x.id.Recipient().String() }
 
-func (x *x25519Identity) AgeIdentity() *age.X25519Identity { return x.id }
+// AgeIdentity returns the X25519 identity through the wider age.Identity
+// interface. *age.X25519Identity already satisfies age.Identity, so this is a
+// widening of the return type only — the concrete X25519 behaviour is unchanged.
+func (x *x25519Identity) AgeIdentity() age.Identity { return x.id }
 
 // Parse builds an Identity from an "AGE-SECRET-KEY-1…" string. The string is a
 // private key and MUST NOT be logged. Parsing failure is ErrParseIdentity

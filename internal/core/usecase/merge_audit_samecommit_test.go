@@ -93,7 +93,7 @@ func realE2EMergeDeps(t *testing.T) (usecase.MergeDeps, *spyAudit, *auditCapturi
 	spy := &spyAudit{}
 	ctr := &auditCapturingCounter{lastAccepted: 0}
 	deps := usecase.MergeDeps{
-		Git: g, Decryptor: realDecryptor(), Encryptor: encrypt.New(),
+		Git: g, Decryptor: realDecryptor(), Encryptor: encrypt.New(encrypt.NewX25519Parser()),
 		IDLoader:      &stubIDLoader{id: id},
 		ArtifactCodec: &realCodec{},
 		Recipients: &stubRecipients{

@@ -213,7 +213,7 @@ func mustID(t *testing.T, x *age.X25519Identity) identity.Identity {
 	return id
 }
 
-func encryptNew() encrypt.Encryptor { return encrypt.New() }
+func encryptNew() encrypt.Encryptor { return encrypt.New(encrypt.NewX25519Parser()) }
 
 func newArmorWriter(sb *strings.Builder) io.WriteCloser { return armor.NewWriter(sb) }
 

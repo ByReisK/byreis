@@ -59,14 +59,48 @@ var ErrArtifactNotFound = errors.New(
 type keyProbe struct {
 	cfg     identityadapter.Config
 	fetcher ArtifactFetcher
+	// needsDecryptProbe is set by the composition root before mode detection
+	// runs, based on which CLI command is being executed. When false, CanDecryptAny
+	// returns (false, nil) immediately — no identity is loaded and no plugin token
+	// is touched. This prevents a hardware-token admin from having their device
+	// prompted on every command invocation (including contributor commands such as
+	// submit, --help, version, and audit-verify).
+	//
+	// Safety invariant: this field may only suppress a probe for commands that the
+	// permission matrix already classifies as not requiring admin decrypt capability.
+	// For commands that do require admin decrypt (get, decrypt, export, run, edit,
+	// review, merge, rotate, etc.), the composition root always sets this to true so
+	// mode detection can determine whether the running identity is an admin.
+	//
+	// A suppressed probe returns (false, nil), which resolves to CONTRIBUTOR —
+	// the strictly-less-privileged result. The inverse failure (suppressing a
+	// required probe, causing a real admin to appear as contributor) is impossible
+	// because the composition root derives this value from NeedsDecryptProbe, which
+	// reads from the same permission matrix as the command gate.
+	needsDecryptProbe bool
+}
+
+// KeyProbeOptions holds optional parameters for NewKeyProbe beyond the
+// mandatory cfg and fetcher. The zero value is safe: needsDecryptProbe
+// defaults to false (no probe), which is the correct default for commands
+// that do not require admin decrypt capability.
+type KeyProbeOptions struct {
+	// NeedsDecryptProbe controls whether CanDecryptAny will attempt to load the
+	// identity and decrypt a project file. The composition root derives this from
+	// mode.NeedsDecryptProbe(resolvedCommand) so the decision is always consistent
+	// with the permission matrix.
+	NeedsDecryptProbe bool
 }
 
 // NewKeyProbe constructs the production KeyProbe. cfg is the identity loader
 // config (populated by the composition root from env + injected keychain);
 // fetcher provides the live artifact for CanDecryptAny (nil is safe: causes
 // CanDecryptAny to return (false, nil) — the "no file yet" path).
-func NewKeyProbe(cfg identityadapter.Config, fetcher ArtifactFetcher) *keyProbe {
-	return &keyProbe{cfg: cfg, fetcher: fetcher}
+// opts.NeedsDecryptProbe must be set to true for admin commands so that
+// mode detection can determine whether the running identity has decrypt
+// capability.
+func NewKeyProbe(cfg identityadapter.Config, fetcher ArtifactFetcher, opts KeyProbeOptions) *keyProbe {
+	return &keyProbe{cfg: cfg, fetcher: fetcher, needsDecryptProbe: opts.NeedsDecryptProbe}
 }
 
 // KeyFilePath returns the resolved key path using the SINGLE shared
@@ -166,13 +200,30 @@ func (k *keyProbe) KeyFilePerms(ctx context.Context) (uint32, error) {
 // CanDecryptAny attempts to decrypt exactly ONE value from the project's
 // file-of-record using the loaded identity.
 //
+// When the probe was constructed with NeedsDecryptProbe=false (a contributor-
+// mode or meta command that does not exercise admin decrypt capability), this
+// method returns (false, nil) immediately without loading the identity or
+// touching any hardware token. The result — CONTRIBUTOR — is the strictly
+// less-privileged outcome and is correct for commands the matrix classifies as
+// not requiring admin decrypt.
+//
 // Returns (true, nil) on successful decrypt.
-// Returns (false, nil) when the key is present but is not a recipient.
+// Returns (false, nil) when the key is present but is not a recipient, or
+// when the probe is suppressed for a non-decrypt command.
 // Returns (false, err) on probe failure — fails closed to CONTRIBUTOR.
 // NEVER returns plaintext: decrypted bytes are discarded immediately.
 func (k *keyProbe) CanDecryptAny(ctx context.Context, projectID string) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, fmt.Errorf("CanDecryptAny cancelled: %w", err)
+	}
+
+	// Probe suppression: when the resolved command does not require admin decrypt
+	// capability (per the permission matrix), skip loading the identity and return
+	// (false, nil). This prevents plugin-backed identities from touching the
+	// hardware token on every invocation — especially on contributor commands like
+	// submit, --help, version, and audit-verify.
+	if !k.needsDecryptProbe {
+		return false, nil
 	}
 
 	// Load the identity.
@@ -215,11 +266,14 @@ func (k *keyProbe) CanDecryptAny(ctx context.Context, projectID string) (bool, e
 }
 
 // probeDecryptOne attempts to decrypt one armored age ciphertext with the given
-// identity. Returns (true, nil) on success, (false, nil) when not a recipient,
-// (false, err) on I/O or format errors.
+// identity. id is the age.Identity interface: age.Decrypt accepts it directly,
+// so any backend (native X25519 or a hardware-token-backed identity) probes
+// through the same path with no concrete-type coupling. Returns (true, nil) on
+// success, (false, nil) when not a recipient, (false, err) on I/O or format
+// errors.
 //
 // Plaintext is read into io.Discard immediately; no plaintext escapes.
-func probeDecryptOne(armoredCT string, id *age.X25519Identity) (bool, error) {
+func probeDecryptOne(armoredCT string, id age.Identity) (bool, error) {
 	ar := armor.NewReader(strings.NewReader(armoredCT))
 	r, err := age.Decrypt(ar, id)
 	if err != nil {

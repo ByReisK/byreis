@@ -11,6 +11,12 @@
 # mode.CommandRequestReject, audit.EventKindReject). This is a reviewed, non-TUI
 # bump; TUI work must never trigger a baseline reseed.
 #
+# v0.9 reseed: the age-plugin admin-identity work adds the reviewed
+# recipient-construction seam (encrypt.RecipientParser, encrypt.NewX25519Parser)
+# and the closed recipient admit-set source of truth (validator.ClassifyRecipient,
+# validator.ErrUnsupportedRecipient, validator.SupportedRecipientBackends). These
+# are reviewed non-TUI use-case/validator additions; TUI work did not introduce them.
+#
 # v0.5 S1 reseed (REQ-V05-001, per-line audit-binding verifier) under
 # principal-go review: adds exactly the 12 reviewed audit-verification symbols —
 # the ErrAuditLogTampered sentinel; the BindingStatus enum type, its String
@@ -114,6 +120,8 @@ github.com/ByReisK/byreis/internal/core/crypto/encrypt#ErrManifestMismatch
 github.com/ByReisK/byreis/internal/core/crypto/encrypt#ErrNoRecipients
 github.com/ByReisK/byreis/internal/core/crypto/encrypt#ErrNoValues
 github.com/ByReisK/byreis/internal/core/crypto/encrypt#New
+github.com/ByReisK/byreis/internal/core/crypto/encrypt#NewX25519Parser
+github.com/ByReisK/byreis/internal/core/crypto/encrypt#RecipientParser
 github.com/ByReisK/byreis/internal/core/crypto/identity#ErrParseIdentity
 github.com/ByReisK/byreis/internal/core/crypto/identity#Identity
 github.com/ByReisK/byreis/internal/core/crypto/identity#Loader
@@ -277,6 +285,7 @@ github.com/ByReisK/byreis/internal/core/mode#Mode.String
 github.com/ByReisK/byreis/internal/core/mode#ModeAdmin
 github.com/ByReisK/byreis/internal/core/mode#ModeContributor
 github.com/ByReisK/byreis/internal/core/mode#ModeSuper
+github.com/ByReisK/byreis/internal/core/mode#NeedsDecryptProbe
 github.com/ByReisK/byreis/internal/core/mode#Policy
 github.com/ByReisK/byreis/internal/core/mode#Policy.Allow
 github.com/ByReisK/byreis/internal/core/mode#RegistryTrust
@@ -993,7 +1002,10 @@ github.com/ByReisK/byreis/internal/core/usecase/submit/envparse#Pair
 github.com/ByReisK/byreis/internal/core/usecase/submit/envparse#Pair.Key
 github.com/ByReisK/byreis/internal/core/usecase/submit/envparse#Pair.Value
 github.com/ByReisK/byreis/internal/core/usecase/submit/envparse#Parse
+github.com/ByReisK/byreis/internal/core/validator#ClassifyRecipient
 github.com/ByReisK/byreis/internal/core/validator#ErrInvalidKey
 github.com/ByReisK/byreis/internal/core/validator#ErrInvalidValue
+github.com/ByReisK/byreis/internal/core/validator#ErrUnsupportedRecipient
+github.com/ByReisK/byreis/internal/core/validator#SupportedRecipientBackends
 github.com/ByReisK/byreis/internal/core/validator#ValidateKeyName
 github.com/ByReisK/byreis/internal/core/validator#ValidateValue
