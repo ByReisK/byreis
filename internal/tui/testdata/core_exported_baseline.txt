@@ -30,6 +30,14 @@
 # adapter-confined (no core symbol). This is a reviewed, non-TUI core addition;
 # TUI work must never trigger a baseline reseed.
 #
+# v0.6 S3 reseed (Synthetic field split) under principal-go review: adds exactly
+# the 1 reviewed symbol AuditEntryView.Synthetic — the additive typed marker for a
+# parser-fabricated display row (truncation advisory / malformed-line placeholder),
+# distinct from Unknown so an Unknown-but-valid-JSON row stays hash-verified. The
+# parse-time setter and isSyntheticRow reader are adapter-confined (no core symbol).
+# The S4 staged-set fail-closed change is adapter-internal and adds zero core symbols.
+# This is a reviewed, non-TUI core addition; TUI work must never trigger a baseline reseed.
+#
 # From this point the baseline is FROZEN for TUI work. Any new exported symbol
 # from internal/core/** not present here fails the ceiling gate. Escalate to
 # principal-go to extend.
@@ -660,6 +668,7 @@ github.com/ByReisK/byreis/internal/core/usecase/rotate#AuditEntryView.OccurredAt
 github.com/ByReisK/byreis/internal/core/usecase/rotate#AuditEntryView.Outcome
 github.com/ByReisK/byreis/internal/core/usecase/rotate#AuditEntryView.Project
 github.com/ByReisK/byreis/internal/core/usecase/rotate#AuditEntryView.SafeDetails
+github.com/ByReisK/byreis/internal/core/usecase/rotate#AuditEntryView.Synthetic
 github.com/ByReisK/byreis/internal/core/usecase/rotate#AuditEntryView.Unknown
 github.com/ByReisK/byreis/internal/core/usecase/rotate#AuditEntryView.VerifiedSignerID
 github.com/ByReisK/byreis/internal/core/usecase/rotate#AuditReader

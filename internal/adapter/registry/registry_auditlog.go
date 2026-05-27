@@ -141,11 +141,14 @@ func parseAuditJSONL(raw []byte, projectID string) ([]rotate.AuditEntryView, err
 			// rather than aborting the entire result, matching the forward-compat
 			// tolerance requirement (an unrecognised or malformed line is surfaced
 			// as a warning row, not a hard error).
+			// Synthetic=true: this row was fabricated by the parser — it has no
+			// verifiable JSON bytes on disk and must be excluded from hash verification.
 			views = append(views, rotate.AuditEntryView{
 				Kind:       "malformed-line",
 				Project:    projectID,
 				OccurredAt: time.Now().UTC().Format(time.RFC3339),
 				Unknown:    true,
+				Synthetic:  true,
 			})
 			continue
 		}
@@ -175,6 +178,8 @@ func parseAuditJSONL(raw []byte, projectID string) ([]rotate.AuditEntryView, err
 
 	// Result count exceeded: return the most recent maxAuditResultCount entries
 	// (tail) with a synthetic truncation-advisory entry prepended.
+	// Synthetic=true: this row was fabricated by the parser — it has no
+	// verifiable JSON bytes on disk and must be excluded from hash verification.
 	total := len(views)
 	tail := views[total-maxAuditResultCount:]
 	advisory := rotate.AuditEntryView{
@@ -183,6 +188,7 @@ func parseAuditJSONL(raw []byte, projectID string) ([]rotate.AuditEntryView, err
 		Project:    projectID,
 		Outcome:    fmt.Sprintf("showing most recent %d of %d entries", maxAuditResultCount, total),
 		Unknown:    true,
+		Synthetic:  true,
 	}
 	result := make([]rotate.AuditEntryView, 0, maxAuditResultCount+1)
 	result = append(result, advisory)
@@ -220,11 +226,14 @@ func parseAuditJSONLWithRawLines(raw []byte, projectID string) ([]rotate.AuditEn
 
 		var e audit.Event
 		if decErr := json.Unmarshal(line, &e); decErr != nil {
+			// Synthetic=true: this row was fabricated by the parser — it has no
+			// verifiable JSON bytes on disk and must be excluded from hash verification.
 			views = append(views, rotate.AuditEntryView{
 				Kind:       "malformed-line",
 				Project:    projectID,
 				OccurredAt: time.Now().UTC().Format(time.RFC3339),
 				Unknown:    true,
+				Synthetic:  true,
 			})
 			rawLines = append(rawLines, nil) // no canonical bytes for a malformed line
 			continue
@@ -258,12 +267,15 @@ func parseAuditJSONLWithRawLines(raw []byte, projectID string) ([]rotate.AuditEn
 	total := len(views)
 	tailViews := views[total-maxAuditResultCount:]
 	tailRaw := rawLines[total-maxAuditResultCount:]
+	// Synthetic=true: this row was fabricated by the parser — it has no
+	// verifiable JSON bytes on disk and must be excluded from hash verification.
 	advisory := rotate.AuditEntryView{
 		Kind:       "truncated",
 		OccurredAt: time.Now().UTC().Format(time.RFC3339),
 		Project:    projectID,
 		Outcome:    fmt.Sprintf("showing most recent %d of %d entries", maxAuditResultCount, total),
 		Unknown:    true,
+		Synthetic:  true,
 	}
 	outViews := make([]rotate.AuditEntryView, 0, maxAuditResultCount+1)
 	outViews = append(outViews, advisory)

@@ -525,8 +525,13 @@ type auditCommitInfo struct {
 	// that predate the byreis-signer footer convention).
 	SignerID string
 	// StagedFiles is the set of file paths staged in this commit. Used for the
-	// cross-project-splice check.
+	// cross-project-splice check. Nil only when StagedFilesUndeterminable is true.
 	StagedFiles map[string]struct{}
+	// StagedFilesUndeterminable is true when the git diff-tree call that should
+	// populate StagedFiles failed. The caller must treat this as a fail-closed
+	// signal and mark the associated line BindingTampered rather than silently
+	// skipping the splice dimension.
+	StagedFilesUndeterminable bool
 	// LineIndex is the 0-based index (from the start of the file) of the line
 	// this commit introduced, as determined by the walk order.
 	LineIndex int
@@ -700,6 +705,9 @@ func extractCommitInfo(
 	info.SignedByAnchor = (verifyErr == nil && verifyExit == 0)
 
 	// Get the set of files changed by this commit (for cross-project-splice check).
+	// Fail closed: if the staged-file set cannot be determined, mark the commit as
+	// having an undeterminable staged set. The caller (bindLines) will treat this as
+	// BindingTampered rather than silently skipping the splice dimension.
 	filesCtx, filesCancel := fetchtransport.WithBoundedDeadline(ctx, auditVerifyReadTimeout)
 	filesOut, _, filesExit, filesErr := pt.verifier.RunSubprocess(
 		filesCtx, cloneDir, hardenedEnv,
@@ -708,16 +716,20 @@ func extractCommitInfo(
 	filesCancel()
 	if filesErr == nil && filesExit == 0 {
 		info.StagedFiles = parseFilesList(string(filesOut))
+	} else {
+		// Cannot determine what files the commit staged — the splice dimension is
+		// unknowable. Record the undeterminable state so bindLines can fail closed.
+		info.StagedFilesUndeterminable = true
 	}
 
 	// Parse per-file counter pairs from the signed commit body for anchor-signed
 	// commits only. Parsing from non-anchor-signed commits is skipped: the
 	// monotonicity assertion only applies to the authentic sequence.
-	// Parse from the commit body, never from JSONL line content (Rule A).
+	// Counters are sourced from the anchor-signed commit body only, never from JSONL line content.
 	if info.SignedByAnchor {
 		pairs, pairsErr := parseCounterPairs(string(bodyOut))
 		if pairsErr != nil {
-			// Rule E: malformed-present field in an anchor-signed body is a
+			// A malformed-present counter field in an anchor-signed body is a
 			// contradiction — return the error so bindLines can mark the line
 			// BindingTampered. Store the error in CounterPairs as nil; the
 			// non-nil pairsErr is propagated to the caller.
@@ -813,13 +825,27 @@ func bindLines(
 	// Reorder check: the introducing commit index must be
 	// strictly increasing (no reorder within the history).
 	var tamperErr error
-	for seq, lineIdx := range nonSyntheticIndices {
-		ci := commits[seq]
+	for seq, ci := range commits {
+		lineIdx := nonSyntheticIndices[seq]
 		entry := allEntries[lineIdx]
 
 		// Cross-project-splice check: the commit must stage
 		// ONLY this project's audit file (plus its counter file(s)). A commit
 		// that also touches another project's audit file is a splice.
+		//
+		// Fail-closed: if the staged-file set is undeterminable (diff-tree failed),
+		// treat the line as BindingTampered rather than skipping the splice dimension.
+		// A silent splice-skip on an undeterminable staged set is a security regression.
+		if ci.StagedFilesUndeterminable {
+			result.Entries[lineIdx].BindingStatus = rotate.BindingTampered
+			if tamperErr == nil {
+				tamperErr = fmt.Errorf(
+					"%w: line %d (commit %q): staged-file set is undeterminable — "+
+						"splice check cannot proceed, failing closed",
+					coreregistry.ErrAuditLogTampered, lineIdx+1, ci.SHA)
+			}
+			continue
+		}
 		if len(ci.StagedFiles) > 0 {
 			if spliceErr := checkSplice(ci.StagedFiles, projectID, auditFilePath); spliceErr != nil {
 				result.Entries[lineIdx].BindingStatus = rotate.BindingTampered
@@ -922,21 +948,21 @@ func bindLines(
 		result.Entries[lineIdx].VerifiedSignerID = ci.SignerID
 	}
 
-	// Counter-monotonicity check (Rule B + C + D): walk the commits in the same
-	// chronological order and assert per-FILE continuity of counter fields parsed
-	// from anchor-signed commit bodies. This closes the E2 residual: a
-	// back-positioned anchor-signed fabricated insert cannot forge a monotonic
-	// counter predecessor under the pinned anchor.
+	// Counter-monotonicity check: walk the commits in the same chronological
+	// order and assert per-file continuity of the counter fields parsed from
+	// anchor-signed commit bodies. This detects a back-positioned anchor-signed
+	// fabricated insert, which cannot forge a monotonic counter predecessor
+	// under the pinned anchor even when its content hash matches.
 	//
 	// The check is performed even when the content-hash already passed for a line,
 	// because a counter break proves the ordered introducing-commit set is not the
 	// genuine monotonic sequence — an independent evidence of tampering.
 	//
-	// Rule C: absence (no counter fields in an anchor-signed body) is not a
+	// Absence of counter fields in an anchor-signed body is not a
 	// contradiction and does NOT advance lastAccepted. Only a contradiction
 	// (fields present but breaking continuity) is BindingTampered.
 	//
-	// Rule D: ordering is git history position only, never wall-clock timestamps.
+	// Ordering is git history position only, never wall-clock timestamps.
 	//
 	// seamSeed (non-nil on the warm/incremental path) pre-seeds lastAccepted with
 	// the last-verified counter state from before the checkpoint seam so the first
@@ -1007,18 +1033,19 @@ func checkCounterMonotonicity(
 		}
 		ci := commits[seq]
 
-		// Only anchor-signed commits participate in the counter walk (Rule A).
+		// Only anchor-signed commits participate in the counter walk; the
+		// monotonicity assertion is sourced from the authentic signed sequence only.
 		if !ci.SignedByAnchor {
 			continue
 		}
-		// No counter pairs in this commit: absence is not contradiction (Rule C).
+		// No counter pairs in this commit: absence of counter fields is not a contradiction.
 		if len(ci.CounterPairs) == 0 {
 			continue
 		}
 
 		for file, pair := range ci.CounterPairs {
-			// Absence-vs-contradiction: pair.Present == false means both fields
-			// were absent from the body (not a contradiction). Skip. (Rule C)
+			// pair.Present == false means both counter fields were absent from the
+			// body — absence is not a contradiction, so skip without error.
 			if !pair.Present {
 				continue
 			}
@@ -1123,8 +1150,8 @@ func deriveSeamCounterSeed(
 		return nil, fmt.Errorf("deriveSeamCounterSeed: extractCommitInfo(%s): %w", predecessorSHA, infoErr)
 	}
 
-	// Only anchor-signed commits participate in counter continuity (Rule A).
-	// A non-anchor-signed predecessor cannot be trusted as a seam seed; force cold re-walk.
+	// Counter continuity is only tracked across anchor-signed commits; counters
+	// from non-anchor-signed predecessors cannot be trusted as a seam seed — force cold re-walk.
 	if !info.SignedByAnchor {
 		return nil, fmt.Errorf("deriveSeamCounterSeed: predecessor commit %s is not signed by the trust anchor — cannot seed seam counter check", predecessorSHA)
 	}
@@ -1132,7 +1159,7 @@ func deriveSeamCounterSeed(
 	// CounterPairs is nil when the commit body carried no counter fields.
 	// Returning nil, nil is correct: the warm path will treat all files as
 	// first-sighting (no predecessor check), which matches the cold-walk behaviour
-	// for commits without counter fields (Rule C: absence is not contradiction).
+	// for commits without counter fields (absence of counter fields is not a contradiction).
 	return info.CounterPairs, nil
 }
 
@@ -1243,7 +1270,7 @@ func parseAuditEntrySHA(body string) string {
 // (or absent key) means the fields were not found for that file. A field that
 // IS present but non-numeric (malformed-present) is signalled by returning
 // (nil, errCounterFieldMalformed) so the caller can treat it as contradiction
-// rather than absence (Rule E: fail-closed parse).
+// rather than absence: a malformed-present field fails closed.
 //
 // Counters are parsed from the commit body only, never from JSONL line content.
 func parseCounterPairs(body string) (map[string]counterPair, error) {
@@ -1261,8 +1288,8 @@ func parseCounterPairs(body string) (map[string]counterPair, error) {
 		if currentFile == "" {
 			return nil
 		}
-		// Rule E: if exactly one of the pair is present, the other is a malformed
-		// absence — treat the commit body as contradictory on this file.
+		// If exactly one field of a counter pair is present, the other is a malformed
+		// absence — treat the commit body as contradictory on this file and fail closed.
 		if hasPrev != hasPend {
 			return fmt.Errorf("counter field partially present for file %q in commit body "+
 				"(expected_previous_counter present=%v, pending_counter present=%v) — "+
@@ -1299,7 +1326,7 @@ func parseCounterPairs(body string) (map[string]counterPair, error) {
 			val := strings.TrimSpace(strings.TrimPrefix(trimmed, "expected_previous_counter:"))
 			n, parseErr := strconv.ParseUint(val, 10, 64)
 			if parseErr != nil {
-				// Field present but non-numeric: Rule E — fail-closed.
+				// Field present but non-numeric: fail closed, treating it as a contradiction.
 				return nil, fmt.Errorf("counter field expected_previous_counter has "+
 					"non-numeric value %q for file %q — "+
 					"malformed-present counter field treated as contradiction",
@@ -1314,7 +1341,7 @@ func parseCounterPairs(body string) (map[string]counterPair, error) {
 			val := strings.TrimSpace(strings.TrimPrefix(trimmed, "pending_counter:"))
 			n, parseErr := strconv.ParseUint(val, 10, 64)
 			if parseErr != nil {
-				// Field present but non-numeric: Rule E — fail-closed.
+				// Field present but non-numeric: fail closed, treating it as a contradiction.
 				return nil, fmt.Errorf("counter field pending_counter has "+
 					"non-numeric value %q for file %q — "+
 					"malformed-present counter field treated as contradiction",
@@ -1361,19 +1388,18 @@ func parseFilesList(out string) map[string]struct{} {
 }
 
 // isSyntheticRow reports whether an AuditEntryView is a synthetic display row
-// (truncation-advisory or malformed-line) that must never be hash-checked
-// (they have no introducing-commit binding to check against).
+// (a truncation advisory or malformed-line placeholder fabricated by the parser)
+// that must be excluded from hash verification.
 //
-// Synthetic rows are identified ONLY by their reserved Kind values. The Unknown
-// flag is intentionally excluded: an entry with Unknown=true but Kind not in
-// the reserved set has valid JSON bytes on disk (the parser only sets
-// Unknown=true for unrecognised event kinds, not for malformed JSON). That
-// entry participates in the git history and its raw bytes must be verified
-// against audit_entry_sha. Treating Unknown rows as synthetic would allow a
-// content edit that changes an event kind to an unrecognised value to silently
-// evade hash verification.
+// The decision is made exclusively from the typed Synthetic field, which is set
+// ONLY by the two parse sites (parseAuditJSONL and parseAuditJSONLWithRawLines)
+// that fabricate rows. This is intentionally distinct from Unknown: an entry
+// with Unknown=true but Synthetic=false has valid JSON bytes on disk (the parser
+// sets Unknown=true for unrecognised event kinds that decoded successfully) and
+// must stay in the binding walk so a content edit cannot evade hash verification
+// by changing a known kind to an unrecognised one.
 func isSyntheticRow(e rotate.AuditEntryView) bool {
-	return e.Kind == "truncated" || e.Kind == "malformed-line"
+	return e.Synthetic
 }
 
 // findNonSyntheticSplitIndex returns the slice index of the first entry AFTER

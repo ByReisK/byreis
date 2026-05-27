@@ -77,6 +77,52 @@ func TestAuditEntryView_BindingStatusDefault(t *testing.T) {
 	}
 }
 
+// TestAuditEntryView_SyntheticDefaultAndOrthogonal asserts the additive
+// Synthetic field defaults to false (a zero-value view is NOT a synthetic
+// display row) and that Synthetic and Unknown are independent booleans. The two
+// flags answer different questions: Synthetic marks a parser-fabricated display
+// row (truncation advisory / malformed line) that carries no verifiable JSON and
+// is excluded from hash verification, while Unknown is a forward-compat hint for
+// a valid-JSON entry whose Kind fell outside the accepted set. Conflating them is
+// the tamper-evasion class the typed field now guards structurally: an
+// Unknown=true, Synthetic=false row MUST still be hash-verified. The behavioural
+// proof of that ("Unknown-but-valid-JSON row stays in the binding walk; synthetic
+// rows are excluded") is the adapter parser's integration test and is NOT built
+// here — this package does not own the parser/isSyntheticRow rewire.
+func TestAuditEntryView_SyntheticDefaultAndOrthogonal(t *testing.T) {
+	t.Parallel()
+
+	var v rotate.AuditEntryView
+	if v.Synthetic {
+		t.Fatalf("zero AuditEntryView.Synthetic = true, want false")
+	}
+
+	// The two flags are orthogonal: every combination is representable and
+	// neither field's value constrains the other.
+	for _, tc := range []struct {
+		name      string
+		unknown   bool
+		synthetic bool
+	}{
+		{"neither", false, false},
+		{"unknown-only", true, false},
+		{"synthetic-only", false, true},
+		{"both", true, true},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			e := rotate.AuditEntryView{Unknown: tc.unknown, Synthetic: tc.synthetic}
+			if e.Unknown != tc.unknown {
+				t.Errorf("Unknown = %v, want %v", e.Unknown, tc.unknown)
+			}
+			if e.Synthetic != tc.synthetic {
+				t.Errorf("Synthetic = %v, want %v", e.Synthetic, tc.synthetic)
+			}
+		})
+	}
+}
+
 // fakeAuditVerifier is an in-memory AuditVerifier used only to prove the
 // consumer-defined port is satisfiable without any SDK type and that the typed
 // error rides ALONGSIDE the per-line projection (a tamper outcome returns both

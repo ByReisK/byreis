@@ -521,6 +521,23 @@ type AuditEntryView struct {
 	// entry, so a newer client that wrote a future event class does not crash
 	// an admin's audit display.
 	Unknown bool
+	// Synthetic is the single authoritative marker for a parser-fabricated
+	// display row: a truncation advisory or a malformed-line placeholder the
+	// parser emits so a damaged channel renders a visible row instead of being
+	// silently dropped. A synthetic row carries no verifiable JSON entry, so it
+	// always carries BindingMissing and is EXCLUDED from hash verification.
+	//
+	// Synthetic is DISTINCT from Unknown and the two are orthogonal. Unknown is a
+	// forward-compat display hint for an entry whose bytes ARE valid JSON but
+	// whose Kind fell outside the accepted set; such a row (Unknown=true,
+	// Synthetic=false) is a real, content-bearing line and MUST still be
+	// hash-verified — it stays in the binding walk. Conflating the two (treating
+	// an Unknown row as synthetic and so skipping its hash check) is the
+	// tamper-evasion class an earlier fix closed by convention; carrying the
+	// marker as a typed field guards that invariant structurally rather than in a
+	// helper comment. Only the parser sets Synthetic, and only for rows it itself
+	// fabricated.
+	Synthetic bool
 	// BindingStatus is the per-line verification result: whether this entry was
 	// bound to the signed commit that introduced it. The zero value is
 	// BindingMissing (the unbindable/synthetic state), so a view the verifier
