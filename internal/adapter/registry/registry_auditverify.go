@@ -43,6 +43,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -332,7 +333,26 @@ func (c *Client) VerifyAuditLog(ctx context.Context, projectID string) (rotate.A
 		newEntries := allEntries[splitIdx:]
 		newRawLines := allRawLines[splitIdx:]
 
-		newResult, newBindErr := bindLines(newEntries, newRawLines, commitInfos, projectID, auditFilePath)
+		// Derive the seam counter seed: read the last pre-checkpoint commit for this
+		// audit file from the anchor-verified cloned history and extract its counter
+		// pairs. This seeds checkCounterMonotonicity so the first new commit after
+		// the seam is validated as a continuation, not as a fresh first-sighting
+		// baseline. The seed comes from anchor-verified history — never from the
+		// cache — so a forged checkpoint cannot carry false counter state.
+		seamSeed, seamErr := deriveSeamCounterSeed(
+			walkCtx, pt, tmpDir, cloneDir, hardenedEnv, allowedSignersPath,
+			ckpt.VerifiedHeadSHA, auditFilePath,
+		)
+		if seamErr != nil {
+			// Seed derivation failure: force a cold re-walk so the seam is
+			// fully re-verified rather than skipped with an unvalidated seed.
+			return performColdReWalk(
+				walkCtx, pt, tmpDir, cloneDir, hardenedEnv,
+				headCommit, projectID, c.cfg.TrustAnchorKey,
+			)
+		}
+
+		newResult, newBindErr := bindLines(newEntries, newRawLines, commitInfos, projectID, auditFilePath, seamSeed)
 
 		// Re-assemble the full result: prior entries tagged BindingVerified +
 		// newly bound entries.
@@ -349,7 +369,7 @@ func (c *Client) VerifyAuditLog(ctx context.Context, projectID string) (rotate.A
 		result = rotate.AuditVerifyResult{Entries: combined}
 		bindErr = newBindErr
 	} else {
-		result, bindErr = bindLines(allEntries, allRawLines, commitInfos, projectID, auditFilePath)
+		result, bindErr = bindLines(allEntries, allRawLines, commitInfos, projectID, auditFilePath, nil)
 	}
 
 	// Step 8: store checkpoint on a clean full walk (no tamper, no error).
@@ -471,9 +491,20 @@ func performColdReWalk(
 	if walkErr != nil {
 		return rotate.AuditVerifyResult{}, walkErr
 	}
-	result, bindErr := bindLines(allEntries, allRawLines, commitInfos, projectID, auditFilePath)
+	result, bindErr := bindLines(allEntries, allRawLines, commitInfos, projectID, auditFilePath, nil)
 	result.FullWalk = true
 	return result, bindErr
+}
+
+// counterPair holds the (expected_previous_counter, pending_counter) pair parsed
+// from an anchor-signed commit body for one logical file. The Present flag
+// distinguishes "fields absent from the body" from "parsed zero value" — a
+// pending_counter of 0 is a legitimate first-accept value and must not be
+// treated as absent. Parse from the commit body only, never from JSONL content.
+type counterPair struct {
+	ExpectedPrevious uint64
+	Pending          uint64
+	Present          bool // true only when BOTH fields were successfully parsed
 }
 
 // auditCommitInfo records per-commit metadata extracted from the git log walk.
@@ -499,6 +530,13 @@ type auditCommitInfo struct {
 	// LineIndex is the 0-based index (from the start of the file) of the line
 	// this commit introduced, as determined by the walk order.
 	LineIndex int
+	// CounterPairs holds the per-file counter pairs parsed from an anchor-signed
+	// commit body. Keyed by logical file name (as written in the body's "file:"
+	// lines). Only populated when SignedByAnchor == true. A counter pair is
+	// absent from the map when the commit body carries no counter fields for
+	// that file — absence is distinct from a parsed zero value (see counterPair.Present).
+	// Parsed from the signed commit body only, never from JSONL line content.
+	CounterPairs map[string]counterPair
 }
 
 // walkAuditHistory runs git log over the audit file path and collects per-commit
@@ -672,6 +710,24 @@ func extractCommitInfo(
 		info.StagedFiles = parseFilesList(string(filesOut))
 	}
 
+	// Parse per-file counter pairs from the signed commit body for anchor-signed
+	// commits only. Parsing from non-anchor-signed commits is skipped: the
+	// monotonicity assertion only applies to the authentic sequence.
+	// Parse from the commit body, never from JSONL line content (Rule A).
+	if info.SignedByAnchor {
+		pairs, pairsErr := parseCounterPairs(string(bodyOut))
+		if pairsErr != nil {
+			// Rule E: malformed-present field in an anchor-signed body is a
+			// contradiction — return the error so bindLines can mark the line
+			// BindingTampered. Store the error in CounterPairs as nil; the
+			// non-nil pairsErr is propagated to the caller.
+			return info, fmt.Errorf(
+				"%w: VerifyAuditLog: counter field parse error in anchor-signed commit %q: %v",
+				coreregistry.ErrAuditLogTampered, sha, pairsErr)
+		}
+		info.CounterPairs = pairs
+	}
+
 	return info, nil
 }
 
@@ -688,6 +744,14 @@ func extractCommitInfo(
 // AuditEntryView is incorrect because the view is a lossy projection and
 // drops fields such as FileName, KeyName, and PRRef.
 //
+// seamSeed, when non-nil, pre-seeds the counter-monotonicity check with the
+// last-accepted counter state from before the checkpoint seam. It allows the
+// first new commit after an incremental walk to be validated as a continuation
+// of the prior sequence rather than accepted as a fresh first-sighting baseline
+// with no predecessor check. The seed must come from anchor-verified history
+// — never from the checkpoint cache — so a forged checkpoint cannot inject a
+// false predecessor value.
+//
 // The returned AuditVerifyResult.Entries preserves the original entry order.
 // On a tamper outcome the function returns the PARTIAL result WITH the
 // ErrAuditLogTampered error so the caller can render per-line status and still
@@ -697,6 +761,7 @@ func bindLines(
 	rawLines [][]byte,
 	commits []auditCommitInfo,
 	projectID, auditFilePath string,
+	seamSeed map[string]counterPair,
 ) (rotate.AuditVerifyResult, error) {
 	result := rotate.AuditVerifyResult{Entries: make([]rotate.AuditEntryView, len(allEntries))}
 	copy(result.Entries, allEntries)
@@ -857,7 +922,218 @@ func bindLines(
 		result.Entries[lineIdx].VerifiedSignerID = ci.SignerID
 	}
 
+	// Counter-monotonicity check (Rule B + C + D): walk the commits in the same
+	// chronological order and assert per-FILE continuity of counter fields parsed
+	// from anchor-signed commit bodies. This closes the E2 residual: a
+	// back-positioned anchor-signed fabricated insert cannot forge a monotonic
+	// counter predecessor under the pinned anchor.
+	//
+	// The check is performed even when the content-hash already passed for a line,
+	// because a counter break proves the ordered introducing-commit set is not the
+	// genuine monotonic sequence — an independent evidence of tampering.
+	//
+	// Rule C: absence (no counter fields in an anchor-signed body) is not a
+	// contradiction and does NOT advance lastAccepted. Only a contradiction
+	// (fields present but breaking continuity) is BindingTampered.
+	//
+	// Rule D: ordering is git history position only, never wall-clock timestamps.
+	//
+	// seamSeed (non-nil on the warm/incremental path) pre-seeds lastAccepted with
+	// the last-verified counter state from before the checkpoint seam so the first
+	// new commit is checked as a continuation, not as an unchecked first baseline.
+	tamperErr = checkCounterMonotonicity(result.Entries, nonSyntheticIndices, commits, projectID, tamperErr, seamSeed)
+
 	return result, tamperErr
+}
+
+// checkCounterMonotonicity enforces per-file counter continuity across the
+// ordered anchor-signed commit walk. It is called as a second pass over the
+// paired (commits × nonSyntheticIndices) after the content-hash phase, so it
+// can fire BindingTampered even when the hash check passed.
+//
+// lastAccepted tracks the most-recently-accepted pending_counter per file
+// across the ordered walk. On each anchor-signed commit with Present==true
+// counter pairs:
+//   - First sighting (not pre-seeded): accept pending as baseline; no predecessor required.
+//   - First sighting (pre-seeded via seamSeed): enforce continuity immediately — the
+//     new commit must chain from the seam predecessor derived from anchor-verified history.
+//   - Subsequent sighting: assert expected_previous == lastAccepted AND
+//     pending == expected_previous + 1. A break → BindingTampered.
+//
+// seamSeed, when non-nil, pre-populates lastAccepted and lastAcceptedSeen before
+// the walk. It carries the last-verified counter state from before the checkpoint
+// seam and must have been derived from anchor-verified history — never from the
+// checkpoint cache. A forged checkpoint therefore cannot inject a false seed
+// because the seed is re-derived from the clone's git history at call time.
+//
+// Absence (Present==false) does not advance lastAccepted and is not a tamper.
+// Non-anchor-signed commits are skipped entirely.
+//
+// The existing tamperErr is threaded through: if it is already set, new tamper
+// findings keep it set but do not replace the first-recorded error message (to
+// preserve the earliest tamper signal for actionable CLI output).
+func checkCounterMonotonicity(
+	entries []rotate.AuditEntryView,
+	nonSyntheticIndices []int,
+	commits []auditCommitInfo,
+	projectID string,
+	existingTamperErr error,
+	seamSeed map[string]counterPair,
+) error {
+	// lastAccepted maps logical file name → most-recently-accepted pending counter.
+	// A file is absent from the map until its first sighting.
+	lastAccepted := make(map[string]uint64)
+	// lastAcceptedSeen tracks which files have been seen at least once (to
+	// distinguish "first sighting" from "subsequent sighting" even when the
+	// first accepted value is 0).
+	lastAcceptedSeen := make(map[string]bool)
+
+	// Pre-seed from the seam predecessor (warm/incremental path only). Each entry
+	// in seamSeed was parsed from an anchor-verified commit body; a file whose
+	// seam commit carried no counter fields (Present==false) is not seeded, which
+	// correctly preserves the "first sighting" treatment for that file.
+	for file, pair := range seamSeed {
+		if pair.Present {
+			lastAccepted[file] = pair.Pending
+			lastAcceptedSeen[file] = true
+		}
+	}
+
+	tamperErr := existingTamperErr
+
+	for seq, lineIdx := range nonSyntheticIndices {
+		if seq >= len(commits) {
+			break
+		}
+		ci := commits[seq]
+
+		// Only anchor-signed commits participate in the counter walk (Rule A).
+		if !ci.SignedByAnchor {
+			continue
+		}
+		// No counter pairs in this commit: absence is not contradiction (Rule C).
+		if len(ci.CounterPairs) == 0 {
+			continue
+		}
+
+		for file, pair := range ci.CounterPairs {
+			// Absence-vs-contradiction: pair.Present == false means both fields
+			// were absent from the body (not a contradiction). Skip. (Rule C)
+			if !pair.Present {
+				continue
+			}
+
+			prev, seen := lastAccepted[file]
+			if !seen {
+				// First sighting: accept pending as baseline. No predecessor required.
+				lastAccepted[file] = pair.Pending
+				lastAcceptedSeen[file] = true
+				continue
+			}
+
+			// Subsequent sighting: assert continuity.
+			// A break: pending <= lastAccepted (regression/overlap)
+			//        OR pending > lastAccepted + 1 (gap)
+			//        OR expected_previous != lastAccepted (forked predecessor)
+			continuityOK := pair.ExpectedPrevious == prev &&
+				pair.Pending == prev+1
+
+			if !continuityOK {
+				// Counter break: mark the line BindingTampered (even if content-hash
+				// passed — this proves the commit is not in the genuine sequence).
+				entries[lineIdx].BindingStatus = rotate.BindingTampered
+				if tamperErr == nil {
+					tamperErr = fmt.Errorf(
+						"%w: counter monotonicity break at line %d (commit %q, file %q): "+
+							"expected_previous_counter=%d (want %d), "+
+							"pending_counter=%d (want %d) — "+
+							"possible back-positioned fabricated insert or history rewrite",
+						coreregistry.ErrAuditLogTampered,
+						lineIdx+1, ci.SHA, file,
+						pair.ExpectedPrevious, prev,
+						pair.Pending, prev+1)
+				}
+				continue
+			}
+
+			lastAccepted[file] = pair.Pending
+		}
+	}
+
+	return tamperErr
+}
+
+// deriveSeamCounterSeed returns the per-file counter pairs from the last
+// anchor-signed commit that touched auditFilePath at or before seamSHA
+// (the checkpoint's VerifiedHeadSHA, exclusive upper bound for the incremental
+// walk). It provides the seam predecessor so checkCounterMonotonicity can
+// enforce continuity across the checkpoint boundary without trusting any cached
+// counter state.
+//
+// The derivation is bounded: a single git log -1 lookup in the already-cloned
+// repository plus one extractCommitInfo call. On any error (git failure, no
+// such commit, anchor-verify failure) the function returns nil, nil and the
+// caller falls back to a cold re-walk.
+//
+// Trust invariant: the seed comes from anchor-verified git history in the
+// verifier clone, not from the checkpoint cache. A forged checkpoint can change
+// seamSHA to point at an absent or non-ancestor commit, but the ancestry check
+// upstream already guards against that — a non-ancestor checkpoint is rejected
+// before this function is ever reached. A forged cache entry cannot inject a
+// false seed value because this function reads the seed from the git objects
+// in the clone, which in turn are verified by git verify-commit against the
+// pinned trust anchor key.
+func deriveSeamCounterSeed(
+	ctx context.Context,
+	pt *productionFetchTransport,
+	tmpDir, cloneDir string,
+	hardenedEnv []string,
+	allowedSignersPath string,
+	seamSHA string,
+	auditFilePath string,
+) (map[string]counterPair, error) {
+	if seamSHA == "" || !fetchtransport.IsValidSHA(seamSHA) {
+		return nil, nil
+	}
+
+	// Find the last commit that touched auditFilePath at or before seamSHA
+	// (i.e. in the ancestry of seamSHA). We ask for at most one commit.
+	logCtx, logCancel := fetchtransport.WithBoundedDeadline(ctx, auditVerifyReadTimeout)
+	logOut, _, logExit, logErr := pt.verifier.RunSubprocess(
+		logCtx, cloneDir, hardenedEnv,
+		"git", "log", "-1", "--pretty=format:%H", "--follow", seamSHA, "--", auditFilePath,
+	)
+	logCancel()
+	if logErr != nil || logExit != 0 {
+		// Cannot determine the predecessor; caller will force cold re-walk.
+		return nil, fmt.Errorf("deriveSeamCounterSeed: git log failed (exit %d, err %v)", logExit, logErr)
+	}
+
+	shas := parseCommitSHAs(logOut)
+	if len(shas) == 0 {
+		// No commit touches this file before the seam; nothing to seed.
+		return nil, nil
+	}
+	predecessorSHA := shas[0]
+
+	// Anchor-verify the predecessor commit and extract its counter pairs.
+	// extractCommitInfo runs git verify-commit against the pinned trust anchor.
+	info, infoErr := extractCommitInfo(ctx, pt, tmpDir, cloneDir, hardenedEnv, allowedSignersPath, predecessorSHA, 0)
+	if infoErr != nil {
+		return nil, fmt.Errorf("deriveSeamCounterSeed: extractCommitInfo(%s): %w", predecessorSHA, infoErr)
+	}
+
+	// Only anchor-signed commits participate in counter continuity (Rule A).
+	// A non-anchor-signed predecessor cannot be trusted as a seam seed; force cold re-walk.
+	if !info.SignedByAnchor {
+		return nil, fmt.Errorf("deriveSeamCounterSeed: predecessor commit %s is not signed by the trust anchor — cannot seed seam counter check", predecessorSHA)
+	}
+
+	// CounterPairs is nil when the commit body carried no counter fields.
+	// Returning nil, nil is correct: the warm path will treat all files as
+	// first-sighting (no predecessor check), which matches the cold-walk behaviour
+	// for commits without counter fields (Rule C: absence is not contradiction).
+	return info.CounterPairs, nil
 }
 
 // checkSplice enforces that the set of files staged in a commit is a subset of
@@ -950,6 +1226,112 @@ func parseAuditEntrySHA(body string) string {
 		}
 	}
 	return ""
+}
+
+// parseCounterPairs extracts per-file (expected_previous_counter, pending_counter)
+// pairs from an anchor-signed commit body. It handles both body formats:
+//
+//   - Counter/merge body (buildCounterCommitMessageBody): a single top-level
+//     "file: <name>" line followed by top-level "expected_previous_counter: N"
+//     and "pending_counter: N" lines.
+//   - Rotation body (buildRotationCommitMessageBody): one or more "file: <name>"
+//     lines each followed by indented "  expected_previous_counter: N" and
+//     "  pending_counter: N" lines.
+//
+// The returned map is keyed by the logical file name. A counterPair.Present == true
+// entry means both fields were parsed successfully. A Present == false entry
+// (or absent key) means the fields were not found for that file. A field that
+// IS present but non-numeric (malformed-present) is signalled by returning
+// (nil, errCounterFieldMalformed) so the caller can treat it as contradiction
+// rather than absence (Rule E: fail-closed parse).
+//
+// Counters are parsed from the commit body only, never from JSONL line content.
+func parseCounterPairs(body string) (map[string]counterPair, error) {
+	result := make(map[string]counterPair)
+	lines := strings.Split(body, "\n")
+
+	var currentFile string
+	var prevVal uint64
+	var pendVal uint64
+	var hasPrev, hasPend bool
+
+	// flushFile finalises the current file's pair into the result map.
+	// Called when we move to a new "file:" line or reach the end.
+	flushFile := func() error {
+		if currentFile == "" {
+			return nil
+		}
+		// Rule E: if exactly one of the pair is present, the other is a malformed
+		// absence — treat the commit body as contradictory on this file.
+		if hasPrev != hasPend {
+			return fmt.Errorf("counter field partially present for file %q in commit body "+
+				"(expected_previous_counter present=%v, pending_counter present=%v) — "+
+				"malformed-present counter field treated as contradiction",
+				currentFile, hasPrev, hasPend)
+		}
+		if hasPrev && hasPend {
+			result[currentFile] = counterPair{
+				ExpectedPrevious: prevVal,
+				Pending:          pendVal,
+				Present:          true,
+			}
+		}
+		// Both absent: do not add to the map (absence is not contradiction).
+		return nil
+	}
+
+	for _, rawLine := range lines {
+		// Detect "file:" at any indentation level (rotation body uses leading spaces).
+		trimmed := strings.TrimSpace(rawLine)
+
+		if strings.HasPrefix(trimmed, "file:") {
+			// Moving to a new file block: flush the previous one first.
+			if err := flushFile(); err != nil {
+				return nil, err
+			}
+			currentFile = strings.TrimSpace(strings.TrimPrefix(trimmed, "file:"))
+			prevVal, pendVal = 0, 0
+			hasPrev, hasPend = false, false
+			continue
+		}
+
+		if strings.HasPrefix(trimmed, "expected_previous_counter:") {
+			val := strings.TrimSpace(strings.TrimPrefix(trimmed, "expected_previous_counter:"))
+			n, parseErr := strconv.ParseUint(val, 10, 64)
+			if parseErr != nil {
+				// Field present but non-numeric: Rule E — fail-closed.
+				return nil, fmt.Errorf("counter field expected_previous_counter has "+
+					"non-numeric value %q for file %q — "+
+					"malformed-present counter field treated as contradiction",
+					val, currentFile)
+			}
+			prevVal = n
+			hasPrev = true
+			continue
+		}
+
+		if strings.HasPrefix(trimmed, "pending_counter:") {
+			val := strings.TrimSpace(strings.TrimPrefix(trimmed, "pending_counter:"))
+			n, parseErr := strconv.ParseUint(val, 10, 64)
+			if parseErr != nil {
+				// Field present but non-numeric: Rule E — fail-closed.
+				return nil, fmt.Errorf("counter field pending_counter has "+
+					"non-numeric value %q for file %q — "+
+					"malformed-present counter field treated as contradiction",
+					val, currentFile)
+			}
+			pendVal = n
+			hasPend = true
+			continue
+		}
+	}
+
+	// Flush the last file block.
+	if err := flushFile(); err != nil {
+		return nil, err
+	}
+
+	return result, nil
 }
 
 // parseCommitSHAs parses a newline-separated list of commit SHAs from git log
