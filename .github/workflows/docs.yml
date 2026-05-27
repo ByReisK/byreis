@@ -35,6 +35,7 @@ jobs:
         with:
           python-version: "3.x"
           cache: pip
+          cache-dependency-path: requirements-docs.txt
       - name: Install MkDocs Material
         run: pip install -r requirements-docs.txt
       - name: Build site (strict)
