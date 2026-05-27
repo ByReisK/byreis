@@ -157,6 +157,14 @@ func BuildProductionDeps(ctx context.Context) (*cli.Deps, error) {
 		currentMode, manifestSigner,
 	)
 
+	// Snapshot the read-only registry client BEFORE the write-reassignment below.
+	// The AuditVerifier (and AuditReader) MUST be wired from this read-only
+	// snapshot: the contributor audit-verify verb must have NO write credential,
+	// regardless of whether admin write-wiring is available. Capturing here is
+	// the single authoritative source — the assignment below may reassign regClient
+	// to a write-enabled instance, but readOnlyRegClient stays immutable.
+	readOnlyRegClient := regClient
+
 	// When write wiring is available, rebuild the registry client with a write-
 	// enabled transport. The project-repo reader (buildFileOfRecordSourceProd)
 	// is ALWAYS constructed with nil write config — it has no business writing
@@ -174,15 +182,14 @@ func BuildProductionDeps(ctx context.Context) (*cli.Deps, error) {
 		}
 	}
 
-	// Wire the audit-verifier checkpoint store on the finalized registry client.
-	// The checkpoint is a host-local performance cache that amortises cold full
-	// history walks (Approach-A amortisation). It is NOT a trust artefact: a
-	// missing, corrupt, or forged checkpoint can only cause MORE work (a forced
-	// cold re-walk), never less. A construction failure is non-fatal: the verifier
-	// falls back to a cold walk on every call, which is functionally correct.
-	// The checkpoint file lives at ~/.cache/byreis/registry/<prefix>/auditverify_<project>.json,
-	// co-located with the counter cache (ADR-0014 precedent).
-	attachAuditVerifierCheckpointStore(ctx, regClient)
+	// Wire the audit-verifier checkpoint store on the READ-ONLY registry client.
+	// The verifier is always wired from readOnlyRegClient (see AuditVerifier
+	// wiring comment below). The checkpoint is a host-local performance cache
+	// that amortises cold full history walks; it is NOT a trust artefact. A
+	// missing, corrupt, or forged checkpoint forces a cold re-walk, never
+	// reduces work. A construction failure is non-fatal.
+	// The checkpoint file lives at ~/.cache/byreis/registry/<prefix>/auditverify_<project>.json.
+	attachAuditVerifierCheckpointStore(ctx, readOnlyRegClient)
 
 	// Build the AtomicFileWriter rooted at the project repo root.
 	atomicWriter := buildAtomicWriterProd()
@@ -394,19 +401,27 @@ func BuildProductionDeps(ctx context.Context) (*cli.Deps, error) {
 	// to core). Type-assert to the narrow AuditReader port; when the assertion
 	// fails (test double or future alternate client) the field stays nil and the
 	// CLI surfaces a "not configured" error at command time.
+	//
+	// Uses readOnlyRegClient: audit read does not require a write credential and
+	// the admin audit-show verb reads from the same verified HEAD as the verifier.
 	var auditReader rotate.AuditReader
-	if regClient != nil {
-		if ar, ok := regClient.(rotate.AuditReader); ok {
+	if readOnlyRegClient != nil {
+		if ar, ok := readOnlyRegClient.(rotate.AuditReader); ok {
 			auditReader = ar
 		}
 	}
 
 	// Wire the AuditVerifier. The concrete *registry.Client implements
-	// rotate.AuditVerifier via its VerifyAuditLog method. Type-assert identically
-	// to the AuditReader wiring above; nil is safe (CLI surfaces "not configured").
+	// rotate.AuditVerifier via its VerifyAuditLog method.
+	//
+	// MUST use readOnlyRegClient (the pre-write-reassignment snapshot): the
+	// contributor audit-verify verb requires zero write capability. Wiring from
+	// the write-enabled regClient would give the verifier a write token provider
+	// even in CONTRIBUTOR mode — a credential-leak class. The read-only client
+	// implements the same VerifyAuditLog method; no functionality is lost.
 	var auditVerifier rotate.AuditVerifier
-	if regClient != nil {
-		if av, ok := regClient.(rotate.AuditVerifier); ok {
+	if readOnlyRegClient != nil {
+		if av, ok := readOnlyRegClient.(rotate.AuditVerifier); ok {
 			auditVerifier = av
 		}
 	}

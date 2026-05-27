@@ -44,6 +44,14 @@ func TestPolicy_CommandModeMatrix(t *testing.T) {
 	//   request-reject : admin-only verb that closes a request/submission PR with
 	//     a structured reason. Mirrors request-list: ADMIN and SUPER allowed,
 	//     CONTRIBUTOR denied. PR-close-only; never loads a key or decrypts.
+	//
+	// v0.6 addition:
+	//   audit-verify : all-modes read-only verb that runs the per-line audit
+	//     binding walk and renders public commit metadata. Distinct from
+	//     audit-show (which stays admin-only): verify carries no secret because
+	//     the audit channel is public by the asymmetric design, and the capability
+	//     is confined by the import graph (zero-key, zero-decrypt, read-only),
+	//     NOT by a denial cell — so all three modes ALLOW.
 	allow := map[mode.Command]map[mode.Mode]bool{
 		mode.CommandVersion:           {mode.ModeContributor: true, mode.ModeAdmin: true, mode.ModeSuper: true},
 		mode.CommandInit:              {mode.ModeContributor: true, mode.ModeAdmin: true, mode.ModeSuper: true},
@@ -60,6 +68,7 @@ func TestPolicy_CommandModeMatrix(t *testing.T) {
 		mode.CommandRequestList:       {mode.ModeContributor: false, mode.ModeAdmin: true, mode.ModeSuper: true},
 		mode.CommandAuditShow:         {mode.ModeContributor: false, mode.ModeAdmin: true, mode.ModeSuper: true},
 		mode.CommandRequestReject:     {mode.ModeContributor: false, mode.ModeAdmin: true, mode.ModeSuper: true},
+		mode.CommandAuditVerify:       {mode.ModeContributor: true, mode.ModeAdmin: true, mode.ModeSuper: true},
 	}
 
 	allModes := []mode.Mode{mode.ModeContributor, mode.ModeAdmin, mode.ModeSuper}
@@ -68,7 +77,7 @@ func TestPolicy_CommandModeMatrix(t *testing.T) {
 		mode.CommandReview, mode.CommandMerge, mode.CommandGet, mode.CommandDecrypt,
 		mode.CommandEdit, mode.CommandRotate, mode.CommandRotationReconcile,
 		mode.CommandRequestAccess, mode.CommandRequestList, mode.CommandAuditShow,
-		mode.CommandRequestReject,
+		mode.CommandRequestReject, mode.CommandAuditVerify,
 	}
 
 	// Guard: the expectation grid must cover the full cross-product so a missing
@@ -146,6 +155,60 @@ func TestPolicy_UnknownModeDeniedFailClosed(t *testing.T) {
 	} {
 		if err := p.Allow(forged, cmd); err == nil {
 			t.Fatalf("forged mode value allowed admin command %q — fail-closed violated", cmd)
+		}
+	}
+}
+
+// TestPolicy_AuditVerifyAllModesAllowedForgedDenied is the focused bypass set
+// for the contributor audit-verify verb (T-S1-A). It asserts that every
+// (CommandAuditVerify × {Contributor, Admin, Super}) cell resolves ALLOW — the
+// verb is read-only and confined by the import graph, not by a denial cell — and
+// that a forged/unknown mode.Command value still resolves DENY via the
+// default-deny floor, so adding an all-modes verb does not open a hole for a
+// typo'd or attacker-supplied command string.
+func TestPolicy_AuditVerifyAllModesAllowedForgedDenied(t *testing.T) {
+	t.Parallel()
+
+	p := &mode.Policy{}
+
+	for _, m := range []mode.Mode{mode.ModeContributor, mode.ModeAdmin, mode.ModeSuper} {
+		if err := p.Allow(m, mode.CommandAuditVerify); err != nil {
+			t.Fatalf("audit-verify must be ALLOW in %v mode, got deny: %v", m, err)
+		}
+	}
+
+	// A forged command value that merely resembles audit-verify must not ride the
+	// all-modes grant: it is unknown to the matrix and denied fail-closed.
+	for _, m := range []mode.Mode{mode.ModeContributor, mode.ModeAdmin, mode.ModeSuper} {
+		err := p.Allow(m, mode.Command("audit-verify-but-forged"))
+		if err == nil {
+			t.Fatalf("mode %v: forged audit-verify command was allowed — fail-closed violated", m)
+		}
+		if !errors.Is(err, mode.ErrPermissionDenied) {
+			t.Fatalf("mode %v: forged-command denial must wrap ErrPermissionDenied, got %v", m, err)
+		}
+	}
+}
+
+// TestPolicy_AuditShowStaysAdminOnly is the regression guard (T-S1-D) proving
+// the new all-modes audit-verify verb did NOT relax the admin-only audit-show
+// cell. A contributor calling audit-show is still denied; admin and super still
+// allowed. The contributor read path is a separate verb (audit-verify), never a
+// relaxation of the plain-read show cell.
+func TestPolicy_AuditShowStaysAdminOnly(t *testing.T) {
+	t.Parallel()
+
+	p := &mode.Policy{}
+
+	if err := p.Allow(mode.ModeContributor, mode.CommandAuditShow); err == nil {
+		t.Fatal("audit-show must stay DENY for contributor — the new audit-verify verb must not relax it")
+	} else if !errors.Is(err, mode.ErrPermissionDenied) {
+		t.Fatalf("audit-show contributor denial must wrap ErrPermissionDenied, got %v", err)
+	}
+
+	for _, m := range []mode.Mode{mode.ModeAdmin, mode.ModeSuper} {
+		if err := p.Allow(m, mode.CommandAuditShow); err != nil {
+			t.Fatalf("audit-show must stay ALLOW in %v mode, got deny: %v", m, err)
 		}
 	}
 }

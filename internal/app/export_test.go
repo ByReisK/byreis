@@ -116,3 +116,19 @@ func BuildSubmitSharedDepsProdForTest(
 var BuildModeDowngradeWarningForTest = func(detResult mode.Result, detErr error) string {
 	return buildModeDowngradeWarning(detResult, detErr)
 }
+
+// AuditVerifierIsReadOnlyForTest reports whether the given AuditVerifier is
+// backed by a read-only *registryadapter.Client (i.e. a client whose
+// WriteTokenProvider is nil). The second return value indicates whether the
+// type-assertion to *registryadapter.Client succeeded; a false second return
+// means the verifier is not the production client (e.g. a test double) and
+// the first value should be ignored. Used by T-S1-C to assert that the
+// contributor-mode AuditVerifier has no write credential — non-nil alone is
+// insufficient.
+func AuditVerifierIsReadOnlyForTest(av interface{}) (readOnly bool, isProductionClient bool) {
+	client, ok := av.(*registryadapter.Client)
+	if !ok {
+		return false, false
+	}
+	return client.WriteTokenProviderIsNilForTest(), true
+}

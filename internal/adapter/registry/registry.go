@@ -1379,6 +1379,19 @@ func (c *Client) SetTransportForTest(ft FetchTransport) {
 	c.cfg.FetchTransport = ft
 }
 
+// WriteTokenProviderIsNilForTest reports whether the Client was constructed
+// without a registry-write credential (WriteTokenProvider == nil). A nil
+// provider means the client operates in read-only mode: WriteCounter and
+// CommitCounter return ErrRegistryWriteAuth on any call. This is the
+// discriminator used by positive-composition shipgate guards to assert that the
+// AuditVerifier wired in contributor mode is backed by a read-only client —
+// no write credential can flow through the verifier regardless of any future
+// refactor that moves the type-assertion site. Production code must never call
+// this method.
+func (c *Client) WriteTokenProviderIsNilForTest() bool {
+	return c.cfg.WriteTokenProvider == nil
+}
+
 // offlineFallback serves a cached admin set with Stale=true, or returns
 // ErrRegistryOffline if nothing is cached.
 //

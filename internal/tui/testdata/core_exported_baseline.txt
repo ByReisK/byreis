@@ -236,6 +236,7 @@ github.com/ByReisK/byreis/internal/core/logging#Logger
 github.com/ByReisK/byreis/internal/core/mode#Clock
 github.com/ByReisK/byreis/internal/core/mode#Command
 github.com/ByReisK/byreis/internal/core/mode#CommandAuditShow
+github.com/ByReisK/byreis/internal/core/mode#CommandAuditVerify
 github.com/ByReisK/byreis/internal/core/mode#CommandDecrypt
 github.com/ByReisK/byreis/internal/core/mode#CommandDoctor
 github.com/ByReisK/byreis/internal/core/mode#CommandEdit

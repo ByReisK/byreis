@@ -119,6 +119,7 @@ func TestTUICeiling_ModeMatrixUnchanged(t *testing.T) {
 		mode.CommandRequestList,
 		mode.CommandAuditShow,
 		mode.CommandRequestReject,
+		mode.CommandAuditVerify,
 	}
 
 	allModes := []mode.Mode{
@@ -165,6 +166,9 @@ func TestTUICeiling_ModeMatrixUnchanged(t *testing.T) {
 		"audit-show:SUPER":           true,
 		"request-reject:ADMIN":       true,
 		"request-reject:SUPER":       true,
+		"audit-verify:CONTRIBUTOR":   true,
+		"audit-verify:ADMIN":         true,
+		"audit-verify:SUPER":         true,
 	}
 
 	// Sweep every (command, mode) pair and collect the live allowed set.
@@ -199,8 +203,8 @@ func TestTUICeiling_ModeMatrixUnchanged(t *testing.T) {
 	if len(additions) > 0 {
 		t.Errorf("CEILING GATE FAIL: %d new (command, mode) allowed pair(s) appeared "+
 			"that are not in the v0.2 expected set.\n\n"+
-			"TUI work must not add mode-matrix entries. The only permitted addition\n"+
-			"is CommandRequestReject from a reviewed, non-TUI change.\n"+
+			"TUI work must not add mode-matrix entries. The only permitted additions\n"+
+			"are CommandRequestReject and CommandAuditVerify from reviewed, non-TUI changes.\n"+
 			"Update this test's allowedPairs when that change lands.\n\n"+
 			"New allowed pairs:\n%s",
 			len(additions), strings.Join(additions, "\n"))

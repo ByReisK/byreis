@@ -136,6 +136,14 @@ const (
 	// decrypts, advances a counter, or writes any trust state; a contributor
 	// invocation is denied at the matrix before any network contact.
 	CommandRequestReject Command = "request-reject"
+	// CommandAuditVerify is the contributor-runnable read-only verb that runs the
+	// per-line audit binding walk over the public registry audit channel and
+	// renders the same public commit-metadata projection. Unlike CommandAuditShow
+	// (admin-only), it is permitted in all modes: it loads no private key, decrypts
+	// nothing, and writes no trust state, so it carries no secret — the audit
+	// channel is public by the asymmetric design. The capability is confined by the
+	// import graph (zero-key, zero-decrypt, read-only), not by a denial cell.
+	CommandAuditVerify Command = "audit-verify"
 )
 
 // ErrKeyPermissions is a hard error returned when the private key file exists
@@ -340,6 +348,12 @@ var matrix = map[Command]map[Mode]bool{
 	// Admin-only verb (mirrors CommandRequestList): CONTRIBUTOR is denied,
 	// ADMIN/SUPER may close a request/submission PR with a reason. PR-close-only.
 	CommandRequestReject: {ModeAdmin: true, ModeSuper: true},
+	// All-modes read-only verb (mirrors the CommandInit/Doctor/Submit pattern):
+	// the per-line audit binding walk over the public audit channel is permitted in
+	// every mode. The capability is confined by the import graph (zero-key,
+	// zero-decrypt, read-only), not by a denial cell — this is NOT a relaxation of
+	// the admin-only CommandAuditShow plain-read cell, which stays {Admin, Super}.
+	CommandAuditVerify: {ModeContributor: true, ModeAdmin: true, ModeSuper: true},
 }
 
 // Allow returns nil if cmd is permitted in mode m, or an error wrapping
