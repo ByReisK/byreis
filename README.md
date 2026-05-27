@@ -52,7 +52,7 @@ never _read_ secrets can still safely _add and update_ them.
 
 ## Status
 
-Stable releases shipped through **v0.5.0**. See the [Releases](https://github.com/ByReisK/byreis/releases) page.
+Stable releases shipped through **v0.8.0**. See the [Releases](https://github.com/ByReisK/byreis/releases) page, or browse the full documentation site at [byreisk.github.io/byreis](https://byreisk.github.io/byreis/).
 
 ## Install
 

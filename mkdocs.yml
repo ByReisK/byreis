@@ -1,0 +1,110 @@
+site_name: byreis
+site_description: >-
+  Friendly GitOps secrets management with asymmetric access control — contributors
+  submit secrets they can never read; only admins decrypt.
+site_url: https://byreisk.github.io/byreis/
+site_author: byreis maintainers
+
+repo_name: ByReisK/byreis
+repo_url: https://github.com/ByReisK/byreis
+edit_uri: edit/main/docs/
+
+copyright: Licensed under Apache 2.0
+
+theme:
+  name: material
+  language: en
+  icon:
+    repo: fontawesome/brands/github
+    logo: material/key-chain-variant
+  favicon: https://raw.githubusercontent.com/ByReisK/byreis/main/.github/favicon.png
+  palette:
+    - media: "(prefers-color-scheme)"
+      toggle:
+        icon: material/brightness-auto
+        name: Switch to light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to system preference
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - navigation.instant
+    - navigation.tracking
+    - navigation.indexes
+    - toc.follow
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.code.annotate
+    - content.action.edit
+
+# Keep the GitHub folder readme out of the rendered site (index.md is the home).
+exclude_docs: |
+  README.md
+
+markdown_extensions:
+  - abbr
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+
+plugins:
+  - search
+
+nav:
+  - Home: index.md
+  - Getting started: getting-started.md
+  - Features: features.md
+  - Security model: security-model.md
+  - User guide: guide.md
+  - Runbooks:
+      - Rotating the recipient set: rotation-runbook.md
+      - Requesting access: request-access-runbook.md
+  - Reference:
+      - Forward secrecy: forward-secrecy.md
+  - Release notes:
+      - v0.8.0: release-notes-v0.8.md
+      - v0.7.0: release-notes-v0.7.md
+      - v0.6.0: release-notes-v0.6.md
+      - v0.5.0: release-notes-v0.5.md
+      - v0.4.0: release-notes-v0.4.md
+      - v0.3.1: release-notes-v0.3.1.md
+      - v0.3.0: release-notes-v0.3.md
+      - v0.2.0: release-notes-v0.2.md
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/ByReisK/byreis
+      name: byreis on GitHub
