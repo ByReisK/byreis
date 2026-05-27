@@ -193,6 +193,21 @@ type Deps struct {
 	// wiring sets this to the real pre-flight adapter at BuildProductionDeps.
 	RotatePreFlight RotatePreFlightReader
 
+	// RunChild execs the child process for the `run` verb. argv[0] is the
+	// executable and argv[1:] its arguments; env is the child's COMPLETE
+	// environment block ("KEY=VALUE" form, already merged with the injected
+	// secrets by the verb). The implementation inherits the parent
+	// stdin/stdout/stderr (no capture/tee/buffer), forwards termination signals,
+	// Wait-reaps on every exit path, and honors ctx cancellation by killing the
+	// child. env carries plaintext secret values; the verb builds and zeroizes
+	// the source map — the spawner only consumes the block.
+	//
+	// The function signature avoids any direct dependency on internal/adapter
+	// (and on os/exec) from internal/cli: the composition root sets this field to
+	// a closure backed by the runner adapter, keeping os/exec confined to the
+	// adapter layer. When nil the `run` verb returns a "not configured" error.
+	RunChild func(ctx context.Context, argv []string, env []string) (ChildExit, error)
+
 	// ModeDowngradeWarning is a non-empty human-readable message when the user
 	// was silently downgraded to CONTRIBUTOR because a private key IS present but
 	// either (a) the key file has incorrect permissions (not 0600) or (b) the key
@@ -303,6 +318,31 @@ func exitCodeForErr(err error) render.ExitCode {
 	return render.ExitGeneralError
 }
 
+// ChildExit is the faithful outcome of the spawned child for the `run` verb.
+// It is a plain value type declared in the UI layer so no os/exec or syscall
+// type crosses into internal/cli: the runner adapter maps the concrete
+// *exec.ExitError / ProcessState into this shape at the boundary.
+type ChildExit struct {
+	// Code is the process exit code to surface for the child. For a normal
+	// exit it is the child's own 0..255 exit status; for a signal-terminated
+	// child it is 128+signal (the conventional shell encoding). The `run` verb
+	// passes this value through unchanged as byreis's own process exit code.
+	Code int
+
+	// Signalled is true when the child was terminated by a signal rather than a
+	// normal exit. When true, Code is the 128+signal encoding.
+	Signalled bool
+
+	// Signal is the signal number that terminated the child when Signalled is
+	// true; zero otherwise.
+	Signal int
+
+	// SpawnFailed is true when exec never started the child (e.g. the command
+	// was not found or was not executable). The verb still surfaces Code as the
+	// process exit code in that case.
+	SpawnFailed bool
+}
+
 // exitError is a typed error that carries a render.ExitCode. The CLI entry
 // point in cmd/byreis/main.go reads the exit code via ExitCodeOf and calls
 // os.Exit with it.
@@ -345,6 +385,13 @@ func ExitCodeOf(err error) int {
 		return 1
 	}
 	return int(ee.code)
+}
+
+// osEnviron returns the current process environment in "KEY=VALUE" form. It is
+// a thin wrapper over os.Environ so the run verb can inject a deterministic
+// parent environment in tests via the runEnvProvider seam.
+func osEnviron() []string {
+	return os.Environ()
 }
 
 // envBool returns true if the environment variable name is set to a truthy value

@@ -672,6 +672,13 @@ func TestAsymmetryShipGate(t *testing.T) {
 				panicker.getCalls)
 		}
 	})
+
+	// REQ-V08-006 run-verb subtests. Registered via the package-level hook set
+	// in asymmetry_shipgate_run_test.go so that the file stays self-contained
+	// and the top-level -run filter (TestAsymmetryShipGate) is unchanged.
+	if runSubtestsRunVerb != nil {
+		runSubtestsRunVerb(t, fx)
+	}
 }
 
 // shipgatePanickingKeyring is a KeyringClient whose Get method panics if called.

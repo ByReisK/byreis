@@ -767,7 +767,8 @@ func auditFetchHint(code render.ExitCode) string {
 			"run `byreis doctor` and verify the registry trust configuration; " +
 			"read audit log directly with: git show audit/<project>.jsonl && git verify-commit <HEAD>"
 	case render.ExitVerifyFailure:
-		return "registry is unreachable — " +
+		return "registry unreachable or verifier timed out — if this persists, " +
+			"treat it as unverified and investigate; " +
 			"read audit log directly with: git show audit/<project>.jsonl && git verify-commit <HEAD>"
 	default:
 		return "run `byreis doctor` for diagnostics; " +

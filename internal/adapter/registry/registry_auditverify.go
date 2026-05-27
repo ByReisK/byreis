@@ -527,10 +527,14 @@ type auditCommitInfo struct {
 	// StagedFiles is the set of file paths staged in this commit. Used for the
 	// cross-project-splice check. Nil only when StagedFilesUndeterminable is true.
 	StagedFiles map[string]struct{}
-	// StagedFilesUndeterminable is true when the git diff-tree call that should
-	// populate StagedFiles failed. The caller must treat this as a fail-closed
-	// signal and mark the associated line BindingTampered rather than silently
-	// skipping the splice dimension.
+	// StagedFilesUndeterminable is true when git diff-tree ran and returned a
+	// non-zero exit code — a determinate git-level content or object problem that
+	// makes the staged-file set unknowable due to the commit's own content.
+	// Distinct from an exec/IO/process failure (filesErr != nil), which is a
+	// verifier-side transient condition returned immediately as ErrRegistryOffline.
+	// The caller (bindLines) must treat StagedFilesUndeterminable=true as a
+	// fail-closed signal and mark the associated line BindingTampered rather than
+	// silently skipping the splice dimension.
 	StagedFilesUndeterminable bool
 	// LineIndex is the 0-based index (from the start of the file) of the line
 	// this commit introduced, as determined by the walk order.
@@ -705,20 +709,98 @@ func extractCommitInfo(
 	info.SignedByAnchor = (verifyErr == nil && verifyExit == 0)
 
 	// Get the set of files changed by this commit (for cross-project-splice check).
-	// Fail closed: if the staged-file set cannot be determined, mark the commit as
-	// having an undeterminable staged set. The caller (bindLines) will treat this as
-	// BindingTampered rather than silently skipping the splice dimension.
+	//
+	// Classification of failure modes (three cases; the determinate and transient
+	// cases must never be conflated):
+	//
+	//   filesErr != nil
+	//     A verifier-side exec/IO/process failure: the git binary could not be
+	//     started, was killed, timed out, or the workspace had an I/O error.
+	//     The subprocess never produced any output and therefore produced no
+	//     determinate verdict on the staged-file set. This is a transient,
+	//     retryable condition caused by the verifier's environment, NOT by the
+	//     commit content. It is returned immediately as ErrRegistryOffline so
+	//     the caller can surface "transient — retry" without asserting tamper.
+	//     An attacker cannot induce this path through commit content; it
+	//     requires compromising the verifier's OS environment (PATH, disk, etc.),
+	//     so reclassifying it does not open a tamper-evasion route.
+	//
+	//   filesErr == nil && filesExit == 0
+	//     The clean case: git ran and reported the staged files successfully.
+	//
+	//   filesErr == nil && filesExit != 0 && filesCtxErr != nil
+	//     The per-read deadline or the outer context was cancelled while git was
+	//     running. exec.CommandContext sends SIGKILL; the resulting *exec.ExitError
+	//     carries ExitCode() == -1. SubprocessRunner maps that to (exitCode=-1,
+	//     err=nil). filesCtxErr is the context error captured BEFORE filesCancel()
+	//     is called; a non-nil value here means the deadline fired during the
+	//     subprocess call, not after it. This is a verifier-side transient
+	//     condition — NOT a determinate verdict on the commit's content. It is
+	//     returned immediately as ErrRegistryOffline. A genuine splice combined
+	//     with a deadline still DENIES: the transient return aborts the whole walk
+	//     without certifying any line as verified.
+	//
+	//   filesErr == nil && filesExit != 0 && filesCtxErr == nil
+	//     A determinate result: git ran to completion and returned a non-zero exit,
+	//     which reflects a real git-level content or object problem on this commit.
+	//     The subprocess produced a determinate (negative) verdict. The staged-file
+	//     set is unknowable because of the commit's own content — this stays
+	//     fail-closed: StagedFilesUndeterminable=true → bindLines → BindingTampered.
+	//     An attacker who crafts a commit that makes diff-tree exit non-zero is
+	//     still denied because the undeterminable state is treated as tamper.
 	filesCtx, filesCancel := fetchtransport.WithBoundedDeadline(ctx, auditVerifyReadTimeout)
 	filesOut, _, filesExit, filesErr := pt.verifier.RunSubprocess(
 		filesCtx, cloneDir, hardenedEnv,
 		"git", "diff-tree", "--no-commit-id", "-r", "--name-only", sha,
 	)
+	// Capture the context error BEFORE calling filesCancel(). After filesCancel()
+	// the context's Err() always returns context.Canceled regardless of whether
+	// the deadline fired or we cancelled it ourselves. The pre-cancel snapshot is
+	// the only reliable way to distinguish a genuine deadline/cancel (deadline
+	// fired during the subprocess) from a normal post-subprocess cleanup cancel.
+	filesCtxErr := filesCtx.Err()
 	filesCancel()
-	if filesErr == nil && filesExit == 0 {
+	switch {
+	case filesErr != nil:
+		// Verifier-side exec/IO/process failure — transient, not a tamper verdict.
+		// Return immediately so the caller surfaces a retryable ErrRegistryOffline
+		// rather than asserting tamper on a commit the verifier could not inspect.
+		// Hint: run `byreis doctor` or retry; the git binary or workspace may be
+		// temporarily unavailable.
+		return info, fmt.Errorf(
+			"%w: VerifyAuditLog: git diff-tree exec error for commit %q: %v — "+
+				"verifier-side process/IO failure, not a tamper verdict; retry or run `byreis doctor`",
+			coreregistry.ErrRegistryOffline, sha, filesErr)
+	case filesExit == 0:
 		info.StagedFiles = parseFilesList(string(filesOut))
-	} else {
-		// Cannot determine what files the commit staged — the splice dimension is
-		// unknowable. Record the undeterminable state so bindLines can fail closed.
+	default:
+		// filesExit != 0 with filesErr == nil. Before treating this as a
+		// determinate git-level error, check whether the per-read deadline (or
+		// the outer context) fired before RunSubprocess returned. When
+		// exec.CommandContext kills the child on context expiry the
+		// *exec.ExitError has ExitCode() == -1, and SubprocessRunner maps that to
+		// (exitCode=-1, err=nil). That is a verifier-side timeout — a transient
+		// condition, not a commit-content verdict. Return ErrRegistryOffline so
+		// the caller can surface "transient — retry" without asserting tamper.
+		//
+		// filesCtxErr was captured before filesCancel() so it is nil when git ran
+		// to completion normally (the clean exit path) and non-nil only when the
+		// context/deadline fired during the subprocess call. A real commit-content
+		// error (git ran to completion, non-zero exit, deadline not expired) still
+		// has filesCtxErr == nil and falls through to StagedFilesUndeterminable.
+		//
+		// A genuine splice combined with a deadline still DENIES: the transient
+		// return aborts the whole walk without certifying any line as verified.
+		if errors.Is(filesCtxErr, context.DeadlineExceeded) || errors.Is(filesCtxErr, context.Canceled) {
+			return info, fmt.Errorf(
+				"%w: VerifyAuditLog: git diff-tree timed out/cancelled for commit %q — "+
+					"transient verifier-side timeout, not a tamper verdict; retry or run `byreis doctor`",
+				coreregistry.ErrRegistryOffline, sha)
+		}
+		// Determinate non-zero exit: git ran and reported a git-level content or
+		// object error. The staged-file set is unknowable due to this commit's own
+		// content. Fail closed: mark undeterminable so bindLines treats the line
+		// as BindingTampered.
 		info.StagedFilesUndeterminable = true
 	}
 
@@ -833,9 +915,12 @@ func bindLines(
 		// ONLY this project's audit file (plus its counter file(s)). A commit
 		// that also touches another project's audit file is a splice.
 		//
-		// Fail-closed: if the staged-file set is undeterminable (diff-tree failed),
-		// treat the line as BindingTampered rather than skipping the splice dimension.
-		// A silent splice-skip on an undeterminable staged set is a security regression.
+		// Fail-closed: if the staged-file set is undeterminable (git diff-tree ran
+		// and returned a non-zero exit — a determinate git-level content problem),
+		// treat the line as BindingTampered rather than silently skipping the splice
+		// dimension. Note: a verifier-side exec/IO failure (filesErr != nil) never
+		// reaches this point — it is returned early from extractCommitInfo as
+		// ErrRegistryOffline before the commit info is added to the walk results.
 		if ci.StagedFilesUndeterminable {
 			result.Entries[lineIdx].BindingStatus = rotate.BindingTampered
 			if tamperErr == nil {

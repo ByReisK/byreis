@@ -306,6 +306,85 @@ consumer side, which would defeat the asymmetric-access guarantee. If you are
 migrating off SOPS, `byreis export --format env|dotenv` is the supported,
 clean escape hatch into plaintext.
 
+### Run a command with the secrets injected
+
+```bash
+# Run a child process with every value in the file injected into its environment
+byreis run --project myapp --file secrets/production.enc.yaml -- ./deploy.sh
+
+# Anything after `--` is the child command, exec'd directly (no shell)
+byreis run --project myapp --file secrets/production.enc.yaml -- printenv DATABASE_URL
+
+# For shell features (pipes, `$VAR`, globbing) you must spawn the shell yourself
+byreis run --project myapp --file secrets/production.enc.yaml -- sh -c 'echo "$DATABASE_URL" | wc -c'
+```
+
+`byreis run -- <cmd>` is an admin-only command; it decrypts with the admin
+private key, so a keyless contributor is denied at the permission matrix before
+any decrypt or child spawn. Like `get`, `decrypt`, and `export`, the denial
+happens before any network contact, identity load, or decrypt attempt. It runs
+`VerifyOfRecord` first and decrypts the whole file fail-closed: if any value
+cannot be decrypted, no child is spawned and nothing is run.
+
+#### Environment-only injection, never argv
+
+byreis injects every decrypted value into the child process's environment only —
+never the argv (a process's argv is world-readable via `ps`, so a secret placed
+there would leak to every user on the host). The secrets never touch disk via
+byreis and exist only for the child's lifetime; when the child exits, byreis
+holds no plaintext.
+
+#### `exec`, not a shell
+
+byreis execs the command after `--` directly — it does NOT interpret `$VAR`, run
+a shell, or perform glob/pipe/redirect expansion. The argument vector you write
+after `--` is exactly the argument vector the child receives. If you want shell
+behavior, run `byreis run -- sh -c '...'` (which you then own). This is a
+deliberate design boundary: execing argv directly means a secret value can never
+be reinterpreted by byreis as a shell command.
+
+#### Environment-override behavior
+
+A byreis-injected variable overrides an inherited parent-environment variable of
+the same name — injected-wins. If your shell already exports `DATABASE_URL` and
+the secrets file also defines `DATABASE_URL`, the child sees the decrypted value
+from the file, not the inherited one.
+
+#### Inherited stdio, no pty
+
+byreis inherits the child's stdin, stdout, and stderr directly — it allocates no
+pty and never captures or filters the child's output. The child sees the real
+terminal, and its exit code (including signal termination as `128 + signal`) is
+passed straight through as byreis's own exit code.
+
+#### Honest residual-exposure disclosure
+
+`byreis run` is the security-aligned consumption pattern (the same model as
+`op run` and `doppler run`): byreis promises only that byreis itself leaks
+nothing and that secrets never hit disk via byreis. Once the child holds the
+environment, that promise ends. byreis CANNOT protect against the following, and
+you must account for them yourself:
+
+- **The child and all its descendants inherit the environment.** Any same-uid
+  process can read an injected secret via `/proc/<pid>/environ` for as long as
+  the child (or a descendant) is alive.
+- **A sub-child can re-expose a secret via its own argv.** If a process started
+  by the child copies an inherited secret into its OWN argv, that value becomes
+  readable via `ps` — byreis controls only the argv of the direct child it
+  spawns, not what descendants do with the inherited environment.
+- **A child core dump or crash reporter can capture the environment.** A child
+  that crashes may write a core dump, or a crash reporter may capture its memory,
+  and either can include the injected secrets.
+- **A SIGKILL of byreis itself orphans the child with the secrets still set.**
+  If the byreis process is force-killed (SIGKILL), the child it spawned is
+  reparented (to init) and keeps the injected secrets in its environment until it
+  exits — byreis cannot forward a signal it never receives.
+
+If any of these are in your threat model, restrict the secret to the narrowest
+possible child, disable core dumps for that process, and treat the injected
+environment as plaintext you now own — the same care you would give any other
+decrypted secret.
+
 ### Edit a secret in-place
 
 ```bash

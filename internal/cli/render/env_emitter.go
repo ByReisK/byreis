@@ -132,6 +132,56 @@ func BuildEnvPairs(plaintext map[string]string, keyNames []string) ([]EnvPair, e
 	return pairs, nil
 }
 
+// BuildChildEnvBlock merges the parent environment (in os.Environ() "KEY=VALUE"
+// form) with the injected secret pairs and returns the complete child
+// environment block as a "KEY=VALUE" slice.
+//
+// Merge rule (injected-wins): a byreis-injected variable OVERRIDES an inherited
+// parent-env entry of the same name. Internal secret-vs-secret collisions are
+// already rejected upstream by BuildEnvPairs (ErrVarCollision) before this is
+// called, so the only collisions handled here are injected-vs-inherited.
+//
+// Every injected value is checked for a NUL byte; a NUL (which cannot appear in
+// a process environment entry) is rejected with ErrNulInValue and no block is
+// returned. Errors never contain a secret value — only the variable NAME — and
+// the inherited entry that gets overridden is never echoed (the var name is the
+// only non-secret part).
+//
+// The returned block has the inherited entries first (in their original order,
+// with overridden names removed) followed by the injected pairs in their
+// provided order. Order is not security-relevant for a process environment.
+func BuildChildEnvBlock(parentEnv []string, pairs []EnvPair) ([]string, error) {
+	// Reject NUL in any injected value before assembling the block.
+	for _, p := range pairs {
+		if strings.ContainsRune(p.Value, '\x00') {
+			return nil, fmt.Errorf("%w: variable %q", ErrNulInValue, p.Var)
+		}
+	}
+
+	// Collect the set of injected names so inherited entries of the same name
+	// are dropped (injected-wins).
+	injected := make(map[string]struct{}, len(pairs))
+	for _, p := range pairs {
+		injected[p.Var] = struct{}{}
+	}
+
+	block := make([]string, 0, len(parentEnv)+len(pairs))
+	for _, e := range parentEnv {
+		name := e
+		if eq := strings.IndexByte(e, '='); eq >= 0 {
+			name = e[:eq]
+		}
+		if _, overridden := injected[name]; overridden {
+			continue
+		}
+		block = append(block, e)
+	}
+	for _, p := range pairs {
+		block = append(block, p.Var+"="+p.Value)
+	}
+	return block, nil
+}
+
 // EmitEnv writes the env or dotenv serialization of pairs to w.
 //
 // Every value is always double-quoted and escaped:

@@ -58,6 +58,13 @@ func TestPolicy_CommandModeMatrix(t *testing.T) {
 	//     format. Byte-identical shape to decrypt/get (ADMIN and SUPER allowed,
 	//     CONTRIBUTOR denied) — emitting plaintext is a privileged read, so it is
 	//     gated by a denial cell, NOT the all-modes audit-verify shape.
+	//
+	// v0.8 addition:
+	//   run : admin-only verb that decrypts the project's secrets and injects them
+	//     into a spawned child process's environment. Byte-identical shape to
+	//     export/decrypt/get (ADMIN and SUPER allowed, CONTRIBUTOR denied) — it
+	//     decrypts and spawns with secrets, so it is a privileged read gated by a
+	//     denial cell, NOT the all-modes audit-verify shape.
 	allow := map[mode.Command]map[mode.Mode]bool{
 		mode.CommandVersion:           {mode.ModeContributor: true, mode.ModeAdmin: true, mode.ModeSuper: true},
 		mode.CommandInit:              {mode.ModeContributor: true, mode.ModeAdmin: true, mode.ModeSuper: true},
@@ -76,6 +83,7 @@ func TestPolicy_CommandModeMatrix(t *testing.T) {
 		mode.CommandRequestReject:     {mode.ModeContributor: false, mode.ModeAdmin: true, mode.ModeSuper: true},
 		mode.CommandAuditVerify:       {mode.ModeContributor: true, mode.ModeAdmin: true, mode.ModeSuper: true},
 		mode.CommandExport:            {mode.ModeContributor: false, mode.ModeAdmin: true, mode.ModeSuper: true},
+		mode.CommandRun:               {mode.ModeContributor: false, mode.ModeAdmin: true, mode.ModeSuper: true},
 	}
 
 	allModes := []mode.Mode{mode.ModeContributor, mode.ModeAdmin, mode.ModeSuper}
@@ -85,6 +93,7 @@ func TestPolicy_CommandModeMatrix(t *testing.T) {
 		mode.CommandEdit, mode.CommandRotate, mode.CommandRotationReconcile,
 		mode.CommandRequestAccess, mode.CommandRequestList, mode.CommandAuditShow,
 		mode.CommandRequestReject, mode.CommandAuditVerify, mode.CommandExport,
+		mode.CommandRun,
 	}
 
 	// Guard: the expectation grid must cover the full cross-product so a missing
@@ -313,6 +322,107 @@ func TestBypass_ExportNotPromotedByFlagEnvConfigForgedCache(t *testing.T) {
 	}
 	if err := p.Allow(res.Mode, mode.CommandExport); err == nil {
 		t.Fatal("forged-cache bypass: export permitted despite fail-closed CONTRIBUTOR")
+	}
+}
+
+// TestPolicy_RunAdminOnlyShape asserts the run verb cell directly: ALLOW for
+// ADMIN and SUPER, DENY for CONTRIBUTOR. It also asserts the matrix shape is
+// byte-identical to export/decrypt/get and explicitly DISTINCT from the
+// all-modes audit-verify shape — run decrypts the project's secrets and spawns
+// a child process with them in its environment, so it must be a privileged read
+// gated by a denial cell, never an all-modes verb.
+func TestPolicy_RunAdminOnlyShape(t *testing.T) {
+	t.Parallel()
+
+	p := &mode.Policy{}
+
+	// AC-001-A: ADMIN and SUPER are allowed.
+	for _, m := range []mode.Mode{mode.ModeAdmin, mode.ModeSuper} {
+		if err := p.Allow(m, mode.CommandRun); err != nil {
+			t.Fatalf("run must be ALLOW in %v mode, got deny: %v", m, err)
+		}
+	}
+
+	// AC-001-B: CONTRIBUTOR is denied, fail-closed with the sentinel.
+	if err := p.Allow(mode.ModeContributor, mode.CommandRun); err == nil {
+		t.Fatal("run must be DENY for contributor — it decrypts secrets and spawns with them")
+	} else if !errors.Is(err, mode.ErrPermissionDenied) {
+		t.Fatalf("run contributor denial must wrap ErrPermissionDenied, got %v", err)
+	}
+
+	// AC-001-D: run shares export/decrypt's shape (admin-only) and is DISTINCT
+	// from the all-modes audit-verify shape. We prove this behaviourally: run
+	// must match export and decrypt on every mode, and must differ from
+	// audit-verify in at least the contributor cell.
+	for _, m := range []mode.Mode{mode.ModeContributor, mode.ModeAdmin, mode.ModeSuper} {
+		runAllowed := p.Allow(m, mode.CommandRun) == nil
+		exportAllowed := p.Allow(m, mode.CommandExport) == nil
+		decryptAllowed := p.Allow(m, mode.CommandDecrypt) == nil
+		if runAllowed != exportAllowed {
+			t.Fatalf("mode %v: run shape (%v) must match export shape (%v)", m, runAllowed, exportAllowed)
+		}
+		if runAllowed != decryptAllowed {
+			t.Fatalf("mode %v: run shape (%v) must match decrypt shape (%v)", m, runAllowed, decryptAllowed)
+		}
+	}
+	// Distinct from audit-verify: contributor is allowed audit-verify but denied run.
+	if p.Allow(mode.ModeContributor, mode.CommandAuditVerify) != nil {
+		t.Fatal("precondition: audit-verify must allow contributor")
+	}
+	if p.Allow(mode.ModeContributor, mode.CommandRun) == nil {
+		t.Fatal("run must NOT inherit the all-modes audit-verify shape: contributor must be denied")
+	}
+}
+
+// TestBypass_RunNotPromotedByFlagEnvConfigForgedCache mirrors the export bypass
+// fixture for the run verb. Run decrypts secrets and spawns a child with them,
+// so no out-of-band channel — a `--mode admin` flag, BYREIS_MODE/BYREIS_ADMIN
+// env, a `mode: admin` config key, or a forged "verified" cached admin set — may
+// promote a contributor into running it. Policy.Allow accepts ONLY the
+// crypto-derived mode; there is no parameter for any of these channels.
+func TestBypass_RunNotPromotedByFlagEnvConfigForgedCache(t *testing.T) {
+	// No t.Parallel(): t.Setenv is incompatible with parallel subtests.
+	t.Setenv("BYREIS_MODE", "admin")
+	t.Setenv("BYREIS_ADMIN", "1")
+
+	// Hostile flag/config blobs are inert: there is no API to feed them into the
+	// policy. Documented here only to record the attempted channels.
+	const userSuppliedModeFlag = "admin"
+	const hostileConfig = "mode: admin\nsuper: true\n"
+	_, _ = userSuppliedModeFlag, hostileConfig
+
+	p := &mode.Policy{}
+
+	// Flag/env/config channels: the only mode the policy sees is the derived one.
+	derived := mode.ModeContributor
+	if err := p.Allow(derived, mode.CommandRun); err == nil {
+		t.Fatal("flag/env/config bypass: run permitted despite contributor mode")
+	} else if !errors.Is(err, mode.ErrPermissionDenied) {
+		t.Fatalf("run denial must wrap ErrPermissionDenied, got %v", err)
+	}
+
+	// Forged "signature-verified" cache: a correct registry adapter reports the
+	// key as NOT registered, so the detector fails closed to CONTRIBUTOR, and the
+	// policy then denies run (so no decrypt and no child spawn is ever reached).
+	d := &mode.Detector{
+		Probe: fakeProbe{
+			path:       "/fake/key",
+			perms:      0o600,
+			canDecrypt: true,
+		},
+		Registry: fakeRegistry{registered: false},
+		Clock:    fixedClock{},
+		Audit:    &recordingSink{},
+	}
+	res, err := d.Detect(testContext(), "proj-1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.Mode == mode.ModeAdmin || res.Mode == mode.ModeSuper {
+		t.Fatalf("forged-cache bypass: detector resolved %v — must fail closed to CONTRIBUTOR", res.Mode)
+	}
+	if err := p.Allow(res.Mode, mode.CommandRun); err == nil {
+		t.Fatal("forged-cache bypass: run permitted despite fail-closed CONTRIBUTOR")
 	}
 }
 

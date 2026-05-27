@@ -151,6 +151,15 @@ const (
 	// CommandAuditVerify: the audit channel is public, but exported plaintext is
 	// not, so export must stay behind an admin denial cell.
 	CommandExport Command = "export"
+	// CommandRun is the admin-side verb that decrypts the project's secrets and
+	// injects them into the environment of a single spawned child process. It
+	// carries the same privilege shape as CommandExport/CommandDecrypt/CommandGet
+	// — ADMIN/SUPER only, CONTRIBUTOR denied — because it decrypts and then spawns
+	// with plaintext secrets in the child's environment. It is deliberately NOT an
+	// all-modes verb like CommandAuditVerify: the audit channel is public, but a
+	// process running with the secrets is not, so run must stay behind an admin
+	// denial cell — a contributor invocation is denied before any decrypt or spawn.
+	CommandRun Command = "run"
 )
 
 // ErrKeyPermissions is a hard error returned when the private key file exists
@@ -366,6 +375,11 @@ var matrix = map[Command]map[Mode]bool{
 	// discloses plaintext, so it is gated by a denial cell — deliberately NOT the
 	// all-modes audit-verify shape.
 	CommandExport: {ModeAdmin: true, ModeSuper: true},
+	// Admin-only verb (byte-identical shape to CommandExport/CommandDecrypt/CommandGet):
+	// CONTRIBUTOR is denied, ADMIN/SUPER may decrypt the project's secrets and spawn a
+	// child process with them in its environment. Running with the secrets is gated by a
+	// denial cell — deliberately NOT the all-modes audit-verify shape.
+	CommandRun: {ModeAdmin: true, ModeSuper: true},
 }
 
 // Allow returns nil if cmd is permitted in mode m, or an error wrapping

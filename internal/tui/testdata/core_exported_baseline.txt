@@ -258,6 +258,7 @@ github.com/ByReisK/byreis/internal/core/mode#CommandRequestReject
 github.com/ByReisK/byreis/internal/core/mode#CommandReview
 github.com/ByReisK/byreis/internal/core/mode#CommandRotate
 github.com/ByReisK/byreis/internal/core/mode#CommandRotationReconcile
+github.com/ByReisK/byreis/internal/core/mode#CommandRun
 github.com/ByReisK/byreis/internal/core/mode#CommandSubmit
 github.com/ByReisK/byreis/internal/core/mode#CommandVersion
 github.com/ByReisK/byreis/internal/core/mode#Detector

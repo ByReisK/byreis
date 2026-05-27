@@ -68,7 +68,7 @@ func (c ExitClass) String() string {
 // is a fixed actionable hint, the wrapped error carries only non-secret detail.
 type ReadPathError struct {
 	Class ExitClass
-	// Op is the read-path operation ("get" | "decrypt" | "edit").
+	// Op is the read-path operation ("get" | "decrypt" | "edit" | "export" | "run").
 	Op  string
 	err error
 }

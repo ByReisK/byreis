@@ -132,6 +132,7 @@ plain CLI path (for CI).
 | `get` | admin | Decrypt and print a single secret value |
 | `decrypt` | admin | Decrypt and print all values in a secrets file |
 | `export` | admin | Decrypt a secrets file to an `env`/`dotenv` stream (admin only) |
+| `run` | admin | Run a command with a secrets file decrypted into its environment (admin only) |
 | `edit` | admin | Edit a secret value in-place (decrypt → `$EDITOR` → re-encrypt) |
 | `rotate` | admin | Rotate the recipient set and re-encrypt all secrets files |
 | `admin rotation reconcile` | admin | Recover a partially rotated project |

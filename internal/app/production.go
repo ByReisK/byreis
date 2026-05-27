@@ -30,6 +30,7 @@ import (
 	"github.com/ByReisK/byreis/internal/adapter/registry/auditverify"
 	"github.com/ByReisK/byreis/internal/adapter/registry/countercache"
 	writesigneradapter "github.com/ByReisK/byreis/internal/adapter/registry/writesigner"
+	runneradapter "github.com/ByReisK/byreis/internal/adapter/runner"
 	"github.com/ByReisK/byreis/internal/adapter/signingkey"
 	"github.com/ByReisK/byreis/internal/adapter/truststore"
 	validatoradapter "github.com/ByReisK/byreis/internal/adapter/validator"
@@ -486,6 +487,7 @@ func BuildProductionDeps(ctx context.Context) (*cli.Deps, error) {
 		RunTUISubmit:          runTUISubmit,
 		RunTUIReview:          runTUIReview,
 		ErrTUISubmitAborted:   tui.ErrSubmitAborted,
+		RunChild:              buildRunChildProd(),
 		ModeDowngradeWarning:  modeDowngradeWarning,
 	}, nil
 }
@@ -1029,6 +1031,31 @@ func (*prodNoEditorNonInteractiveRefusal) Edit(_ context.Context, _ usecase.Edit
 	return nil, fmt.Errorf(
 		"edit requires an interactive terminal: $EDITOR is not set and BYREIS_NON_INTERACTIVE is enabled — " +
 			"set the EDITOR environment variable or disable non-interactive mode to use `byreis edit`")
+}
+
+// buildRunChildProd returns the RunChild closure wired into cli.Deps for the
+// `run` verb. The closure adapts runner.Outcome to cli.ChildExit at the
+// composition-root boundary so neither internal/cli nor internal/core ever
+// imports os/exec or os/signal. It is always constructible (pure os/exec, no
+// external config), so RunChild is wired unconditionally.
+//
+// Field mapping (runner.Outcome → cli.ChildExit):
+//
+//	Outcome.ExitCode   → ChildExit.Code
+//	Outcome.Signalled  → ChildExit.Signalled
+//	Outcome.Signal     → ChildExit.Signal
+//	Outcome.SpawnFailed → ChildExit.SpawnFailed
+func buildRunChildProd() func(ctx context.Context, argv []string, env []string) (cli.ChildExit, error) {
+	return func(ctx context.Context, argv []string, env []string) (cli.ChildExit, error) {
+		outcome, err := runneradapter.Run(ctx, argv, env)
+		exit := cli.ChildExit{
+			Code:        outcome.ExitCode,
+			Signalled:   outcome.Signalled,
+			Signal:      outcome.Signal,
+			SpawnFailed: outcome.SpawnFailed,
+		}
+		return exit, err
+	}
 }
 
 // resolveRepoRootProd walks from the current working directory upward looking
