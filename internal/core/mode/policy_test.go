@@ -52,6 +52,12 @@ func TestPolicy_CommandModeMatrix(t *testing.T) {
 	//     the audit channel is public by the asymmetric design, and the capability
 	//     is confined by the import graph (zero-key, zero-decrypt, read-only),
 	//     NOT by a denial cell — so all three modes ALLOW.
+	//
+	// v0.7 addition:
+	//   export : admin-only verb that emits decrypted plaintext to an external
+	//     format. Byte-identical shape to decrypt/get (ADMIN and SUPER allowed,
+	//     CONTRIBUTOR denied) — emitting plaintext is a privileged read, so it is
+	//     gated by a denial cell, NOT the all-modes audit-verify shape.
 	allow := map[mode.Command]map[mode.Mode]bool{
 		mode.CommandVersion:           {mode.ModeContributor: true, mode.ModeAdmin: true, mode.ModeSuper: true},
 		mode.CommandInit:              {mode.ModeContributor: true, mode.ModeAdmin: true, mode.ModeSuper: true},
@@ -69,6 +75,7 @@ func TestPolicy_CommandModeMatrix(t *testing.T) {
 		mode.CommandAuditShow:         {mode.ModeContributor: false, mode.ModeAdmin: true, mode.ModeSuper: true},
 		mode.CommandRequestReject:     {mode.ModeContributor: false, mode.ModeAdmin: true, mode.ModeSuper: true},
 		mode.CommandAuditVerify:       {mode.ModeContributor: true, mode.ModeAdmin: true, mode.ModeSuper: true},
+		mode.CommandExport:            {mode.ModeContributor: false, mode.ModeAdmin: true, mode.ModeSuper: true},
 	}
 
 	allModes := []mode.Mode{mode.ModeContributor, mode.ModeAdmin, mode.ModeSuper}
@@ -77,7 +84,7 @@ func TestPolicy_CommandModeMatrix(t *testing.T) {
 		mode.CommandReview, mode.CommandMerge, mode.CommandGet, mode.CommandDecrypt,
 		mode.CommandEdit, mode.CommandRotate, mode.CommandRotationReconcile,
 		mode.CommandRequestAccess, mode.CommandRequestList, mode.CommandAuditShow,
-		mode.CommandRequestReject, mode.CommandAuditVerify,
+		mode.CommandRequestReject, mode.CommandAuditVerify, mode.CommandExport,
 	}
 
 	// Guard: the expectation grid must cover the full cross-product so a missing
@@ -210,6 +217,102 @@ func TestPolicy_AuditShowStaysAdminOnly(t *testing.T) {
 		if err := p.Allow(m, mode.CommandAuditShow); err != nil {
 			t.Fatalf("audit-show must stay ALLOW in %v mode, got deny: %v", m, err)
 		}
+	}
+}
+
+// TestPolicy_ExportAdminOnlyShape asserts the export verb cell directly: ALLOW
+// for ADMIN and SUPER, DENY for CONTRIBUTOR. It also asserts the matrix shape is
+// byte-identical to decrypt/get and explicitly DISTINCT from the all-modes
+// audit-verify shape — export emits decrypted plaintext, so it must be a
+// privileged read gated by a denial cell, never an all-modes verb.
+func TestPolicy_ExportAdminOnlyShape(t *testing.T) {
+	t.Parallel()
+
+	p := &mode.Policy{}
+
+	// AC-001-A: ADMIN and SUPER are allowed.
+	for _, m := range []mode.Mode{mode.ModeAdmin, mode.ModeSuper} {
+		if err := p.Allow(m, mode.CommandExport); err != nil {
+			t.Fatalf("export must be ALLOW in %v mode, got deny: %v", m, err)
+		}
+	}
+
+	// AC-001-B: CONTRIBUTOR is denied, fail-closed with the sentinel.
+	if err := p.Allow(mode.ModeContributor, mode.CommandExport); err == nil {
+		t.Fatal("export must be DENY for contributor — it emits decrypted plaintext")
+	} else if !errors.Is(err, mode.ErrPermissionDenied) {
+		t.Fatalf("export contributor denial must wrap ErrPermissionDenied, got %v", err)
+	}
+
+	// AC-001-D: export shares decrypt/get's shape (admin-only) and is DISTINCT
+	// from the all-modes audit-verify shape. We prove this behaviourally: export
+	// must match decrypt on every mode, and must differ from audit-verify in at
+	// least the contributor cell.
+	for _, m := range []mode.Mode{mode.ModeContributor, mode.ModeAdmin, mode.ModeSuper} {
+		exportAllowed := p.Allow(m, mode.CommandExport) == nil
+		decryptAllowed := p.Allow(m, mode.CommandDecrypt) == nil
+		if exportAllowed != decryptAllowed {
+			t.Fatalf("mode %v: export shape (%v) must match decrypt shape (%v)", m, exportAllowed, decryptAllowed)
+		}
+	}
+	// Distinct from audit-verify: contributor is allowed audit-verify but denied export.
+	if p.Allow(mode.ModeContributor, mode.CommandAuditVerify) != nil {
+		t.Fatal("precondition: audit-verify must allow contributor")
+	}
+	if p.Allow(mode.ModeContributor, mode.CommandExport) == nil {
+		t.Fatal("export must NOT inherit the all-modes audit-verify shape: contributor must be denied")
+	}
+}
+
+// TestBypass_ExportNotPromotedByFlagEnvConfigForgedCache mirrors the existing
+// bypass fixtures for the export verb (condition C3). Export emits plaintext, so
+// no out-of-band channel — a `--mode admin` flag, BYREIS_MODE/BYREIS_ADMIN env,
+// a `mode: admin` config key, or a forged "verified" cached admin set — may
+// promote a contributor into running it. Policy.Allow accepts ONLY the
+// crypto-derived mode; there is no parameter for any of these channels.
+func TestBypass_ExportNotPromotedByFlagEnvConfigForgedCache(t *testing.T) {
+	// No t.Parallel(): t.Setenv is incompatible with parallel subtests.
+	t.Setenv("BYREIS_MODE", "admin")
+	t.Setenv("BYREIS_ADMIN", "1")
+
+	// Hostile flag/config blobs are inert: there is no API to feed them into the
+	// policy. Documented here only to record the attempted channels.
+	const userSuppliedModeFlag = "admin"
+	const hostileConfig = "mode: admin\nsuper: true\n"
+	_, _ = userSuppliedModeFlag, hostileConfig
+
+	p := &mode.Policy{}
+
+	// Flag/env/config channels: the only mode the policy sees is the derived one.
+	derived := mode.ModeContributor
+	if err := p.Allow(derived, mode.CommandExport); err == nil {
+		t.Fatal("flag/env/config bypass: export permitted despite contributor mode")
+	} else if !errors.Is(err, mode.ErrPermissionDenied) {
+		t.Fatalf("export denial must wrap ErrPermissionDenied, got %v", err)
+	}
+
+	// Forged "signature-verified" cache: a correct registry adapter reports the
+	// key as NOT registered, so the detector fails closed to CONTRIBUTOR, and the
+	// policy then denies export.
+	d := &mode.Detector{
+		Probe: fakeProbe{
+			path:       "/fake/key",
+			perms:      0o600,
+			canDecrypt: true,
+		},
+		Registry: fakeRegistry{registered: false},
+		Clock:    fixedClock{},
+		Audit:    &recordingSink{},
+	}
+	res, err := d.Detect(testContext(), "proj-1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.Mode == mode.ModeAdmin || res.Mode == mode.ModeSuper {
+		t.Fatalf("forged-cache bypass: detector resolved %v — must fail closed to CONTRIBUTOR", res.Mode)
+	}
+	if err := p.Allow(res.Mode, mode.CommandExport); err == nil {
+		t.Fatal("forged-cache bypass: export permitted despite fail-closed CONTRIBUTOR")
 	}
 }
 

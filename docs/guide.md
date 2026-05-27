@@ -256,6 +256,56 @@ byreis decrypt --project myapp --file secrets/production.enc.yaml --ci --json
 Both `get` and `decrypt` run `VerifyOfRecord` (registry trust verification)
 before any decrypt or key-load.
 
+### Export to an env/dotenv stream
+
+```bash
+# Shell-sourceable export lines (set -a; source <(byreis export ...))
+byreis export --project myapp --file secrets/production.enc.yaml --format env | cat
+
+# .env file for godotenv / docker-compose env_file
+byreis export --project myapp --file secrets/production.enc.yaml --format dotenv > app.env
+```
+
+`byreis export` is an admin-only command. Like `get` and `decrypt`, it decrypts
+the secrets file with the admin private key, so a keyless contributor cannot run
+it — it is denied at the permission matrix before any network contact or
+key-load. It runs `VerifyOfRecord` first and decrypts the whole file fail-closed:
+if any value cannot be decrypted, nothing is emitted.
+
+`--format` selects the serialization shape:
+
+- `env` emits one `export KEY="..."` line per value, intended to be `source`d or
+  `eval`d by a shell.
+- `dotenv` emits one `KEY="..."` line per value, for `.env` files consumed by
+  godotenv, docker-compose `env_file`, and other quote-aware loaders.
+
+Every value is always double-quoted and escaped — including `$` and backtick — so
+a value round-trips exactly and a hostile secret value cannot inject a command
+when the output is `source`d or `eval`d. The output targets quote-aware
+consumers; raw `docker --env-file` (which does not process quotes or escapes) is
+out of scope.
+
+By default `byreis export` refuses to write plaintext to an interactive
+terminal, so a decrypted file does not land in scrollback by accident. **This
+TTY refusal is a convenience speed-bump against an accidental dump, not a
+security boundary.** The security boundary is the admin private key. The moment
+you pipe or redirect the output — `byreis export ... | cat`, `> app.env` — the
+plaintext is yours to protect: it is now in your shell history, your CI logs,
+and a file whose permissions you own. Treat exported plaintext with the same
+care as any other decrypted secret.
+
+#### Why there is no `--sops` flag
+
+`byreis export` does not and will not support a `--sops` output format. byreis
+uses a native age recipient model (see ADR-0001 and ADR-0003): secrets are
+encrypted directly to each admin's public key, and there is **no shared
+symmetric data key**. That absence is exactly what makes the access asymmetric —
+a contributor can encrypt to the admins but holds no key that decrypts anything.
+A SOPS-style export would have to reintroduce a shared symmetric data key on the
+consumer side, which would defeat the asymmetric-access guarantee. If you are
+migrating off SOPS, `byreis export --format env|dotenv` is the supported,
+clean escape hatch into plaintext.
+
 ### Edit a secret in-place
 
 ```bash

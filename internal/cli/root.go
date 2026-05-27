@@ -72,6 +72,7 @@ hold only public keys.`,
 	root.AddCommand(newReviewCmd(deps, &jsonFlag))
 	root.AddCommand(newGetCmd(deps, &jsonFlag))
 	root.AddCommand(newDecryptCmd(deps, &jsonFlag))
+	root.AddCommand(newExportCmd(deps, &jsonFlag))
 	root.AddCommand(newEditCmd(deps, &jsonFlag))
 	root.AddCommand(newAdminCmd(deps, &jsonFlag))
 	root.AddCommand(newAuditCmd(deps, &jsonFlag))

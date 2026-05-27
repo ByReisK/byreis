@@ -144,6 +144,13 @@ const (
 	// channel is public by the asymmetric design. The capability is confined by the
 	// import graph (zero-key, zero-decrypt, read-only), not by a denial cell.
 	CommandAuditVerify Command = "audit-verify"
+	// CommandExport is the admin-side verb that emits decrypted plaintext to an
+	// external format (e.g. dotenv). It carries the same privilege shape as
+	// CommandDecrypt/CommandGet — ADMIN/SUPER only, CONTRIBUTOR denied — because
+	// it discloses plaintext. It is deliberately NOT an all-modes verb like
+	// CommandAuditVerify: the audit channel is public, but exported plaintext is
+	// not, so export must stay behind an admin denial cell.
+	CommandExport Command = "export"
 )
 
 // ErrKeyPermissions is a hard error returned when the private key file exists
@@ -354,6 +361,11 @@ var matrix = map[Command]map[Mode]bool{
 	// zero-decrypt, read-only), not by a denial cell — this is NOT a relaxation of
 	// the admin-only CommandAuditShow plain-read cell, which stays {Admin, Super}.
 	CommandAuditVerify: {ModeContributor: true, ModeAdmin: true, ModeSuper: true},
+	// Admin-only verb (byte-identical shape to CommandDecrypt/CommandGet):
+	// CONTRIBUTOR is denied, ADMIN/SUPER may export decrypted plaintext. Export
+	// discloses plaintext, so it is gated by a denial cell — deliberately NOT the
+	// all-modes audit-verify shape.
+	CommandExport: {ModeAdmin: true, ModeSuper: true},
 }
 
 // Allow returns nil if cmd is permitted in mode m, or an error wrapping

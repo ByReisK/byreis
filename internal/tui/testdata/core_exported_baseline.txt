@@ -248,6 +248,7 @@ github.com/ByReisK/byreis/internal/core/mode#CommandAuditVerify
 github.com/ByReisK/byreis/internal/core/mode#CommandDecrypt
 github.com/ByReisK/byreis/internal/core/mode#CommandDoctor
 github.com/ByReisK/byreis/internal/core/mode#CommandEdit
+github.com/ByReisK/byreis/internal/core/mode#CommandExport
 github.com/ByReisK/byreis/internal/core/mode#CommandGet
 github.com/ByReisK/byreis/internal/core/mode#CommandInit
 github.com/ByReisK/byreis/internal/core/mode#CommandMerge
@@ -388,6 +389,7 @@ github.com/ByReisK/byreis/internal/core/usecase#DecryptDeps.Verifier
 github.com/ByReisK/byreis/internal/core/usecase#DecryptInput
 github.com/ByReisK/byreis/internal/core/usecase#DecryptInput.FileName
 github.com/ByReisK/byreis/internal/core/usecase#DecryptInput.Keys
+github.com/ByReisK/byreis/internal/core/usecase#DecryptInput.Op
 github.com/ByReisK/byreis/internal/core/usecase#DecryptInput.ProjectID
 github.com/ByReisK/byreis/internal/core/usecase#DecryptResult
 github.com/ByReisK/byreis/internal/core/usecase#DecryptResult.ContentSHA

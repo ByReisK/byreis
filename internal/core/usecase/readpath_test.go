@@ -26,6 +26,7 @@ import (
 	"filippo.io/age"
 	"filippo.io/age/armor"
 
+	"github.com/ByReisK/byreis/internal/core/audit"
 	"github.com/ByReisK/byreis/internal/core/crypto/artifact"
 	"github.com/ByReisK/byreis/internal/core/crypto/encrypt"
 	"github.com/ByReisK/byreis/internal/core/crypto/identity"
@@ -972,5 +973,164 @@ func TestDecrypt_HappyPath_AllValuesAfterVerifyFirst(t *testing.T) {
 	}
 	if res.Plaintext["A"] != "1" || res.Plaintext["B"] != "2" {
 		t.Fatalf("Plaintext = %v, want all values", res.Plaintext)
+	}
+}
+
+// mkDecryptorWithAudit builds a Decrypt use-case wired to the supplied recording
+// audit sink. It is the shared fixture for the DecryptInput.Op audit-plumbing
+// table below; every collaborator other than the audit sink is the same happy
+// path the existing Decrypt tests use.
+func mkDecryptorWithAudit(t *testing.T, aud audit.Logger) usecase.DecryptUseCase {
+	t.Helper()
+	rec, _, x := mkRecipient(t)
+	body, pub := signedArtifactFor(t,
+		[]rectypes.Recipient{rec}, []*age.X25519Identity{x},
+		map[string]string{"A": "1"}, 0)
+	d, err := usecase.NewDecryptor(usecase.DecryptDeps{
+		Source:     &stubFileOfRecord{bytes: []byte("live"), sha: verify.ContentSHA(body)},
+		Codec:      &stubCodec{signed: body},
+		Decryptor:  &spyDecryptor{out: map[string]string{"A": "1"}},
+		IDLoader:   &spyIDLoader{id: mustID(t, x)},
+		Verifier:   &spyVerifier{},
+		Recipients: recDeps(t, pub, []rectypes.Recipient{rec}),
+		Counter:    &stubCounter{auth: witnessedAuthority(0, nil)},
+		Mode:       modeGate{m: mode.ModeAdmin},
+		Audit:      aud,
+	})
+	if err != nil {
+		t.Fatalf("NewDecryptor: %v", err)
+	}
+	return d
+}
+
+// lastReadOp returns the recorded Details["op"] of the most recent audit event,
+// failing the test if no event was recorded.
+func lastReadOp(t *testing.T, sink *spyAudit) string {
+	t.Helper()
+	if len(sink.events) == 0 {
+		t.Fatal("no audit event was recorded for a successful Decrypt")
+	}
+	return sink.events[len(sink.events)-1].Details["op"]
+}
+
+// TestDecrypt_OpAuditField_DefaultAndExplicit asserts the DecryptInput.Op audit
+// plumbing:
+//
+//   - default (zero-value) DecryptInput.Op records op "decrypt" — byte-identical
+//     to the pre-Op behaviour, the hard back-compat condition for existing
+//     Get/Decrypt callers that pass no Op;
+//   - Op:"export" flows through to the recorded audit op unchanged;
+//   - Op is a fixed intent literal only — it never appears in the returned error
+//     text on a failure path (asserted by the sibling leak test below).
+func TestDecrypt_OpAuditField_DefaultAndExplicit(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		op     string
+		wantOp string
+	}{
+		{name: "default empty Op normalizes to decrypt (back-compat)", op: "", wantOp: "decrypt"},
+		{name: "explicit export Op flows through", op: "export", wantOp: "export"},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			sink := &spyAudit{}
+			d := mkDecryptorWithAudit(t, sink)
+
+			_, err := d.Decrypt(context.Background(), usecase.DecryptInput{
+				ProjectID: rpProject, FileName: rpFile, Op: tc.op,
+			})
+			if err != nil {
+				t.Fatalf("Decrypt: %v", err)
+			}
+			if got := lastReadOp(t, sink); got != tc.wantOp {
+				t.Fatalf("recorded audit op = %q, want %q", got, tc.wantOp)
+			}
+		})
+	}
+}
+
+// failingAudit is an audit.Logger whose Append always returns the configured
+// error. It is used exclusively in TestDecrypt_AuditAppendFail_NonFatal to
+// verify that a post-decrypt audit failure does not fail a successful read.
+type failingAudit struct {
+	err error
+}
+
+func (f *failingAudit) Append(_ context.Context, _ audit.Event) error {
+	return f.err
+}
+
+// TestDecrypt_AuditAppendFail_NonFatal asserts AC-005-B: if the audit Append
+// call returns an error after a successful decrypt, the Decrypt use-case
+// still returns the full plaintext map and KeyNames with no error. A downstream
+// audit failure must never roll back a completed read.
+func TestDecrypt_AuditAppendFail_NonFatal(t *testing.T) {
+	t.Parallel()
+
+	auditErr := errors.New("audit backend unavailable: disk full")
+	d := mkDecryptorWithAudit(t, &failingAudit{err: auditErr})
+
+	res, err := d.Decrypt(context.Background(), usecase.DecryptInput{
+		ProjectID: rpProject, FileName: rpFile, Op: "export",
+	})
+
+	// (a) Decrypt must succeed — no error returned to the caller.
+	if err != nil {
+		t.Fatalf("Decrypt must succeed even when audit.Append fails, got err: %v", err)
+	}
+	// (b) The full plaintext map and KeyNames are present.
+	if len(res.Plaintext) == 0 {
+		t.Fatal("Decrypt returned an empty Plaintext map after a failing audit.Append")
+	}
+	if res.Plaintext["A"] != "1" {
+		t.Fatalf("Plaintext[A] = %q, want %q", res.Plaintext["A"], "1")
+	}
+	if len(res.KeyNames) == 0 {
+		t.Fatal("Decrypt returned no KeyNames after a failing audit.Append")
+	}
+}
+
+// TestDecrypt_OpNeverLeaksIntoErrorText proves condition Q5/C7: even when a
+// caller sets a custom Op, that value is confined to the audit Details and never
+// surfaces in the ReadPathError message or its Op field on a failure path. The
+// error path keeps the fixed "decrypt" use-case label regardless of the audit op.
+func TestDecrypt_OpNeverLeaksIntoErrorText(t *testing.T) {
+	t.Parallel()
+
+	rec, _, x := mkRecipient(t)
+	_, pub := signedArtifactFor(t,
+		[]rectypes.Recipient{rec}, []*age.X25519Identity{x},
+		map[string]string{"K": "v"}, 0)
+	// A verify failure forces the read to fail before any audit-OK append, so we
+	// can inspect the returned error for any trace of the caller-supplied Op.
+	const sentinelOp = "export-sentinel-OP"
+	d, _ := usecase.NewDecryptor(usecase.DecryptDeps{
+		Source:     &stubFileOfRecord{bytes: []byte("live"), sha: "x"},
+		Codec:      &stubCodec{decodeSErr: errors.New("yaml: malformed")},
+		Decryptor:  &spyDecryptor{out: map[string]string{"K": "v"}},
+		IDLoader:   &spyIDLoader{id: mustID(t, x)},
+		Verifier:   &spyVerifier{},
+		Recipients: recDeps(t, pub, []rectypes.Recipient{rec}),
+		Counter:    &stubCounter{auth: witnessedAuthority(0, nil)},
+		Mode:       modeGate{m: mode.ModeAdmin},
+		Audit:      &spyAudit{},
+	})
+	_, err := d.Decrypt(context.Background(), usecase.DecryptInput{
+		ProjectID: rpProject, FileName: rpFile, Op: sentinelOp,
+	})
+	if err == nil {
+		t.Fatal("expected a decode failure")
+	}
+	if strings.Contains(err.Error(), sentinelOp) {
+		t.Fatalf("caller-supplied Op leaked into error text: %q", err.Error())
+	}
+	var rpe *usecase.ReadPathError
+	if errors.As(err, &rpe) && strings.Contains(rpe.Op, sentinelOp) {
+		t.Fatalf("caller-supplied Op leaked into ReadPathError.Op: %q", rpe.Op)
 	}
 }

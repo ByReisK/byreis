@@ -403,6 +403,13 @@ type DecryptInput struct {
 	// Keys, when non-empty, restricts the returned plaintext to this subset
 	// (missing keys are an error). Empty means decrypt every value.
 	Keys []string
+	// Op is the audit intent label recorded for this read. It is a fixed intent
+	// literal only (e.g. "decrypt", "export") — never key, secret, or any
+	// caller/attacker-derived data — and is confined to the audit Details map; it
+	// never appears in an error message or log line. The empty value behaves as
+	// "decrypt": existing Get/Decrypt callers pass no Op and their audit records
+	// stay byte-identical to the pre-Op behaviour.
+	Op string
 }
 
 // DecryptResult is the full (or subset) decrypted plaintext set.
@@ -495,10 +502,21 @@ func (u *decryptUseCase) Decrypt(ctx context.Context, in DecryptInput) (DecryptR
 		plaintext = subset
 	}
 
-	u.d.auditOK(ctx, in.ProjectID, in.FileName, "", "decrypt")
+	u.d.auditOK(ctx, in.ProjectID, in.FileName, "", normalizeReadOp(in.Op))
 	return DecryptResult{
 		Plaintext: plaintext, ContentSHA: contentSHA, KeyNames: keyNames,
 	}, nil
+}
+
+// normalizeReadOp maps the DecryptInput.Op audit intent label to its recorded
+// form. An empty Op (the default for existing Get/Decrypt callers) is recorded
+// as "decrypt", preserving byte-identical audit records for pre-Op callers; a
+// caller-set literal (e.g. "export") flows through unchanged.
+func normalizeReadOp(op string) string {
+	if op == "" {
+		return "decrypt"
+	}
+	return op
 }
 
 // auditOK appends a success audit event (no secret material — key names only).

@@ -483,6 +483,165 @@ func TestAsymmetryShipGate(t *testing.T) {
 		}
 	})
 
+	t.Run("ADMIN/Export/GreenWithRealComposition", func(t *testing.T) {
+		// REQ-V07-007 admin success path: an ADMIN running `export --format env`
+		// through the real production composition must exit 0 and emit the secret
+		// in `KEY="VALUE"` env format on stdout. The env emitter is the only path
+		// to stdout; the raw plaintext value must appear only in that formatted
+		// form and must never appear in stderr or the error channel.
+		//
+		// The export command refuses to write to an interactive TTY; runCobra wires
+		// a *bytes.Buffer as stdout which is never a TTY, so the refusal does not
+		// apply here.
+		fx.applyAdminEnv(t)
+		deps, err := app.BuildProductionDeps(context.Background())
+		if err != nil {
+			t.Fatalf("BuildProductionDeps (ADMIN): %v", err)
+		}
+		if deps.CurrentMode != mode.ModeAdmin {
+			t.Fatalf("M6: deps.CurrentMode = %v, want ModeAdmin", deps.CurrentMode)
+		}
+
+		out, errBuf, exitCode := fx.runCobra(t, deps,
+			"export",
+			"--project", shipgateProjectID,
+			"--file", shipgateLogicalFile,
+			"--format", "env",
+		)
+		if exitCode != 0 {
+			t.Fatalf("admin export: exit %d; stderr=%q stdout=%q",
+				exitCode, errBuf.String(), out.String())
+		}
+		// Emitter output must be in `export KEY="VALUE"` form.
+		wantPrefix := "export " + shipgateSecretKey + `="`
+		if !strings.Contains(out.String(), wantPrefix) {
+			t.Fatalf("admin export (env): stdout %q does not contain expected env prefix %q",
+				out.String(), wantPrefix)
+		}
+		if !strings.Contains(out.String(), shipgateSecretValue) {
+			t.Fatalf("admin export (env): stdout %q does not contain expected plaintext",
+				out.String())
+		}
+		// No plaintext on stderr.
+		if strings.Contains(errBuf.String(), shipgateSecretValue) {
+			t.Fatalf("admin export (env): plaintext leaked to stderr: %q", errBuf.String())
+		}
+	})
+
+	t.Run("ADMIN/Export/DotenvFormat/GreenWithRealComposition", func(t *testing.T) {
+		// Companion to the env-format subtest: verifies --format dotenv produces
+		// `KEY="VALUE"` (no `export ` prefix) and exits 0. Same plaintext appears
+		// only on stdout in the mapped form, never on stderr.
+		fx.applyAdminEnv(t)
+		deps, err := app.BuildProductionDeps(context.Background())
+		if err != nil {
+			t.Fatalf("BuildProductionDeps (ADMIN): %v", err)
+		}
+		if deps.CurrentMode != mode.ModeAdmin {
+			t.Fatalf("M6: deps.CurrentMode = %v, want ModeAdmin", deps.CurrentMode)
+		}
+
+		out, errBuf, exitCode := fx.runCobra(t, deps,
+			"export",
+			"--project", shipgateProjectID,
+			"--file", shipgateLogicalFile,
+			"--format", "dotenv",
+		)
+		if exitCode != 0 {
+			t.Fatalf("admin export (dotenv): exit %d; stderr=%q stdout=%q",
+				exitCode, errBuf.String(), out.String())
+		}
+		// Dotenv format: `KEY="VALUE"` — no `export ` prefix.
+		wantDotenvPrefix := shipgateSecretKey + `="`
+		if !strings.Contains(out.String(), wantDotenvPrefix) {
+			t.Fatalf("admin export (dotenv): stdout %q does not contain expected dotenv prefix %q",
+				out.String(), wantDotenvPrefix)
+		}
+		// The `export ` prefix must NOT appear (confirms format selection fired).
+		if strings.Contains(out.String(), "export "+shipgateSecretKey) {
+			t.Fatalf("admin export (dotenv): stdout contains `export KEY` prefix — wrong format emitted")
+		}
+		if !strings.Contains(out.String(), shipgateSecretValue) {
+			t.Fatalf("admin export (dotenv): stdout does not contain expected plaintext")
+		}
+		if strings.Contains(errBuf.String(), shipgateSecretValue) {
+			t.Fatalf("admin export (dotenv): plaintext leaked to stderr: %q", errBuf.String())
+		}
+	})
+
+	t.Run("CONTRIBUTOR/Export/DeniedByPolicyNotAttempted", func(t *testing.T) {
+		// REQ-V07-007 CONTRIBUTOR denial path + channel sweep.
+		//
+		// The mode gate at the CLI layer must fire BEFORE any use-case entry or
+		// decrypt attempt: denied-by-policy, not attempted-then-failed. Proof
+		// mechanism: replace deps.Decryptor with a panic stub AFTER
+		// BuildProductionDeps; any call into it means the mode gate did NOT fire
+		// first and surfaces as a test failure via panic.
+		//
+		// Channel sweep: across the denied path, the known plaintext must not
+		// appear on stdout, stderr, or in any error value's text. The TMPDIR
+		// snapshot proves zero new temp dirs are created on the denied path
+		// (no fetchhead, project-blob, or editor dirs — mirroring the same
+		// technique applied to get/decrypt/edit above).
+		fx.applyContributorEnv(t)
+		deps, err := app.BuildProductionDeps(context.Background())
+		if err != nil {
+			t.Fatalf("BuildProductionDeps (CONTRIBUTOR): %v", err)
+		}
+		if deps.CurrentMode != mode.ModeContributor {
+			t.Fatalf("CurrentMode = %v, want ModeContributor", deps.CurrentMode)
+		}
+
+		// Replace the Decryptor with a panic stub: any decrypt call proves the mode
+		// gate did not fire first, surfacing as a test failure.
+		deps.Decryptor = &shipgatePanicDecryptor{}
+
+		// TMPDIR snapshot: count byreis-* temp dirs BEFORE the denied call.
+		beforeFetchhead := countTempDirsByPrefix(t, "byreis-fetchhead-")
+		beforeProjBlob := countTempDirsByPrefix(t, "byreis-project-blob-")
+		beforeEditor := countTempDirsByPrefix(t, "byreis-editor-")
+
+		out, errBuf, exitCode := fx.runCobra(t, deps,
+			"export",
+			"--project", shipgateProjectID,
+			"--file", shipgateLogicalFile,
+			"--format", "env",
+		)
+		if exitCode != int(render.ExitPermissionDenied) {
+			t.Fatalf("contributor export: exit %d, want ExitPermissionDenied=%d; "+
+				"stderr=%q stdout=%q",
+				exitCode, render.ExitPermissionDenied, errBuf.String(), out.String())
+		}
+
+		// Channel sweep: no plaintext on any output channel.
+		if strings.Contains(out.String(), shipgateSecretValue) {
+			t.Fatalf("contributor export: plaintext leaked to stdout: %q", out.String())
+		}
+		if strings.Contains(errBuf.String(), shipgateSecretValue) {
+			t.Fatalf("contributor export: plaintext leaked to stderr: %q", errBuf.String())
+		}
+
+		// TMPDIR snapshot AFTER: zero new temp dirs must have been created.
+		afterFetchhead := countTempDirsByPrefix(t, "byreis-fetchhead-")
+		afterProjBlob := countTempDirsByPrefix(t, "byreis-project-blob-")
+		afterEditor := countTempDirsByPrefix(t, "byreis-editor-")
+		if afterFetchhead != beforeFetchhead {
+			t.Errorf("CONTRIBUTOR export added %d new byreis-fetchhead-* dir(s) — "+
+				"mode-gate denial must NOT trigger any new registry clone",
+				afterFetchhead-beforeFetchhead)
+		}
+		if afterProjBlob != beforeProjBlob {
+			t.Errorf("CONTRIBUTOR export added %d new byreis-project-blob-* dir(s) — "+
+				"mode-gate denial must NOT trigger any new project-repo clone",
+				afterProjBlob-beforeProjBlob)
+		}
+		if afterEditor != beforeEditor {
+			t.Errorf("CONTRIBUTOR export added %d new byreis-editor-* dir(s) — "+
+				"mode-gate denial must NEVER reach the editor adapter",
+				afterEditor-beforeEditor)
+		}
+	})
+
 	t.Run("CONTRIBUTOR/RegistryWriteToken/KeychainGateDeniesBeforeRead", func(t *testing.T) {
 		// Credential-separation invariant: in CONTRIBUTOR mode, the keychain
 		// Store's load-site mode gate must fire BEFORE any keychain read occurs.
@@ -550,6 +709,15 @@ type shipgatePanicMerger struct{}
 
 func (p *shipgatePanicMerger) Merge(_ context.Context, _ usecase.MergeInput) (usecase.MergeResult, error) {
 	panic("shipgatePanicMerger.Merge was called — the mode gate did NOT fire before the use-case")
+}
+
+// shipgatePanicDecryptor panics if Decrypt is ever invoked. It is used to
+// assert that the mode gate fires before any decrypt use-case call on the
+// export CONTRIBUTOR denied path.
+type shipgatePanicDecryptor struct{}
+
+func (p *shipgatePanicDecryptor) Decrypt(_ context.Context, _ usecase.DecryptInput) (usecase.DecryptResult, error) {
+	panic("shipgatePanicDecryptor.Decrypt was called — the mode gate did NOT fire before the decrypt use-case on the export path")
 }
 
 // ─── shipgateFixture ──────────────────────────────────────────────────────────
