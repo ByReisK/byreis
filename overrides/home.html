@@ -1,0 +1,49 @@
+{% extends "main.html" %}
+
+<!--
+  Custom landing page for byreis: a terminal-style hero injected above the page
+  content. Only docs/index.md opts in (template: home.html), so every other page
+  keeps the standard Material layout.
+-->
+
+{% block tabs %}
+  {{ super() }}
+
+  <section class="byreis-hero" markdown="0">
+    <div class="byreis-hero__inner">
+      <div class="byreis-hero__copy">
+        <p class="byreis-hero__eyebrow">GitOps secrets · asymmetric access</p>
+        <h1 class="byreis-hero__title">Send secrets.<br><span>Not see them.</span></h1>
+        <p class="byreis-hero__tagline">
+          Contributors submit secrets they can never read. Only admins decrypt.
+          Zero infrastructure — just git and modern public-key encryption.
+        </p>
+        <div class="byreis-hero__cta">
+          <a href="{{ 'getting-started/' | url }}" class="md-button md-button--primary">
+            Get started
+          </a>
+          <a href="{{ config.repo_url }}" class="md-button">
+            View on GitHub
+          </a>
+        </div>
+      </div>
+
+      <div class="byreis-term" aria-hidden="true">
+        <div class="byreis-term__bar">
+          <span class="byreis-term__dot byreis-term__dot--r"></span>
+          <span class="byreis-term__dot byreis-term__dot--y"></span>
+          <span class="byreis-term__dot byreis-term__dot--g"></span>
+          <span class="byreis-term__title">contributor — no private key</span>
+        </div>
+        <pre class="byreis-term__body"><span class="p">$</span> byreis submit <span class="f">--key</span> STRIPE_API_KEY
+<span class="d">✓ encrypted to 3 admin recipients · PR opened</span>
+
+<span class="p">$</span> byreis audit verify <span class="f">--json</span>
+<span class="d">✓ audit trail intact · 0 tampered</span>
+
+<span class="p">$</span> byreis run <span class="f">--</span> ./server      <span class="c"># admin: secrets → env, never disk</span>
+<span class="cur">█</span></pre>
+      </div>
+    </div>
+  </section>
+{% endblock %}

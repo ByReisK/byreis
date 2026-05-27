@@ -14,29 +14,30 @@ copyright: Licensed under Apache 2.0
 theme:
   name: material
   language: en
+  custom_dir: overrides
+  favicon: assets/favicon.svg
   icon:
     repo: fontawesome/brands/github
     logo: material/key-chain-variant
-  favicon: https://raw.githubusercontent.com/ByReisK/byreis/main/.github/favicon.png
+  font:
+    text: Inter
+    code: JetBrains Mono
   palette:
-    - media: "(prefers-color-scheme)"
+    # Dark (slate + amber) is the default — terminal/dev vibe.
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: black
+      accent: amber
       toggle:
-        icon: material/brightness-auto
+        icon: material/weather-night
         name: Switch to light mode
     - media: "(prefers-color-scheme: light)"
       scheme: default
-      primary: indigo
-      accent: indigo
+      primary: black
+      accent: amber
       toggle:
-        icon: material/brightness-7
+        icon: material/weather-sunny
         name: Switch to dark mode
-    - media: "(prefers-color-scheme: dark)"
-      scheme: slate
-      primary: indigo
-      accent: indigo
-      toggle:
-        icon: material/brightness-4
-        name: Switch to system preference
   features:
     - navigation.tabs
     - navigation.sections
@@ -44,12 +45,17 @@ theme:
     - navigation.instant
     - navigation.tracking
     - navigation.indexes
+    - navigation.footer
     - toc.follow
     - search.suggest
     - search.highlight
     - content.code.copy
     - content.code.annotate
+    - content.tabs.link
     - content.action.edit
+
+extra_css:
+  - assets/extra.css
 
 # Keep the GitHub folder readme out of the rendered site (index.md is the home).
 exclude_docs: |

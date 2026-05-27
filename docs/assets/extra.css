@@ -1,0 +1,201 @@
+/* ==========================================================================
+   byreis docs — Slate + Amber (terminal / dev) theme
+   ========================================================================== */
+
+:root {
+  --byreis-amber: #f59e0b;
+  --byreis-amber-bright: #fbbf24;
+  --byreis-slate-900: #0b1120;
+  --byreis-slate-850: #0f172a;
+  --byreis-slate-800: #1e293b;
+  --byreis-slate-700: #334155;
+  --byreis-slate-200: #e2e8f0;
+  --byreis-slate-400: #94a3b8;
+  --md-accent-fg-color: var(--byreis-amber);
+  --md-accent-fg-color--transparent: rgba(245, 158, 11, 0.1);
+}
+
+/* Amber links + accents in both schemes. */
+[data-md-color-scheme="default"] {
+  --md-primary-fg-color: var(--byreis-slate-850);
+  --md-primary-fg-color--dark: var(--byreis-slate-900);
+  --md-typeset-a-color: #b45309; /* amber-700: readable on white */
+}
+
+[data-md-color-scheme="slate"] {
+  --md-primary-fg-color: var(--byreis-slate-850);
+  --md-default-bg-color: var(--byreis-slate-850);
+  --md-default-fg-color: var(--byreis-slate-200);
+  --md-default-fg-color--light: var(--byreis-slate-400);
+  --md-typeset-a-color: var(--byreis-amber);
+  --md-code-bg-color: var(--byreis-slate-900);
+  --md-footer-bg-color: var(--byreis-slate-900);
+}
+
+/* Monospace, slightly tightened headings — the "terminal" signature. */
+.md-typeset h1,
+.md-typeset h2,
+.md-typeset h3 {
+  font-family: "JetBrains Mono", "Roboto Mono", monospace;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+.md-typeset h2 {
+  border-bottom: 1px solid var(--md-default-fg-color--lightest);
+  padding-bottom: 0.3rem;
+}
+
+/* Comfortable reading measure + rhythm. */
+.md-typeset {
+  line-height: 1.7;
+}
+.md-grid {
+  max-width: 64rem; /* a touch wider than default for the card grids */
+}
+
+/* Amber buttons. */
+.md-typeset .md-button--primary {
+  background-color: var(--byreis-amber);
+  border-color: var(--byreis-amber);
+  color: #1a1300;
+  font-weight: 600;
+}
+.md-typeset .md-button--primary:hover {
+  background-color: var(--byreis-amber-bright);
+  border-color: var(--byreis-amber-bright);
+  color: #1a1300;
+}
+.md-typeset .md-button:not(.md-button--primary):hover {
+  border-color: var(--byreis-amber);
+  color: var(--byreis-amber);
+}
+
+/* Feature cards: lift + amber edge on hover. */
+.md-typeset .grid.cards > :is(ul, ol) > li,
+.md-typeset .grid > .card {
+  border: 1px solid var(--md-default-fg-color--lightest);
+  border-radius: 0.6rem;
+  transition: border-color 160ms ease, transform 160ms ease, box-shadow 160ms ease;
+}
+.md-typeset .grid.cards > :is(ul, ol) > li:hover {
+  border-color: var(--byreis-amber);
+  transform: translateY(-3px);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
+}
+
+/* ==========================================================================
+   Hero
+   ========================================================================== */
+
+.byreis-hero {
+  background:
+    radial-gradient(900px 360px at 12% -10%, rgba(245, 158, 11, 0.14), transparent 60%),
+    linear-gradient(180deg, var(--byreis-slate-900), var(--byreis-slate-850));
+  border-bottom: 1px solid var(--byreis-slate-700);
+  color: var(--byreis-slate-200);
+  padding: 3.2rem 1.2rem 3.6rem;
+}
+.byreis-hero__inner {
+  max-width: 64rem;
+  margin: 0 auto;
+  display: grid;
+  grid-template-columns: 1.05fr 1fr;
+  gap: 2.4rem;
+  align-items: center;
+}
+.byreis-hero__eyebrow {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 0.72rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--byreis-amber);
+  margin: 0 0 0.5rem;
+}
+.byreis-hero__title {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 2.5rem;
+  line-height: 1.1;
+  font-weight: 700;
+  margin: 0 0 1rem;
+  color: #f8fafc;
+}
+.byreis-hero__title span {
+  color: var(--byreis-amber);
+}
+.byreis-hero__tagline {
+  font-size: 0.92rem;
+  line-height: 1.65;
+  color: var(--byreis-slate-400);
+  max-width: 32rem;
+  margin: 0 0 1.6rem;
+}
+.byreis-hero__cta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.8rem;
+}
+.byreis-hero__cta .md-button {
+  margin: 0;
+}
+.byreis-hero__cta .md-button:not(.md-button--primary) {
+  color: var(--byreis-slate-200);
+  border-color: var(--byreis-slate-700);
+}
+
+/* Terminal window mock. */
+.byreis-term {
+  background: #060a14;
+  border: 1px solid var(--byreis-slate-700);
+  border-radius: 0.7rem;
+  overflow: hidden;
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.45);
+}
+.byreis-term__bar {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.55rem 0.8rem;
+  background: var(--byreis-slate-800);
+  border-bottom: 1px solid var(--byreis-slate-700);
+}
+.byreis-term__dot {
+  width: 0.7rem;
+  height: 0.7rem;
+  border-radius: 50%;
+  display: inline-block;
+}
+.byreis-term__dot--r { background: #ff5f56; }
+.byreis-term__dot--y { background: #ffbd2e; }
+.byreis-term__dot--g { background: #27c93f; }
+.byreis-term__title {
+  margin-left: 0.6rem;
+  font-family: "JetBrains Mono", monospace;
+  font-size: 0.7rem;
+  color: var(--byreis-slate-400);
+}
+.byreis-term__body {
+  margin: 0;
+  padding: 1rem 1.1rem 1.2rem;
+  font-family: "JetBrains Mono", "Roboto Mono", monospace;
+  font-size: 0.8rem;
+  line-height: 1.7;
+  color: #cbd5e1;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.byreis-term__body .p { color: var(--byreis-amber); font-weight: 700; } /* prompt */
+.byreis-term__body .f { color: #7dd3fc; }                               /* flags */
+.byreis-term__body .d { color: #34d399; }                               /* success */
+.byreis-term__body .c { color: var(--byreis-slate-400); font-style: italic; } /* comment */
+.byreis-term__body .cur {
+  color: var(--byreis-amber);
+  animation: byreis-blink 1.1s steps(1) infinite;
+}
+@keyframes byreis-blink { 50% { opacity: 0; } }
+
+/* Responsive: stack on small screens. */
+@media screen and (max-width: 76.1875em) {
+  .byreis-hero__inner { grid-template-columns: 1fr; gap: 1.6rem; }
+  .byreis-hero__title { font-size: 2.1rem; }
+  .byreis-term { order: 2; }
+}

@@ -1,23 +1,12 @@
 ---
+template: home.html
+title: byreis — send secrets, not see them
 hide:
   - navigation
+  - toc
 ---
 
-# byreis
-
-> **Send secrets. Not see them.**
-
-Friendly GitOps secrets management with **asymmetric access control** — written in Go.
-
-byreis lets a team manage secrets in plain git, with one defining twist:
-
-!!! quote ""
-    **Contributors can submit secrets, but only admins can read them.**
-
-A contributor encrypts a value to the team's admin public keys and opens a pull
-request. They never hold a private key, so they can add or update a secret but
-can never decrypt one — not even the value they just submitted. An admin reviews
-the decrypted value and merges.
+## See it in action
 
 ```bash
 # Contributor — write-only, no private key required
@@ -32,33 +21,47 @@ byreis admin merge --pr myorg/my-app-secrets#42 --expect <pin> \
 byreis run --project myapp --file secrets/production.enc.yaml -- ./server
 ```
 
-No server. No vendor backend. Just git and modern public-key encryption.
-
 Access level is **derived from cryptographic reality**, never from a config flag
 or environment variable. If you can decrypt a project file and your public key is
 in the verified admin registry, you are an admin. Otherwise you are a contributor.
 
 <div class="grid cards" markdown>
 
--   :material-rocket-launch: **[Getting started](getting-started.md)**
+-   :material-rocket-launch:{ .lg .middle } **Getting started**
+
+    ---
 
     Install byreis, initialize a project, submit your first secret, and read it
     back as an admin.
 
--   :material-feature-search: **[Features](features.md)**
+    [:octicons-arrow-right-24: Get started](getting-started.md)
 
-    The full capability set, organised by role: what a contributor can do, what
-    an admin can do, and the guarantees that hold across both.
+-   :material-feature-search:{ .lg .middle } **Features**
 
--   :material-shield-key: **[Security model](security-model.md)**
+    ---
+
+    The full capability set by role: what a contributor can do, what an admin can
+    do, and the guarantees that hold across both.
+
+    [:octicons-arrow-right-24: Browse features](features.md)
+
+-   :material-shield-key:{ .lg .middle } **Security model**
+
+    ---
 
     How asymmetric access works: native `age` encryption, the two-repo trust
     model, fail-closed mode detection, and the trustworthy audit trail.
 
--   :material-book-open-variant: **[User guide](guide.md)**
+    [:octicons-arrow-right-24: Read the model](security-model.md)
+
+-   :material-book-open-variant:{ .lg .middle } **User guide**
+
+    ---
 
     The complete reference for every workflow, command, configuration value, and
     environment variable.
+
+    [:octicons-arrow-right-24: Open the guide](guide.md)
 
 </div>
 
