@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -1700,17 +1701,22 @@ func githubTokenProd() string {
 }
 
 // buildGitAuthEnv returns a self-contained GIT_CONFIG_COUNT=3 environment
-// block that injects an Authorization: Bearer header scoped to GitHub HTTPS
-// requests only. It returns nil (no auth block) when the token is empty or
-// the URL does not begin with "https://github.com/", so file:// local repos,
-// SSH remote forms, and non-GitHub hosts all clone without an auth header.
+// block that injects an Authorization header scoped to GitHub HTTPS requests
+// only. It returns nil (no auth block) when the token is empty or the URL does
+// not begin with "https://github.com/", so file:// local repos, SSH remote
+// forms, and non-GitHub hosts all clone without an auth header.
 //
-// The config key is http.https://github.com/.extraHeader rather than the
-// bare http.extraHeader, ensuring git only sends the token to github.com;
-// a redirect to any other host drops the header automatically.
+// The config key is http.https://github.com/.extraHeader rather than the bare
+// http.extraHeader, ensuring git only sends the token to github.com; a redirect
+// to any other host drops the header automatically.
 //
-// The predicate is identical to gitAuthEnvBlock in the registry adapter so
-// both layers enforce the same host-scoping rule.
+// GitHub's git-over-HTTPS endpoint requires HTTP Basic authentication. The
+// credential form is base64(x-access-token:<token>), matching the PAT and
+// fine-grained-token forms documented by GitHub. Bearer is rejected by the
+// smart-HTTP info/refs endpoint with 401; Basic is the only accepted scheme.
+//
+// The predicate and encoding are identical to gitAuthEnvBlock in the registry
+// adapter so both layers enforce the same host-scoping and auth-scheme rules.
 func buildGitAuthEnv(registryURL, token string) []string {
 	if token == "" {
 		return nil
@@ -1718,6 +1724,7 @@ func buildGitAuthEnv(registryURL, token string) []string {
 	if !strings.HasPrefix(registryURL, "https://github.com/") {
 		return nil
 	}
+	encoded := base64.StdEncoding.EncodeToString([]byte("x-access-token:" + token))
 	return []string{
 		"GIT_CONFIG_COUNT=3",
 		"GIT_CONFIG_KEY_0=core.hooksPath",
@@ -1725,7 +1732,7 @@ func buildGitAuthEnv(registryURL, token string) []string {
 		"GIT_CONFIG_KEY_1=core.fsmonitor",
 		"GIT_CONFIG_VALUE_1=",
 		"GIT_CONFIG_KEY_2=http.https://github.com/.extraHeader",
-		"GIT_CONFIG_VALUE_2=Authorization: Bearer " + token,
+		"GIT_CONFIG_VALUE_2=Authorization: Basic " + encoded,
 	}
 }
 

@@ -1,13 +1,18 @@
 package app_test
 
-// Tests for buildGitAuthEnv host-scoping predicate (CR-2/CR-3).
+// Tests for buildGitAuthEnv host-scoping predicate and auth-scheme correctness.
 //
 // The helper must return a scoped env block only for github.com HTTPS URLs and
 // must return nil for file://, SSH, bare-owner/repo, non-GitHub HTTPS, and
 // empty-token inputs. This property ensures the token is never injected for a
 // non-GitHub host, even if git follows a cross-host redirect.
+//
+// The auth-scheme tests verify that the Authorization header value uses HTTP
+// Basic (not Bearer) and that the base64-encoded credential has the canonical
+// x-access-token:<token> form required by GitHub's git-over-HTTPS endpoint.
 
 import (
+	"encoding/base64"
 	"strings"
 	"testing"
 
@@ -113,12 +118,27 @@ func TestBuildGitAuthEnv_Predicate(t *testing.T) {
 				t.Errorf("expected scoped key %q in env block, got %v", scopedKey, got)
 			}
 
-			// Verify the auth value entry exists and contains the token.
+			// Verify the auth value entry exists, uses Basic scheme, and encodes
+			// the token in the x-access-token:<token> credential form.
 			var foundValue bool
 			for _, entry := range got {
 				if strings.HasPrefix(entry, "GIT_CONFIG_VALUE_2=") {
-					if !strings.Contains(entry, tc.token) {
-						t.Errorf("GIT_CONFIG_VALUE_2 does not contain token: %q", entry)
+					headerVal := strings.TrimPrefix(entry, "GIT_CONFIG_VALUE_2=")
+					// Scheme must be Basic, not Bearer.
+					if !strings.HasPrefix(headerVal, "Authorization: Basic ") {
+						t.Errorf("GIT_CONFIG_VALUE_2 scheme is not Basic: %q", headerVal)
+					}
+					// Decode and verify the credential payload.
+					encoded := strings.TrimPrefix(headerVal, "Authorization: Basic ")
+					decoded, decErr := base64.StdEncoding.DecodeString(encoded)
+					if decErr != nil {
+						t.Errorf("GIT_CONFIG_VALUE_2 base64 decode failed: %v (value: %q)", decErr, encoded)
+					} else {
+						want := "x-access-token:" + tc.token
+						if string(decoded) != want {
+							t.Errorf("GIT_CONFIG_VALUE_2 decoded credential = %q, want %q",
+								string(decoded), want)
+						}
 					}
 					foundValue = true
 				}

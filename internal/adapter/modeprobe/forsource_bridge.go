@@ -38,6 +38,7 @@ import (
 	"fmt"
 	"sort"
 
+	"github.com/ByReisK/byreis/internal/adapter/artifactcodec"
 	"github.com/ByReisK/byreis/internal/core/crypto/artifact"
 	"github.com/ByReisK/byreis/internal/core/usecase"
 )
@@ -100,13 +101,32 @@ func NewForSourceBridge(
 //  2. Fetches the FileOfRecord from the source.
 //  3. Decodes the bytes into artifact.Signed via the codec.
 //
-// Fail-closed taxonomy (five rows):
+// Fail-closed taxonomy (six rows):
 //
-//   - chooser returns ErrArtifactNotFound (empty/stale/unverified ConfiguredFiles) → ErrArtifactNotFound
-//   - source returns usecase.ErrFileOfRecordNotFound (file not yet merged)         → ErrArtifactNotFound
-//   - codec returns an error (malformed/decode fault)                               → wrapped (not ErrArtifactNotFound)
-//   - source returns a transient network/IO error                                   → wrapped (not ErrArtifactNotFound)
-//   - ctx cancelled                                                                 → ctx error (not ErrArtifactNotFound)
+//   - chooser returns ErrArtifactNotFound (empty/stale/unverified ConfiguredFiles)      → ErrArtifactNotFound
+//   - source returns usecase.ErrFileOfRecordNotFound (file not yet merged)              → ErrArtifactNotFound
+//   - codec returns artifactcodec.ErrTypedMismatch (file exists but has no manifest_sig,
+//     i.e. an unsigned contributor submission artifact on a fresh project before the
+//     first admin merge)                                                                 → ErrArtifactNotFound
+//   - codec returns any other error (malformed/decode fault)                            → wrapped (not ErrArtifactNotFound)
+//   - source returns a transient network/IO error                                       → wrapped (not ErrArtifactNotFound)
+//   - ctx cancelled                                                                     → ctx error (not ErrArtifactNotFound)
+//
+// The ErrTypedMismatch row is fail-closed by construction: both pre- and post-patch
+// resolve to CONTRIBUTOR. Before this row existed, a project file present but lacking a
+// manifest_sig surfaced as a wrapped codec error; CanDecryptAny returned (false, err) and
+// mode.Detect step 3 short-circuited to CONTRIBUTOR on the err != nil branch. After this
+// row, the same input returns ErrArtifactNotFound; CanDecryptAny returns (false, nil) and
+// step 3 short-circuits to CONTRIBUTOR on the !canDecrypt branch. The downstream
+// IsRegisteredAdmin step is never reached when canDecrypt is false, so no promotion path
+// is created by this softening — it only suppresses a misleading "malformed file"
+// diagnostic on the probe path when the project is in the legitimate "contributor has
+// submitted but no admin has merged yet" intermediate state. The asymmetric guarantee
+// holds for the same reason it held before: an attacker without the private key cannot
+// pass the decrypt probe regardless of how a benign no-signed-artifact-yet input is
+// classified. Note: this row does NOT solve the genuine "fresh-project bootstrap"
+// UX question (how a real admin runs the first merge on a project that has never been
+// signed) — that remains a known gap to address in a future cycle, not here.
 //
 // The bridge NEVER logs the probe outcome, audits on error, or caches the
 // returned artifact.Signed across calls. Plaintext stays at the io.Discard
@@ -142,6 +162,20 @@ func (b *ForSourceBridge) FetchArtifact(ctx context.Context, projectID string) (
 
 	signed, decodeErr := b.codec.DecodeSigned(rec.Bytes)
 	if decodeErr != nil {
+		// A file that exists but carries no manifest_sig block is an unsigned
+		// contributor submission artifact — present on a fresh project where a
+		// contributor has submitted but no admin has merged yet. Treat this
+		// identically to a missing file: the probe has nothing signed to attempt
+		// decryption against, so return ErrArtifactNotFound rather than a hard
+		// decode error. This is error-class hygiene on the probe path; it does not
+		// create any new mode-promotion path (see the taxonomy comment above for the
+		// fail-closed argument).
+		if errors.Is(decodeErr, artifactcodec.ErrTypedMismatch) {
+			return artifact.Signed{}, fmt.Errorf(
+				"%w: project %q file %q exists but has no manifest_sig block "+
+					"(unsigned submission artifact — no signed file-of-record yet)",
+				ErrArtifactNotFound, projectID, fileName)
+		}
 		return artifact.Signed{}, fmt.Errorf(
 			"decoding file-of-record for project %q file %q (contentSHA %s): %w",
 			projectID, fileName, rec.ContentSHA, decodeErr)

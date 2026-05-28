@@ -83,6 +83,11 @@ const gitHubHTTPSBase = "https://github.com/"
 // The config key is http.https://github.com/.extraHeader rather than the
 // unqualified http.extraHeader, ensuring git drops the header on any redirect
 // that leaves github.com.
+//
+// GitHub's git-over-HTTPS endpoint requires HTTP Basic authentication. The
+// credential form is base64(x-access-token:<token>), matching the PAT and
+// fine-grained-token forms documented by GitHub. Bearer is rejected by the
+// smart-HTTP info/refs endpoint with 401; Basic is the only accepted scheme.
 func gitAuthEnvBlock(repoURL, token string) []string {
 	if token == "" {
 		return nil
@@ -90,6 +95,7 @@ func gitAuthEnvBlock(repoURL, token string) []string {
 	if !strings.HasPrefix(repoURL, gitHubHTTPSBase) {
 		return nil
 	}
+	encoded := base64.StdEncoding.EncodeToString([]byte("x-access-token:" + token))
 	return []string{
 		"GIT_CONFIG_COUNT=3",
 		"GIT_CONFIG_KEY_0=core.hooksPath",
@@ -97,7 +103,7 @@ func gitAuthEnvBlock(repoURL, token string) []string {
 		"GIT_CONFIG_KEY_1=core.fsmonitor",
 		"GIT_CONFIG_VALUE_1=",
 		"GIT_CONFIG_KEY_2=http." + gitHubHTTPSBase + ".extraHeader",
-		"GIT_CONFIG_VALUE_2=Authorization: Bearer " + token,
+		"GIT_CONFIG_VALUE_2=Authorization: Basic " + encoded,
 	}
 }
 
@@ -259,8 +265,8 @@ func NewProductionFetchTransportFromRunner(runner SubprocessRunner, writeCfg *Fe
 // NewProductionFetchTransportFromRunnerWithAuth is identical to
 // NewProductionFetchTransportFromRunner but also injects extraEnv into the
 // HeadVerifier so that private repositories can be cloned with HTTP
-// authentication.  extraEnv should be a self-contained GIT_CONFIG_COUNT/KEY/VALUE
-// block (e.g. setting http.extraHeader to "Authorization: Bearer <token>").
+// authentication. extraEnv should be a self-contained GIT_CONFIG_COUNT/KEY/VALUE
+// block (e.g. setting http.extraHeader to "Authorization: Basic <base64>").
 // Pass nil for public repositories where no auth is needed.
 func NewProductionFetchTransportFromRunnerWithAuth(runner SubprocessRunner, writeCfg *FetchTransportWriteConfig, extraEnv []string) (*productionFetchTransport, error) {
 	v, err := fetchtransport.NewHeadVerifier(fetchtransport.HeadVerifierConfig{

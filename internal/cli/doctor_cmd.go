@@ -8,6 +8,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/ByReisK/byreis/internal/cli/render"
+	"github.com/ByReisK/byreis/internal/core/mode"
 	"github.com/ByReisK/byreis/internal/core/usecase"
 	"github.com/ByReisK/byreis/internal/core/usecase/rotate"
 )
@@ -90,6 +91,17 @@ alone does NOT cause a non-zero exit.`,
 
 			// Plain output: print mode + reason, then all findings.
 			_, _ = fmt.Fprintf(r.Out, "mode: %s\nreason: %s\n\n", result.Mode, result.ModeReason)
+
+			// When doctor runs with probe suppression (the mode matrix permits doctor
+			// in CONTRIBUTOR mode, so the decrypt probe is never run) AND a key is
+			// configured, the CONTRIBUTOR result may be misleading to an admin. Emit
+			// an informational note so they know how to get an authoritative reading.
+			if !mode.NeedsDecryptProbe(mode.CommandDoctor) && doctorKeyConfigured() {
+				_, _ = fmt.Fprintf(r.Out,
+					"[INFO] mode: probe suppressed (doctor does not require admin); "+
+						"to verify admin mode try a key-using command\n")
+			}
+
 			for _, f := range result.Findings {
 				_, _ = fmt.Fprintf(r.Out, "[%s] %s: %s\n", f.Severity, f.Check, f.Detail)
 			}
@@ -152,6 +164,15 @@ type doctorResultJSONOut struct {
 	OfflineCacheAge string                      `json:"offline_cache_age,omitempty"`
 	HasFail         bool                        `json:"has_fail"`
 	RotationHistory []doctorRotationHistoryJSON `json:"rotation_history,omitempty"`
+}
+
+// doctorKeyConfigured returns true when at least one key-source environment
+// variable is set, indicating a key is configured even though the decrypt probe
+// was suppressed for this command. The note is suppressed for bare contributors
+// who have no key configured at all, where it would be confusing.
+func doctorKeyConfigured() bool {
+	return os.Getenv("BYREIS_KEY") != "" ||
+		os.Getenv("BYREIS_KEY_FILE") != ""
 }
 
 func doctorResultJSON(r usecase.DoctorResult) doctorResultJSONOut {

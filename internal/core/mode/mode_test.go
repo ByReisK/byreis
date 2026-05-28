@@ -303,3 +303,58 @@ func TestDetect_RequiresInjectedDependencies(t *testing.T) {
 		t.Fatalf("misconfigured detector resolved to ADMIN — fail-closed violated")
 	}
 }
+
+// TestDetect_NoCanDecryptShortCircuitsBeforeRegistryCheck pins the property
+// the bridge-softening for unsigned/fresh-project files relies on: when
+// CanDecryptAny returns (false, nil), Detect must short-circuit to CONTRIBUTOR
+// without consulting IsRegisteredAdmin. A future change that consults the
+// registry on the no-decrypt-proof branch would let a registry-write attacker
+// who lacks the private key promote to ADMIN — the asymmetric guarantee.
+// This test asserts that path is closed regardless of registry membership.
+func TestDetect_NoCanDecryptShortCircuitsBeforeRegistryCheck(t *testing.T) {
+	t.Parallel()
+
+	probedRegistry := false
+	registry := callRecordingRegistry{
+		registered: true,
+		called:     &probedRegistry,
+	}
+
+	d := &mode.Detector{
+		Probe: fakeProbe{
+			path:       "/fake/key",
+			perms:      0o600,
+			canDecrypt: false,
+			decryptErr: nil, // benign "nothing to decrypt yet" outcome
+		},
+		Registry: registry,
+		Clock:    fixedClock{t: time.Unix(1_700_000_000, 0)},
+		Audit:    &recordingSink{},
+	}
+
+	res, err := d.Detect(context.Background(), "proj-1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.Mode != mode.ModeContributor {
+		t.Fatalf("benign (false,nil) decrypt probe with admins.yaml-registered key must resolve CONTRIBUTOR, got %v", res.Mode)
+	}
+	if probedRegistry {
+		t.Fatalf("registry must NOT be consulted when CanDecryptAny returned (false, nil) — short-circuit invariant broken; a future code path here could promote a non-key-holder")
+	}
+}
+
+// callRecordingRegistry records whether IsRegisteredAdmin was invoked so the
+// short-circuit invariant above can be asserted directly, not inferred from
+// the resulting mode.
+type callRecordingRegistry struct {
+	registered bool
+	called     *bool
+}
+
+func (r callRecordingRegistry) IsRegisteredAdmin(context.Context, string) (bool, error) {
+	if r.called != nil {
+		*r.called = true
+	}
+	return r.registered, nil
+}

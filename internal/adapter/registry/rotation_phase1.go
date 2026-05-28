@@ -29,6 +29,7 @@ package registry
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"os"
@@ -286,9 +287,12 @@ func (a *rotationPhase1Adapter) Execute(ctx context.Context, plan rotate.Rotatio
 	// the project repo is a GitHub HTTPS URL, count is 3 with the Authorization
 	// header scoped to github.com; otherwise count is 2 (no auth header). The
 	// scoped key ensures a cross-host redirect never carries the token.
+	// The auth header uses Basic base64(x-access-token:<token>) as required by
+	// GitHub's git-over-HTTPS endpoint; Bearer is rejected by that endpoint.
 	buildEnv := func(withAuth bool) []string {
 		base := fetchtransport.CleanGitEnv()
 		if withAuth && gitAuthEnvBlock(a.d.ProjectRepoURL, token) != nil {
+			encoded := base64.StdEncoding.EncodeToString([]byte("x-access-token:" + token))
 			return append(base,
 				"GIT_CONFIG_NOSYSTEM=1",
 				"HOME="+tmpDir,
@@ -300,7 +304,7 @@ func (a *rotationPhase1Adapter) Execute(ctx context.Context, plan rotate.Rotatio
 				"GIT_CONFIG_KEY_1=core.fsmonitor",
 				"GIT_CONFIG_VALUE_1=",
 				"GIT_CONFIG_KEY_2=http."+gitHubHTTPSBase+".extraHeader",
-				"GIT_CONFIG_VALUE_2=Authorization: Bearer "+token,
+				"GIT_CONFIG_VALUE_2=Authorization: Basic "+encoded,
 			)
 		}
 		return append(base,
@@ -666,7 +670,10 @@ func (a *rotationPhase1Adapter) captureRepoHEAD(
 	// HTTPS URLs the scoped key prevents the token from leaking on a redirect;
 	// for non-GitHub or file:// URLs gitAuthEnvBlock returns nil and we omit
 	// the auth header entirely, letting git use SSH or anonymous access.
+	// The auth header uses Basic base64(x-access-token:<token>) as required by
+	// GitHub's git-over-HTTPS endpoint; Bearer is rejected by that endpoint.
 	if gitAuthEnvBlock(repoURL, token) != nil {
+		encoded := base64.StdEncoding.EncodeToString([]byte("x-access-token:" + token))
 		env = append(base,
 			"GIT_CONFIG_NOSYSTEM=1",
 			"HOME="+tmpDir,
@@ -678,7 +685,7 @@ func (a *rotationPhase1Adapter) captureRepoHEAD(
 			"GIT_CONFIG_KEY_1=core.fsmonitor",
 			"GIT_CONFIG_VALUE_1=",
 			"GIT_CONFIG_KEY_2=http."+gitHubHTTPSBase+".extraHeader",
-			"GIT_CONFIG_VALUE_2=Authorization: Bearer "+token,
+			"GIT_CONFIG_VALUE_2=Authorization: Basic "+encoded,
 		)
 	} else {
 		env = append(base,

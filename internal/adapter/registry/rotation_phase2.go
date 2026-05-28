@@ -17,6 +17,7 @@ package registry
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"os"
 	"strings"
@@ -106,9 +107,12 @@ func (a *rotationPhase2Adapter) Execute(ctx context.Context, p1 rotate.Phase1Res
 	// the project repo is a GitHub HTTPS URL, count is 3 with the Authorization
 	// header scoped to github.com; otherwise count is 2. The scoped key ensures
 	// a cross-host redirect never carries the token.
+	// The auth header uses Basic base64(x-access-token:<token>) as required by
+	// GitHub's git-over-HTTPS endpoint; Bearer is rejected by that endpoint.
 	buildEnv := func(withAuth bool) []string {
 		base := fetchtransport.CleanGitEnv()
 		if withAuth && gitAuthEnvBlock(a.d.ProjectRepoURL, token) != nil {
+			encoded := base64.StdEncoding.EncodeToString([]byte("x-access-token:" + token))
 			return append(base,
 				"GIT_CONFIG_NOSYSTEM=1",
 				"HOME="+tmpDir,
@@ -120,7 +124,7 @@ func (a *rotationPhase2Adapter) Execute(ctx context.Context, p1 rotate.Phase1Res
 				"GIT_CONFIG_KEY_1=core.fsmonitor",
 				"GIT_CONFIG_VALUE_1=",
 				"GIT_CONFIG_KEY_2=http."+gitHubHTTPSBase+".extraHeader",
-				"GIT_CONFIG_VALUE_2=Authorization: Bearer "+token,
+				"GIT_CONFIG_VALUE_2=Authorization: Basic "+encoded,
 			)
 		}
 		return append(base,

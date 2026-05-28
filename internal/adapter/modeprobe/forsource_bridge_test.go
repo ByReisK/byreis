@@ -2,7 +2,7 @@ package modeprobe_test
 
 // Test suite for ForSourceBridge and LexFirstChooser.
 //
-// All five fail-closed rows, env-bypass regression, age error-string pinning,
+// All six fail-closed rows, env-bypass regression, age error-string pinning,
 // deterministic chooser ordering, and plaintext non-visibility are covered.
 // No real network, real keychain, real filesystem, or real registry is touched.
 
@@ -18,6 +18,7 @@ import (
 	"filippo.io/age"
 	"filippo.io/age/armor"
 
+	"github.com/ByReisK/byreis/internal/adapter/artifactcodec"
 	"github.com/ByReisK/byreis/internal/adapter/modeprobe"
 	"github.com/ByReisK/byreis/internal/core/crypto/artifact"
 	"github.com/ByReisK/byreis/internal/core/usecase"
@@ -91,7 +92,7 @@ func mustNewBridge(t *testing.T, src usecase.FileOfRecordSource, codec usecase.A
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Five fail-closed rows
+// Six fail-closed rows
 // ─────────────────────────────────────────────────────────────────────────────
 
 // TestBridge_FailClosed_EmptyConfiguredFiles — chooser signals ErrArtifactNotFound
@@ -206,6 +207,34 @@ func TestBridge_FailClosed_IONetworkFault(t *testing.T) {
 	}
 	if !errors.Is(err, netErr) {
 		t.Errorf("row 5 (IO/network fault): error %v must wrap %v", err, netErr)
+	}
+}
+
+// TestBridge_FailClosed_ErrTypedMismatch — codec.DecodeSigned returns
+// artifactcodec.ErrTypedMismatch (the file exists but has no manifest_sig block,
+// meaning no signed artifact has been produced yet for this project). The bridge
+// maps this to ErrArtifactNotFound so that mode.Detect treats it as "nothing to
+// probe against" rather than a hard failure. Admin promotion still happens via
+// registry-membership check (IsRegisteredAdmin), which does not require a signed
+// artifact. Fail-closed is preserved: wrong key / missing key still yields
+// CONTRIBUTOR; only genuine key-possession succeeds the decrypt probe once the
+// first signed artifact exists.
+func TestBridge_FailClosed_ErrTypedMismatch(t *testing.T) {
+	t.Parallel()
+
+	chooser := &fakeChooser{fileName: "secrets"}
+	src := &fakeForSource{rec: usecase.FileOfRecord{Bytes: []byte("submission-artifact"), ContentSHA: "sha-abc"}}
+	codec := &fakeCodec{err: artifactcodec.ErrTypedMismatch}
+
+	bridge := mustNewBridge(t, src, codec, chooser)
+
+	_, err := bridge.FetchArtifact(context.Background(), "proj-fresh")
+	if err == nil {
+		t.Fatal("row 6 (ErrTypedMismatch): expected ErrArtifactNotFound, got nil")
+	}
+	// Must translate to ErrArtifactNotFound — not a hard fault.
+	if !errors.Is(err, modeprobe.ErrArtifactNotFound) {
+		t.Errorf("row 6 (ErrTypedMismatch): got %v, want errors.Is(ErrArtifactNotFound)", err)
 	}
 }
 
@@ -595,7 +624,7 @@ func TestBridge_PlaintextNonVisibility(t *testing.T) {
 // Error mapping table: usecase.ErrFileOfRecordNotFound passthrough
 // ─────────────────────────────────────────────────────────────────────────────
 
-// TestBridge_ErrorMapping — table-driven coverage of the five error inputs
+// TestBridge_ErrorMapping — table-driven coverage of the six error inputs
 // and their expected output classification.
 func TestBridge_ErrorMapping(t *testing.T) {
 	t.Parallel()
@@ -637,6 +666,13 @@ func TestBridge_ErrorMapping(t *testing.T) {
 		{
 			name:            "registry-resolver-fail (ErrArtifactNotFound) → ErrArtifactNotFound",
 			chooserErr:      modeprobe.ErrArtifactNotFound,
+			wantArtNotFound: true,
+		},
+		{
+			name:            "codec-ErrTypedMismatch (no manifest_sig yet) → ErrArtifactNotFound",
+			chooserErr:      nil,
+			sourceErr:       nil,
+			codecErr:        artifactcodec.ErrTypedMismatch,
 			wantArtNotFound: true,
 		},
 	}

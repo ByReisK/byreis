@@ -1,6 +1,6 @@
 package registry
 
-// White-box tests for gitAuthEnvBlock host-scoping (CR-1).
+// White-box tests for gitAuthEnvBlock host-scoping and auth-scheme correctness.
 //
 // These tests run in package registry (not registry_test) to access the
 // unexported helper directly. They assert that:
@@ -12,9 +12,12 @@ package registry
 //   - An empty token always returns nil regardless of URL.
 //   - The produced block contains exactly one GIT_CONFIG_COUNT entry equal to 3
 //     and no bare http.extraHeader key.
+//   - The Authorization header value uses HTTP Basic auth with the
+//     x-access-token:<token> credential form, not Bearer.
 
 import (
 	"context"
+	"encoding/base64"
 	"strings"
 	"testing"
 
@@ -135,12 +138,26 @@ func TestGitAuthEnvBlock_Predicate(t *testing.T) {
 				t.Errorf("expected %q in block, got %v", scopedKey, got)
 			}
 
-			// Authorization value must contain the token.
+			// Authorization value must use Basic scheme and encode the token as
+			// x-access-token:<token> in base64 — Bearer is rejected by GitHub.
 			var foundValue bool
 			for _, e := range got {
 				if strings.HasPrefix(e, "GIT_CONFIG_VALUE_2=") {
-					if !strings.Contains(e, tc.token) {
-						t.Errorf("GIT_CONFIG_VALUE_2 missing token: %q", e)
+					headerVal := strings.TrimPrefix(e, "GIT_CONFIG_VALUE_2=")
+					if !strings.HasPrefix(headerVal, "Authorization: Basic ") {
+						t.Errorf("GIT_CONFIG_VALUE_2 scheme is not Basic: %q", headerVal)
+					}
+					encoded := strings.TrimPrefix(headerVal, "Authorization: Basic ")
+					decoded, decErr := base64.StdEncoding.DecodeString(encoded)
+					if decErr != nil {
+						t.Errorf("GIT_CONFIG_VALUE_2 base64 decode failed: %v (encoded: %q)",
+							decErr, encoded)
+					} else {
+						want := "x-access-token:" + tc.token
+						if string(decoded) != want {
+							t.Errorf("GIT_CONFIG_VALUE_2 decoded credential = %q, want %q",
+								string(decoded), want)
+						}
 					}
 					foundValue = true
 				}
@@ -227,7 +244,8 @@ func TestRotationReverserBuildEnv_Scoping(t *testing.T) {
 }
 
 // assertScopedKey checks that env contains the scoped GIT_CONFIG_KEY_2 entry
-// and that GIT_CONFIG_VALUE_2 holds the token. No bare http.extraHeader allowed.
+// and that GIT_CONFIG_VALUE_2 encodes the token as Basic x-access-token:<token>.
+// No bare http.extraHeader allowed.
 func assertScopedKey(t *testing.T, scopedKey, token string, env []string) {
 	t.Helper()
 	var found bool
@@ -244,12 +262,25 @@ func assertScopedKey(t *testing.T, scopedKey, token string, env []string) {
 	}
 	var foundVal bool
 	for _, e := range env {
-		if strings.HasPrefix(e, "GIT_CONFIG_VALUE_2=") && strings.Contains(e, token) {
-			foundVal = true
+		if strings.HasPrefix(e, "GIT_CONFIG_VALUE_2=") {
+			headerVal := strings.TrimPrefix(e, "GIT_CONFIG_VALUE_2=")
+			if !strings.HasPrefix(headerVal, "Authorization: Basic ") {
+				t.Errorf("assertScopedKey: GIT_CONFIG_VALUE_2 scheme is not Basic: %q", headerVal)
+			}
+			encoded := strings.TrimPrefix(headerVal, "Authorization: Basic ")
+			decoded, decErr := base64.StdEncoding.DecodeString(encoded)
+			if decErr != nil {
+				t.Errorf("assertScopedKey: base64 decode failed: %v (encoded: %q)", decErr, encoded)
+			} else if string(decoded) == "x-access-token:"+token {
+				foundVal = true
+			} else {
+				t.Errorf("assertScopedKey: decoded credential = %q, want x-access-token:%s",
+					string(decoded), token)
+			}
 		}
 	}
 	if !foundVal {
-		t.Errorf("token not found in GIT_CONFIG_VALUE_2 in env %v", env)
+		t.Errorf("token not found in GIT_CONFIG_VALUE_2 (via Basic base64) in env %v", env)
 	}
 }
 

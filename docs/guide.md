@@ -110,6 +110,49 @@ meanings. `BYREIS_PROJECT` is the registry-path id (no slashes). A
 `BYREIS_PROJECT` value that contains a slash is almost always an old-style
 `owner/repo` value in the wrong variable; `byreis doctor` warns on this.
 
+### Counter file schema
+
+The admin registry holds one counter file per project file, at
+`counters/<project_id>/<file>.json`. byreis writes and reads this file during
+`merge` and `rotate`. The JSON schema is:
+
+```json
+{
+  "project_id":            "myapp",
+  "file":                  "production",
+  "last_accepted_counter": 0,
+  "last_pr":               "myorg/myapp-secrets#42",
+  "updated_at":            "2026-01-02T15:04:05Z",
+  "rotation_epoch":        0,
+  "pending":               null
+}
+```
+
+Fields:
+
+| Field | Type | Description |
+|---|---|---|
+| `project_id` | string | Slash-free logical project id (matches `BYREIS_PROJECT`) |
+| `file` | string | Logical file name (basename without extension, e.g. `production`) |
+| `last_accepted_counter` | integer | Monotonically increasing merge counter; starts at 0 |
+| `last_pr` | string | `owner/repo#N` of the last accepted merge PR |
+| `updated_at` | string | RFC 3339 timestamp of the last accepted merge |
+| `rotation_epoch` | integer | Rotation epoch; incremented by `rotate`. Absent (or `0`) before any rotation |
+| `pending` | object or null | Write-ahead intent for an in-flight merge; null when no merge is in progress |
+
+The `pending` sub-object (non-null only during an in-flight merge):
+
+| Field | Type | Description |
+|---|---|---|
+| `pending_counter` | integer | The counter value being committed (`last_accepted_counter + 1`) |
+| `target_artifact_sha` | string | SHA-256 of the artifact being merged (replay defence) |
+| `target_pr` | string | `owner/repo#N` of the PR being merged |
+| `intent_at` | string | RFC 3339 timestamp when the pending intent was written |
+| `parent_commit_sha` | string | Registry HEAD SHA at the time the pending intent was written (replay anchor) |
+
+byreis uses `DisallowUnknownFields` when reading the file: extra JSON keys cause
+a hard error. Do not add non-schema fields manually.
+
 ### `.byreis.yaml`
 
 Created by `byreis init`. Points the project at its registry and holds the

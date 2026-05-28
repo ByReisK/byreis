@@ -25,6 +25,7 @@ package registry
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -761,9 +762,14 @@ func extractBranchFromRef(ref git.PRRef) string {
 // scoped to github.com; otherwise count is 2 (no auth header). Passing the
 // target URL ensures a cross-host redirect never carries the token — non-GitHub
 // and file:// callers naturally produce the two-entry noauth block.
+//
+// The auth header uses HTTP Basic with base64(x-access-token:<token>) to match
+// GitHub's git-over-HTTPS requirement. Bearer is rejected by GitHub's smart-HTTP
+// endpoint; the same encoding is used by gitAuthEnvBlock for consistency.
 func (a *RotationReverserAdapter) buildEnv(tmpDir, repoURL, token string, withAuth bool) []string {
 	base := fetchtransport.CleanGitEnv()
 	if withAuth && gitAuthEnvBlock(repoURL, token) != nil {
+		encoded := base64.StdEncoding.EncodeToString([]byte("x-access-token:" + token))
 		return append(base,
 			"GIT_CONFIG_NOSYSTEM=1",
 			"HOME="+tmpDir,
@@ -775,7 +781,7 @@ func (a *RotationReverserAdapter) buildEnv(tmpDir, repoURL, token string, withAu
 			"GIT_CONFIG_KEY_1=core.fsmonitor",
 			"GIT_CONFIG_VALUE_1=",
 			"GIT_CONFIG_KEY_2=http."+gitHubHTTPSBase+".extraHeader",
-			"GIT_CONFIG_VALUE_2=Authorization: Bearer "+token,
+			"GIT_CONFIG_VALUE_2=Authorization: Basic "+encoded,
 		)
 	}
 	return append(base,
