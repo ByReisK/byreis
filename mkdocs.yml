@@ -42,7 +42,8 @@ theme:
     - navigation.tabs
     - navigation.sections
     - navigation.top
-    - navigation.instant
+    # navigation.instant disabled — mkdocs-static-i18n's contextual
+    # language switcher is incompatible with it.
     - navigation.tracking
     - navigation.indexes
     - navigation.footer
@@ -87,6 +88,36 @@ markdown_extensions:
 
 plugins:
   - search
+  - i18n:
+      docs_structure: suffix
+      reconfigure_material: true
+      reconfigure_search: true
+      languages:
+        - locale: en
+          default: true
+          name: English
+          build: true
+        - locale: vi
+          name: Tiếng Việt
+          build: true
+          site_name: byreis
+          site_description: >-
+            GitOps secrets management thân thiện với asymmetric access control —
+            contributor submit secrets nhưng không bao giờ đọc được; chỉ admin
+            decrypt.
+          nav_translations:
+            Home: Trang chủ
+            Getting started: Bắt đầu
+            Features: Tính năng
+            Security model: Mô hình bảo mật
+            User guide: Hướng dẫn sử dụng
+            Walkthrough: Walkthrough thực tế
+            Runbooks: Runbook
+            Rotating the recipient set: Rotate recipient set
+            Requesting access: Yêu cầu access
+            Reference: Tham khảo
+            Forward secrecy: Forward secrecy
+            Release notes: Release notes
 
 nav:
   - Home: index.md

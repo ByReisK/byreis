@@ -1,3 +1,4 @@
 # Documentation site toolchain (used only by the docs workflow / local preview).
 # The byreis project itself remains pure Go — this is not a runtime dependency.
 mkdocs-material>=9.5,<10
+mkdocs-static-i18n>=1.2,<2
