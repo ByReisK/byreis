@@ -1,8 +1,11 @@
 # byreis user guide
 
-This guide covers the full current feature set of byreis v0.5. It is written
+This guide covers the full current feature set of byreis v0.9.2. It is written
 for both contributors (who submit secrets but cannot read them) and admins (who
 hold private keys and manage the secrets lifecycle).
+
+For a captured end-to-end run against real GitHub — real repos, real PRs, real
+signed commits — see the [walkthrough](walkthrough.md).
 
 ## Contents
 

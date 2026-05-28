@@ -94,6 +94,7 @@ nav:
   - Features: features.md
   - Security model: security-model.md
   - User guide: guide.md
+  - Walkthrough: walkthrough.md
   - Runbooks:
       - Rotating the recipient set: rotation-runbook.md
       - Requesting access: request-access-runbook.md
