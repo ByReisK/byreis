@@ -6,6 +6,12 @@ on:
   pull_request:
     branches: ["**"]
 
+# Force Node.js-20-based JavaScript actions (actions/checkout@v4, actions/setup-go@v5,
+# softprops/action-gh-release@v2) to run on the runner-provided Node 24, ahead of
+# the 2026-06-02 GitHub-enforced default switch.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   build:
     name: Build
