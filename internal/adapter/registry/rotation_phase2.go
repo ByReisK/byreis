@@ -102,11 +102,13 @@ func (a *rotationPhase2Adapter) Execute(ctx context.Context, p1 rotate.Phase1Res
 	cloneDir := tmpDir // we use a shallow clone of the project repo
 
 	// buildEnv constructs the git isolation environment with exactly one
-	// GIT_CONFIG_COUNT entry. When withAuth is true and a token is available,
-	// the count is 3 and the Authorization header is appended; otherwise 2.
+	// GIT_CONFIG_COUNT entry. When withAuth is true AND gitAuthEnvBlock confirms
+	// the project repo is a GitHub HTTPS URL, count is 3 with the Authorization
+	// header scoped to github.com; otherwise count is 2. The scoped key ensures
+	// a cross-host redirect never carries the token.
 	buildEnv := func(withAuth bool) []string {
 		base := fetchtransport.CleanGitEnv()
-		if withAuth && token != "" {
+		if withAuth && gitAuthEnvBlock(a.d.ProjectRepoURL, token) != nil {
 			return append(base,
 				"GIT_CONFIG_NOSYSTEM=1",
 				"HOME="+tmpDir,
@@ -117,7 +119,7 @@ func (a *rotationPhase2Adapter) Execute(ctx context.Context, p1 rotate.Phase1Res
 				"GIT_CONFIG_VALUE_0=/dev/null",
 				"GIT_CONFIG_KEY_1=core.fsmonitor",
 				"GIT_CONFIG_VALUE_1=",
-				"GIT_CONFIG_KEY_2=http.extraHeader",
+				"GIT_CONFIG_KEY_2=http."+gitHubHTTPSBase+".extraHeader",
 				"GIT_CONFIG_VALUE_2=Authorization: Bearer "+token,
 			)
 		}

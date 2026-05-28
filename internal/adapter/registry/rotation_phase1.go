@@ -282,14 +282,14 @@ func (a *rotationPhase1Adapter) Execute(ctx context.Context, plan rotate.Rotatio
 	cloneDir := filepath.Join(tmpDir, "project")
 
 	// buildEnv constructs the git isolation environment with exactly one
-	// GIT_CONFIG_COUNT entry. When withAuth is true and a token is available, the
-	// count is 3 and the Authorization header entry is appended; otherwise count
-	// is 2. This avoids the duplicate-COUNT bug that caused glibc getenv to
-	// return the first (wrong) value and drop the auth header.
+	// GIT_CONFIG_COUNT entry. When withAuth is true AND gitAuthEnvBlock confirms
+	// the project repo is a GitHub HTTPS URL, count is 3 with the Authorization
+	// header scoped to github.com; otherwise count is 2 (no auth header). The
+	// scoped key ensures a cross-host redirect never carries the token.
 	buildEnv := func(withAuth bool) []string {
 		base := fetchtransport.CleanGitEnv()
-		if withAuth && token != "" {
-			env := append(base,
+		if withAuth && gitAuthEnvBlock(a.d.ProjectRepoURL, token) != nil {
+			return append(base,
 				"GIT_CONFIG_NOSYSTEM=1",
 				"HOME="+tmpDir,
 				"GIT_TERMINAL_PROMPT=0",
@@ -299,10 +299,9 @@ func (a *rotationPhase1Adapter) Execute(ctx context.Context, plan rotate.Rotatio
 				"GIT_CONFIG_VALUE_0=/dev/null",
 				"GIT_CONFIG_KEY_1=core.fsmonitor",
 				"GIT_CONFIG_VALUE_1=",
-				"GIT_CONFIG_KEY_2=http.extraHeader",
+				"GIT_CONFIG_KEY_2=http."+gitHubHTTPSBase+".extraHeader",
 				"GIT_CONFIG_VALUE_2=Authorization: Bearer "+token,
 			)
-			return env
 		}
 		return append(base,
 			"GIT_CONFIG_NOSYSTEM=1",
@@ -663,7 +662,11 @@ func (a *rotationPhase1Adapter) captureRepoHEAD(
 ) (string, error) {
 	base := fetchtransport.CleanGitEnv()
 	var env []string
-	if token != "" {
+	// Scope the Authorization header to the target repoURL host. For GitHub
+	// HTTPS URLs the scoped key prevents the token from leaking on a redirect;
+	// for non-GitHub or file:// URLs gitAuthEnvBlock returns nil and we omit
+	// the auth header entirely, letting git use SSH or anonymous access.
+	if gitAuthEnvBlock(repoURL, token) != nil {
 		env = append(base,
 			"GIT_CONFIG_NOSYSTEM=1",
 			"HOME="+tmpDir,
@@ -674,7 +677,7 @@ func (a *rotationPhase1Adapter) captureRepoHEAD(
 			"GIT_CONFIG_VALUE_0=/dev/null",
 			"GIT_CONFIG_KEY_1=core.fsmonitor",
 			"GIT_CONFIG_VALUE_1=",
-			"GIT_CONFIG_KEY_2=http.extraHeader",
+			"GIT_CONFIG_KEY_2=http."+gitHubHTTPSBase+".extraHeader",
 			"GIT_CONFIG_VALUE_2=Authorization: Bearer "+token,
 		)
 	} else {

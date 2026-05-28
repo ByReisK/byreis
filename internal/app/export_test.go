@@ -132,3 +132,9 @@ func AuditVerifierIsReadOnlyForTest(av interface{}) (readOnly bool, isProduction
 	}
 	return client.WriteTokenProviderIsNilForTest(), true
 }
+
+// BuildGitAuthEnvForTest exposes buildGitAuthEnv for white-box tests that
+// verify the host-scoping predicate and the resulting GIT_CONFIG env block.
+func BuildGitAuthEnvForTest(registryURL, token string) []string {
+	return buildGitAuthEnv(registryURL, token)
+}

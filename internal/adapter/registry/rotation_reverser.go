@@ -159,7 +159,7 @@ func (a *RotationReverserAdapter) FetchPartialState(ctx context.Context, project
 	}
 
 	cloneDir := filepath.Join(tmpDir, "registry")
-	env := a.buildEnv(tmpDir, token, true)
+	env := a.buildEnv(tmpDir, a.d.RegistryURL, token, true)
 
 	// Shallow clone the registry.
 	cloneCtx, cloneCancel := fetchtransport.WithBoundedDeadline(ctx, writeTimeout)
@@ -327,7 +327,7 @@ func (a *RotationReverserAdapter) checkRotationBranch(
 		return false, false, git.PRRef{}, fmt.Errorf("chmod branch-check workspace: %w", chErr)
 	}
 
-	env := a.buildEnv(tmpDir, token, true)
+	env := a.buildEnv(tmpDir, a.d.ProjectRepoURL, token, true)
 
 	// Use git ls-remote to list branches without a full clone.
 	lsCtx, lsCancel := fetchtransport.WithBoundedDeadline(ctx, 20*time.Second)
@@ -437,7 +437,7 @@ func (a *RotationReverserAdapter) ClearPendings(
 	}
 
 	cloneDir := filepath.Join(tmpDir, "repo")
-	env := a.buildEnv(tmpDir, token, true)
+	env := a.buildEnv(tmpDir, a.d.RegistryURL, token, true)
 
 	// Step 1: shallow clone the registry.
 	cloneCtx, cloneCancel := fetchtransport.WithBoundedDeadline(ctx, writeTimeout)
@@ -701,7 +701,7 @@ func (a *RotationReverserAdapter) DeleteRotationBranch(ctx context.Context, ref 
 		return fmt.Errorf("DeleteRotationBranch: cannot extract branch name from ref %+v", ref)
 	}
 
-	env := a.buildEnv(tmpDir, token, true)
+	env := a.buildEnv(tmpDir, a.d.ProjectRepoURL, token, true)
 
 	pushCtx, pushCancel := fetchtransport.WithBoundedDeadline(ctx, writeTimeout)
 	defer pushCancel()
@@ -756,13 +756,14 @@ func extractBranchFromRef(ref git.PRRef) string {
 }
 
 // buildEnv constructs the git isolation environment with exactly one
-// GIT_CONFIG_COUNT entry. When withAuth is true and token is non-empty,
-// the count is 3 and the Authorization header entry is appended; otherwise
-// count is 2. This eliminates the duplicate-COUNT bug that silently dropped
-// the auth header when hardenedEnv(authEnv()...) was used.
-func (a *RotationReverserAdapter) buildEnv(tmpDir, token string, withAuth bool) []string {
+// GIT_CONFIG_COUNT entry. When withAuth is true AND gitAuthEnvBlock confirms
+// that repoURL is a GitHub HTTPS URL, count is 3 with the Authorization header
+// scoped to github.com; otherwise count is 2 (no auth header). Passing the
+// target URL ensures a cross-host redirect never carries the token — non-GitHub
+// and file:// callers naturally produce the two-entry noauth block.
+func (a *RotationReverserAdapter) buildEnv(tmpDir, repoURL, token string, withAuth bool) []string {
 	base := fetchtransport.CleanGitEnv()
-	if withAuth && token != "" {
+	if withAuth && gitAuthEnvBlock(repoURL, token) != nil {
 		return append(base,
 			"GIT_CONFIG_NOSYSTEM=1",
 			"HOME="+tmpDir,
@@ -773,7 +774,7 @@ func (a *RotationReverserAdapter) buildEnv(tmpDir, token string, withAuth bool) 
 			"GIT_CONFIG_VALUE_0=/dev/null",
 			"GIT_CONFIG_KEY_1=core.fsmonitor",
 			"GIT_CONFIG_VALUE_1=",
-			"GIT_CONFIG_KEY_2=http.extraHeader",
+			"GIT_CONFIG_KEY_2=http."+gitHubHTTPSBase+".extraHeader",
 			"GIT_CONFIG_VALUE_2=Authorization: Bearer "+token,
 		)
 	}
@@ -791,9 +792,9 @@ func (a *RotationReverserAdapter) buildEnv(tmpDir, token string, withAuth bool) 
 }
 
 // hardenedEnvNoAuth builds the isolation environment without HTTP auth.
-// Delegates to buildEnv with withAuth=false.
+// Delegates to buildEnv with withAuth=false and an empty URL.
 func (a *RotationReverserAdapter) hardenedEnvNoAuth(tmpDir string) []string {
-	return a.buildEnv(tmpDir, "", false)
+	return a.buildEnv(tmpDir, "", "", false)
 }
 
 // buildReversalCommitMessageBody returns the canonical signed-payload envelope

@@ -17,6 +17,7 @@ import (
 	"github.com/ByReisK/byreis/internal/adapter/artifactcodec"
 	auditadapter "github.com/ByReisK/byreis/internal/adapter/audit"
 	editadapter "github.com/ByReisK/byreis/internal/adapter/editor"
+	fsadapter "github.com/ByReisK/byreis/internal/adapter/fs"
 	"github.com/ByReisK/byreis/internal/adapter/fs/atomicwrite"
 	"github.com/ByReisK/byreis/internal/adapter/fs/resumestore"
 	"github.com/ByReisK/byreis/internal/adapter/git/fileofrecord"
@@ -30,6 +31,7 @@ import (
 	registryadapter "github.com/ByReisK/byreis/internal/adapter/registry"
 	"github.com/ByReisK/byreis/internal/adapter/registry/auditverify"
 	"github.com/ByReisK/byreis/internal/adapter/registry/countercache"
+	"github.com/ByReisK/byreis/internal/adapter/registry/signerprobe"
 	writesigneradapter "github.com/ByReisK/byreis/internal/adapter/registry/writesigner"
 	runneradapter "github.com/ByReisK/byreis/internal/adapter/runner"
 	"github.com/ByReisK/byreis/internal/adapter/signingkey"
@@ -462,6 +464,14 @@ func BuildProductionDeps(ctx context.Context) (*cli.Deps, error) {
 		pol, currentMode, reviewer, merger, rejecter, requestAccessReader, projectSubmissionsReader,
 	)
 
+	// Build the Initializer use-case. It requires a trust-anchor store, a
+	// registry signer probe (discovers the commit-signer key from the registry
+	// HEAD for TOFU pinning), a config filesystem writer (writes .byreis.yaml),
+	// and an interactive prompter (for first-init fingerprint confirmation).
+	// The probe reads BYREIS_GITHUB_TOKEN before ScrubSecretEnvVars runs so the
+	// token is available for private-registry auth on the clone path.
+	initializer := buildInitializerProd(ctx, configDir)
+
 	// Scrub BYREIS_* secret variables from the process environment. All reads of
 	// BYREIS_KEY, BYREIS_KEY_FILE, BYREIS_SIGN_KEY, BYREIS_SIGN_KEY_FILE, and
 	// BYREIS_GITHUB_TOKEN were completed above (synchronously, before this point).
@@ -472,6 +482,7 @@ func BuildProductionDeps(ctx context.Context) (*cli.Deps, error) {
 	ScrubSecretEnvVars()
 
 	return &cli.Deps{
+		Initializer:           initializer,
 		Policy:                pol,
 		CurrentMode:           currentMode,
 		ConfigDir:             configDir,
@@ -520,9 +531,11 @@ func buildDoctorProd(
 	}
 
 	// Build the registry status probe (wraps the registry client).
+	// projectID (slash-free, from BYREIS_PROJECT) is the second arg FetchAdminSet
+	// expects; registryURL is held by the use-case for display only.
 	var registryProbe usecase.RegistryStatusProbe
 	if regClient != nil && registryURL != "" {
-		registryProbe = &prodRegistryStatusProbe{client: regClient}
+		registryProbe = &prodRegistryStatusProbe{client: regClient, projectID: projectID}
 	}
 
 	// Build the base Doctor (no rotation-history probe).
@@ -566,6 +579,67 @@ func buildDoctorProd(
 	}
 
 	return baseDoc, rhDoc
+}
+
+// buildInitializerProd constructs the Init use-case with its real adapters:
+//   - truststore.Store for reading/writing the trust anchor (trust.yaml at 0600)
+//   - signerprobe.Probe for discovering the registry commit-signer key on first init
+//   - fs.Filesystem for writing .byreis.yaml
+//   - prompt.ConfirmPrompter for interactive first-init fingerprint acceptance
+//
+// Auth for private registries: the GitHub token (read before ScrubSecretEnvVars)
+// is injected into the signer probe's git subprocess environment as an HTTP
+// extra-header so the shallow clone can authenticate against a private repo.
+// For file:// registries no token is needed.
+//
+// Returns nil with a warning on any construction failure; the init command will
+// surface a "not configured" error at command time.
+func buildInitializerProd(ctx context.Context, configDir string) usecase.Initializer {
+	if configDir == "" {
+		fmt.Fprintln(os.Stderr,
+			"byreis: warning: config dir not set; init use-case unavailable")
+		return nil
+	}
+
+	ts, err := truststore.New(configDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr,
+			"byreis: warning: cannot construct trust store for init: %v\n", err)
+		return nil
+	}
+
+	// Build the signer-probe extra-env for private-registry auth.
+	// The token is read here (before ScrubSecretEnvVars strips it).
+	// The header is host-scoped to github.com; file:// and non-GitHub forms
+	// get nil (no auth block) and clone unauthenticated.
+	probeExtraEnv := buildGitAuthEnv(os.Getenv("BYREIS_REGISTRY"), githubTokenProd())
+
+	probe, err := signerprobe.New(signerprobe.Config{
+		Runner:   registryadapter.SubprocessRunner{},
+		ExtraEnv: probeExtraEnv,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr,
+			"byreis: warning: cannot construct signer probe for init: %v\n", err)
+		return nil
+	}
+
+	initializer, err := usecase.NewInitializer(usecase.InitDeps{
+		TrustStore:   ts,
+		SignerProbe:  probe,
+		Prompter:     prompt.NewConfirmPrompter(),
+		ConfigWriter: fsadapter.Filesystem{},
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr,
+			"byreis: warning: cannot construct init use-case: %v\n", err)
+		return nil
+	}
+
+	// ctx is available in BuildProductionDeps but is not needed at construction
+	// time for this use-case; the port calls receive their own ctx at invocation.
+	_ = ctx
+	return initializer
 }
 
 // buildModeDowngradeWarning returns a non-empty, actionable warning message
@@ -780,11 +854,14 @@ func buildFileOfRecordSourceProd(regClient coreregistry.RegistryClient) (usecase
 
 	baseBranch := baseBranchFromEnvProd()
 
-	// Construct the git-based reader using the existing SubprocessRunner (no
-	// new dependency or import edge). The token is NOT required for file://
-	// project URLs. Pass nil writeCfg: this path is read-only.
-	ft, err := registryadapter.NewProductionFetchTransportFromRunner(
-		registryadapter.SubprocessRunner{}, nil,
+	// Construct the git-based reader for the project secrets repo.
+	// Pass nil writeCfg: this path is strictly read-only (the reader has no
+	// business writing counter commits).
+	// Auth: for GitHub forms the token is injected as an HTTP extra-header
+	// scoped to github.com. For file:// URLs buildGitAuthEnv returns nil.
+	forSourceAuthEnv := buildGitAuthEnv(rawProjectRepoURL, githubTokenProd())
+	ft, err := registryadapter.NewProductionFetchTransportFromRunnerWithAuth(
+		registryadapter.SubprocessRunner{}, nil, forSourceAuthEnv,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("constructing project-repo git reader: %w", err)
@@ -1420,14 +1497,21 @@ func buildRegistryFetchTransportWithWriteProd(
 		return ft, nil
 	}
 
-	// GitHub forms: token is required for authenticated clone access.
+	// GitHub forms: token required for authenticated clone access.
+	// buildGitAuthEnv returns nil for empty token — the (nil, nil) return
+	// below signals the registry client to use offline-only mode instead of
+	// failing at construction time.
 	token := githubTokenProd()
 	if token == "" {
 		return nil, nil
 	}
 
-	ft, err := registryadapter.NewProductionFetchTransportFromRunner(
-		registryadapter.SubprocessRunner{}, writeCfg,
+	// The Authorization header is scoped to github.com via the URL-qualified
+	// config key so a redirect to another host does not carry the token.
+	authEnv := buildGitAuthEnv(registryURL, token)
+
+	ft, err := registryadapter.NewProductionFetchTransportFromRunnerWithAuth(
+		registryadapter.SubprocessRunner{}, writeCfg, authEnv,
 	)
 	if err != nil {
 		return nil, fmt.Errorf(
@@ -1613,6 +1697,36 @@ func githubTokenProd() string {
 		return v
 	}
 	return os.Getenv("GITHUB_TOKEN")
+}
+
+// buildGitAuthEnv returns a self-contained GIT_CONFIG_COUNT=3 environment
+// block that injects an Authorization: Bearer header scoped to GitHub HTTPS
+// requests only. It returns nil (no auth block) when the token is empty or
+// the URL does not begin with "https://github.com/", so file:// local repos,
+// SSH remote forms, and non-GitHub hosts all clone without an auth header.
+//
+// The config key is http.https://github.com/.extraHeader rather than the
+// bare http.extraHeader, ensuring git only sends the token to github.com;
+// a redirect to any other host drops the header automatically.
+//
+// The predicate is identical to gitAuthEnvBlock in the registry adapter so
+// both layers enforce the same host-scoping rule.
+func buildGitAuthEnv(registryURL, token string) []string {
+	if token == "" {
+		return nil
+	}
+	if !strings.HasPrefix(registryURL, "https://github.com/") {
+		return nil
+	}
+	return []string{
+		"GIT_CONFIG_COUNT=3",
+		"GIT_CONFIG_KEY_0=core.hooksPath",
+		"GIT_CONFIG_VALUE_0=/dev/null",
+		"GIT_CONFIG_KEY_1=core.fsmonitor",
+		"GIT_CONFIG_VALUE_1=",
+		"GIT_CONFIG_KEY_2=http.https://github.com/.extraHeader",
+		"GIT_CONFIG_VALUE_2=Authorization: Bearer " + token,
+	}
 }
 
 // contribGitHubTokenProd reads the contributor GitHub token. It checks
@@ -2336,19 +2450,25 @@ func buildRotatePreFlightProd(
 // mapping the result to the domain-typed usecase.RegistryStatus struct. No
 // SDK or transport types cross this boundary.
 type prodRegistryStatusProbe struct {
-	client coreregistry.RegistryClient
+	client    coreregistry.RegistryClient
+	projectID string // logical project ID (slash-free, from BYREIS_PROJECT)
 }
 
 // RegistryStatus probes the registry and returns the doctor-layer status.
 // An offline registry (ErrRegistryOffline) is reported as Offline=true with
 // the cache age from the stale AdminSet, not as an error. Only unexpected
 // failures return a non-nil error.
+//
+// The registryURL parameter carries the URL from the Doctor use-case's
+// DoctorDeps.RegistryURL (for display / hint purposes); FetchAdminSet requires
+// the logical project ID, which is held on the probe and used here.
 func (p *prodRegistryStatusProbe) RegistryStatus(ctx context.Context, registryURL string) (usecase.RegistryStatus, error) {
 	if err := ctx.Err(); err != nil {
 		return usecase.RegistryStatus{}, fmt.Errorf("registry status probe cancelled: %w", err)
 	}
+	_ = registryURL // URL is for caller context only; FetchAdminSet takes projectID
 
-	set, fetchErr := p.client.FetchAdminSet(ctx, registryURL)
+	set, fetchErr := p.client.FetchAdminSet(ctx, p.projectID)
 
 	// Transport/network failure or offline-with-cache.
 	if fetchErr != nil {

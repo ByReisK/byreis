@@ -69,6 +69,38 @@ const maxCounterJSONBytes = 64 * 1024 // 64 KiB
 // deadline is min(ctx.Deadline, mergeBaseTimeout from call time).
 const mergeBaseTimeout = 30 * time.Second
 
+// gitHubHTTPSBase is the URL prefix used as the scope for the git config
+// http.<url>.extraHeader key. Git applies the header only to requests whose
+// URL is prefixed by this value, so a redirect to a non-GitHub host drops the
+// token automatically.
+const gitHubHTTPSBase = "https://github.com/"
+
+// gitAuthEnvBlock returns a self-contained GIT_CONFIG_COUNT=3 environment
+// block that injects an Authorization header scoped to github.com HTTPS URLs
+// only. It returns nil when the token is empty or the repoURL is not an HTTPS
+// github.com URL, so callers can append the result unconditionally.
+//
+// The config key is http.https://github.com/.extraHeader rather than the
+// unqualified http.extraHeader, ensuring git drops the header on any redirect
+// that leaves github.com.
+func gitAuthEnvBlock(repoURL, token string) []string {
+	if token == "" {
+		return nil
+	}
+	if !strings.HasPrefix(repoURL, gitHubHTTPSBase) {
+		return nil
+	}
+	return []string{
+		"GIT_CONFIG_COUNT=3",
+		"GIT_CONFIG_KEY_0=core.hooksPath",
+		"GIT_CONFIG_VALUE_0=/dev/null",
+		"GIT_CONFIG_KEY_1=core.fsmonitor",
+		"GIT_CONFIG_VALUE_1=",
+		"GIT_CONFIG_KEY_2=http." + gitHubHTTPSBase + ".extraHeader",
+		"GIT_CONFIG_VALUE_2=Authorization: Bearer " + token,
+	}
+}
+
 // cloneSession holds the state of a single FetchAdminSet-scoped clone. It is
 // created by FetchHead and consumed by the subsequent ReadAdmins +
 // ReadProjectConfig calls within the same FetchAdminSet invocation.
@@ -221,14 +253,25 @@ func (SubprocessRunner) Run(ctx context.Context, dir string, env []string, name 
 // sub-package directly. Pass a non-nil writeCfg to enable the counter-write
 // path; pass nil for read-only tools.
 func NewProductionFetchTransportFromRunner(runner SubprocessRunner, writeCfg *FetchTransportWriteConfig) (*productionFetchTransport, error) {
+	return NewProductionFetchTransportFromRunnerWithAuth(runner, writeCfg, nil)
+}
+
+// NewProductionFetchTransportFromRunnerWithAuth is identical to
+// NewProductionFetchTransportFromRunner but also injects extraEnv into the
+// HeadVerifier so that private repositories can be cloned with HTTP
+// authentication.  extraEnv should be a self-contained GIT_CONFIG_COUNT/KEY/VALUE
+// block (e.g. setting http.extraHeader to "Authorization: Bearer <token>").
+// Pass nil for public repositories where no auth is needed.
+func NewProductionFetchTransportFromRunnerWithAuth(runner SubprocessRunner, writeCfg *FetchTransportWriteConfig, extraEnv []string) (*productionFetchTransport, error) {
 	v, err := fetchtransport.NewHeadVerifier(fetchtransport.HeadVerifierConfig{
 		Runner:    runner,
 		MkdirTemp: os.MkdirTemp,
 		RemoveAll: os.RemoveAll,
+		ExtraEnv:  extraEnv,
 	})
 	if err != nil {
 		return nil, fmt.Errorf(
-			"registry.NewProductionFetchTransportFromRunner: constructing head verifier: %w", err)
+			"registry.NewProductionFetchTransportFromRunnerWithAuth: constructing head verifier: %w", err)
 	}
 	return NewProductionFetchTransport(v, writeCfg)
 }
@@ -833,33 +876,16 @@ func (t *productionFetchTransport) doCounterWrite(
 		return append(env, extraEnv...)
 	}
 
-	// authEnv carries the registry-write credential as an HTTP extra-header.
-	// This follows the same pattern as the read path extraEnv: the token is
-	// passed via GIT_CONFIG so it is process-scoped and does not persist.
-	// The token appears only in the env of git subprocess invocations, never
-	// in log output (the hardened env sanitizer never includes env values).
-	authEnv := func() []string {
-		if token == "" {
-			return nil
-		}
-		return []string{
-			"GIT_CONFIG_COUNT=3",
-			"GIT_CONFIG_KEY_0=core.hooksPath",
-			"GIT_CONFIG_VALUE_0=/dev/null",
-			"GIT_CONFIG_KEY_1=core.fsmonitor",
-			"GIT_CONFIG_VALUE_1=",
-			"GIT_CONFIG_KEY_2=http.extraHeader",
-			"GIT_CONFIG_VALUE_2=Authorization: Bearer " + token,
-		}
-	}
-
 	// Step 1: clone the registry (shallow, full checkout for file writes).
+	// The auth block is host-scoped to github.com so a redirect to another
+	// host does not carry the token. For non-GitHub or empty-token cases
+	// gitAuthEnvBlock returns nil and clone proceeds unauthenticated.
 	cloneCtx, cloneCancel := fetchtransport.WithBoundedDeadline(ctx, writeTimeout)
 	defer cloneCancel()
 
 	_, cloneStderr, cloneExit, cloneErr := t.verifier.RunSubprocess(
 		cloneCtx, tmpDir,
-		append(hardenedEnv(), authEnv()...),
+		append(hardenedEnv(), gitAuthEnvBlock(repoURL, token)...),
 		"git", "clone", "--depth=1", "--no-local", "--", repoURL, cloneDir,
 	)
 	if cloneErr != nil {
@@ -1168,7 +1194,7 @@ func (t *productionFetchTransport) doCounterWrite(
 	leaseRef := "refs/heads/main:" + parentSHA
 	_, pushStderr, pushExit, pushErr := t.verifier.RunSubprocess(
 		pushCtx, cloneDir,
-		append(hardenedEnv(), authEnv()...),
+		append(hardenedEnv(), gitAuthEnvBlock(repoURL, token)...),
 		"git", "push", "--force-with-lease="+leaseRef, "origin", "main",
 	)
 	if pushErr != nil {
@@ -1429,29 +1455,16 @@ func (t *productionFetchTransport) doCommitRotation(
 		return append(env, extraEnv...)
 	}
 
-	authEnv := func() []string {
-		if token == "" {
-			return nil
-		}
-		return []string{
-			"GIT_CONFIG_COUNT=3",
-			"GIT_CONFIG_KEY_0=core.hooksPath",
-			"GIT_CONFIG_VALUE_0=/dev/null",
-			"GIT_CONFIG_KEY_1=core.fsmonitor",
-			"GIT_CONFIG_VALUE_1=",
-			"GIT_CONFIG_KEY_2=http.extraHeader",
-			"GIT_CONFIG_VALUE_2=Authorization: Bearer " + token,
-		}
-	}
-
 	// Clone the registry (shallow, full checkout for file writes). One clone,
-	// one commit, one push — no loop of commits.
+	// one commit, one push — no loop of commits. The auth block is
+	// host-scoped to github.com; non-GitHub or empty-token paths clone
+	// unauthenticated.
 	cloneCtx, cloneCancel := fetchtransport.WithBoundedDeadline(ctx, writeTimeout)
 	defer cloneCancel()
 
 	_, cloneStderr, cloneExit, cloneErr := t.verifier.RunSubprocess(
 		cloneCtx, tmpDir,
-		append(hardenedEnv(), authEnv()...),
+		append(hardenedEnv(), gitAuthEnvBlock(repoURL, token)...),
 		"git", "clone", "--depth=1", "--no-local", "--", repoURL, cloneDir,
 	)
 	if cloneErr != nil {
@@ -1650,7 +1663,7 @@ func (t *productionFetchTransport) doCommitRotation(
 	leaseRef := "refs/heads/main:" + in.RegistryParentSHA
 	_, pushStderr, pushExit, pushErr := t.verifier.RunSubprocess(
 		pushCtx, cloneDir,
-		append(hardenedEnv(), authEnv()...),
+		append(hardenedEnv(), gitAuthEnvBlock(repoURL, token)...),
 		"git", "push", "--force-with-lease="+leaseRef, "origin", "main",
 	)
 	if pushErr != nil {
